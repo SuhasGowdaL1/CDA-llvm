@@ -85,6 +85,23 @@ docker run --rm -v "$PWD:/work" -w /work cfggen:linux-build-deps \
 ls -l out/sample.dot
 ```
 
+### Binary Serialized Output (Compact, Lossless)
+
+Use `--format=bin` to emit a compact binary graph instead of DOT:
+
+```sh
+mkdir -p out
+docker run --rm -v "$PWD:/work" -w /work cfggen:linux-build-deps \
+	-lc './build-linux/cfg_generator --format=bin -o out/sample.cfgb examples/sample.c -- -I.'
+```
+
+Notes:
+
+- Binary format magic header: `CFGB2`
+- Recommended extension: `.cfgb`
+- DOT remains available with `--format=dot` (default)
+- Binary output preserves graph information (no lossy mode)
+
 ### Alternative Commands
 
 Build Linux binary from Docker (reuses image if already available):

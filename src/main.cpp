@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <memory>
 #include <set>
@@ -38,6 +39,41 @@ llvm::cl::opt<std::string> FunctionFilter(
     llvm::cl::value_desc("name"),
     llvm::cl::init(""),
     llvm::cl::cat(CfgCategory));
+
+llvm::cl::opt<std::string> OutputFormat(
+    "format",
+    llvm::cl::desc("Output format: dot or bin"),
+    llvm::cl::value_desc("dot|bin"),
+    llvm::cl::init("dot"),
+    llvm::cl::cat(CfgCategory));
+
+struct SerializedBlock {
+    unsigned Id = 0;
+    std::vector<std::string> Lines;
+    std::vector<unsigned> Successors;
+};
+
+struct SerializedFunction {
+    std::string Name;
+    std::string BaseId;
+    unsigned EntryBlockId = 0;
+    std::vector<SerializedBlock> Blocks;
+    std::set<std::string> Callees;
+};
+
+void writeU32(llvm::raw_ostream &Out, std::uint32_t V) {
+    char B[4];
+    B[0] = static_cast<char>(V & 0xffu);
+    B[1] = static_cast<char>((V >> 8) & 0xffu);
+    B[2] = static_cast<char>((V >> 16) & 0xffu);
+    B[3] = static_cast<char>((V >> 24) & 0xffu);
+    Out.write(B, 4);
+}
+
+void writeString(llvm::raw_ostream &Out, const std::string &S) {
+    writeU32(Out, static_cast<std::uint32_t>(S.size()));
+    Out.write(S.data(), static_cast<std::streamsize>(S.size()));
+}
 
 std::string escapeDot(const std::string &Input) {
     std::string Out;
@@ -139,16 +175,136 @@ public:
     CfgCollectorVisitor(ASTContext &Context, llvm::raw_ostream &Out, bool &AnyFound)
         : Context(Context), Out(Out), AnyFound(AnyFound) {}
 
-    void emitInterFunctionDependencies() {
-        for (const auto &Edge : InterFunctionCalls) {
-            auto CallerIt = FunctionEntryNode.find(Edge.first);
-            auto CalleeIt = FunctionEntryNode.find(Edge.second);
-            if (CallerIt == FunctionEntryNode.end() || CalleeIt == FunctionEntryNode.end()) {
-                continue;
+    void emitOutput() {
+        if (OutputFormat == "bin") {
+            emitBinary();
+            return;
+        }
+        emitDot();
+    }
+
+    void emitDot() {
+        Out << "digraph cfg {\n";
+        Out << "  rankdir=TB;\n";
+        Out << "  node [fontname=\"Courier New\", fontsize=10];\n";
+
+        std::unordered_map<std::string, std::string> FunctionEntryNode;
+        for (const SerializedFunction &Fn : Functions) {
+            FunctionEntryNode[Fn.Name] = Fn.BaseId + "_B" + std::to_string(Fn.EntryBlockId);
+
+            Out << "  subgraph cluster_" << Fn.BaseId << " {\n";
+            Out << "    label=\"" << escapeDot(Fn.Name) << "\";\n";
+            Out << "    style=rounded;\n";
+
+            for (const SerializedBlock &Block : Fn.Blocks) {
+                const std::string NodeId = Fn.BaseId + "_B" + std::to_string(Block.Id);
+                Out << "    " << NodeId << " [shape=box,label=\"";
+                for (size_t I = 0; I < Block.Lines.size(); ++I) {
+                    if (I != 0) {
+                        Out << "\\l";
+                    }
+                    Out << escapeDot(Block.Lines[I]);
+                }
+                Out << "\\l\"];\n";
             }
 
-            Out << "  " << CallerIt->second << " -> " << CalleeIt->second
-                << " [style=dashed,color=blue,label=\"calls\"];\n";
+            for (const SerializedBlock &Block : Fn.Blocks) {
+                const std::string SrcId = Fn.BaseId + "_B" + std::to_string(Block.Id);
+                for (unsigned SuccId : Block.Successors) {
+                    const std::string DstId = Fn.BaseId + "_B" + std::to_string(SuccId);
+                    Out << "    " << SrcId << " -> " << DstId << ";\n";
+                }
+            }
+
+            Out << "  }\n";
+        }
+
+        for (const SerializedFunction &Fn : Functions) {
+            auto CallerIt = FunctionEntryNode.find(Fn.Name);
+            if (CallerIt == FunctionEntryNode.end()) {
+                continue;
+            }
+            for (const std::string &Callee : Fn.Callees) {
+                auto CalleeIt = FunctionEntryNode.find(Callee);
+                if (CalleeIt == FunctionEntryNode.end()) {
+                    continue;
+                }
+                Out << "  " << CallerIt->second << " -> " << CalleeIt->second
+                    << " [style=dashed,color=blue,label=\"calls\"];\n";
+            }
+        }
+
+        Out << "}\n";
+    }
+
+    void emitBinary() {
+        static constexpr char Magic[] = {'C', 'F', 'G', 'B', '2'};
+        Out.write(Magic, sizeof(Magic));
+
+        std::vector<std::string> LineTable;
+        std::unordered_map<std::string, std::uint32_t> LineIndex;
+        for (const SerializedFunction &Fn : Functions) {
+            for (const SerializedBlock &Block : Fn.Blocks) {
+                for (const std::string &Line : Block.Lines) {
+                    auto It = LineIndex.find(Line);
+                    if (It != LineIndex.end()) {
+                        continue;
+                    }
+                    const std::uint32_t Idx = static_cast<std::uint32_t>(LineTable.size());
+                    LineIndex.emplace(Line, Idx);
+                    LineTable.push_back(Line);
+                }
+            }
+        }
+
+        writeU32(Out, static_cast<std::uint32_t>(LineTable.size()));
+        for (const std::string &Line : LineTable) {
+            writeString(Out, Line);
+        }
+
+        writeU32(Out, static_cast<std::uint32_t>(Functions.size()));
+
+        std::unordered_map<std::string, std::uint32_t> FunctionIndex;
+        for (std::uint32_t I = 0; I < Functions.size(); ++I) {
+            FunctionIndex[Functions[I].Name] = I;
+        }
+
+        for (const SerializedFunction &Fn : Functions) {
+            writeString(Out, Fn.Name);
+            writeU32(Out, static_cast<std::uint32_t>(Fn.EntryBlockId));
+
+            writeU32(Out, static_cast<std::uint32_t>(Fn.Blocks.size()));
+            for (const SerializedBlock &Block : Fn.Blocks) {
+                writeU32(Out, static_cast<std::uint32_t>(Block.Id));
+
+                writeU32(Out, static_cast<std::uint32_t>(Block.Lines.size()));
+                for (const std::string &Line : Block.Lines) {
+                    auto It = LineIndex.find(Line);
+                    if (It == LineIndex.end()) {
+                        writeU32(Out, 0u);
+                        continue;
+                    }
+                    writeU32(Out, It->second);
+                }
+
+                writeU32(Out, static_cast<std::uint32_t>(Block.Successors.size()));
+                for (unsigned SuccId : Block.Successors) {
+                    writeU32(Out, static_cast<std::uint32_t>(SuccId));
+                }
+            }
+
+            std::vector<std::uint32_t> CalleeIndexes;
+            for (const std::string &Callee : Fn.Callees) {
+                auto It = FunctionIndex.find(Callee);
+                if (It != FunctionIndex.end()) {
+                    CalleeIndexes.push_back(It->second);
+                }
+            }
+
+            writeU32(Out, static_cast<std::uint32_t>(CalleeIndexes.size()));
+            for (std::uint32_t Idx : CalleeIndexes) {
+                writeU32(Out, Idx);
+            }
         }
     }
 
@@ -206,9 +362,10 @@ private:
     void emitFunctionCfg(const FunctionDecl &Func, const CFG &Graph) {
         const std::string FunctionName = Func.getQualifiedNameAsString();
         const std::string BaseId = sanitizeId(FunctionName);
-        const std::string EntryNodeId = BaseId + "_B" + std::to_string(Graph.getEntry().getBlockID());
-
-        FunctionEntryNode[FunctionName] = EntryNodeId;
+        SerializedFunction Function;
+        Function.Name = FunctionName;
+        Function.BaseId = BaseId;
+        Function.EntryBlockId = Graph.getEntry().getBlockID();
 
         if (const Stmt *Body = Func.getBody()) {
             std::set<std::string> Callees;
@@ -217,31 +374,9 @@ private:
 
             for (const std::string &Callee : Callees) {
                 if (Callee != FunctionName) {
-                    InterFunctionCalls.insert({FunctionName, Callee});
+                    Function.Callees.insert(Callee);
                 }
             }
-        }
-
-        Out << "  subgraph cluster_" << BaseId << " {\n";
-        Out << "    label=\"" << escapeDot(FunctionName) << "\";\n";
-        Out << "    style=rounded;\n";
-
-        for (const CFGBlock *Block : Graph) {
-            if (!Block) {
-                continue;
-            }
-
-            const std::string NodeId = BaseId + "_B" + std::to_string(Block->getBlockID());
-            const std::vector<std::string> Lines = blockLabelLines(*Block, Context);
-
-            Out << "    " << NodeId << " [shape=box,label=\"";
-            for (size_t I = 0; I < Lines.size(); ++I) {
-                if (I != 0) {
-                    Out << "\\l";
-                }
-                Out << escapeDot(Lines[I]);
-            }
-            Out << "\\l\"];\n";
         }
 
         for (const CFGBlock *Block : Graph) {
@@ -249,26 +384,28 @@ private:
                 continue;
             }
 
-            const std::string SrcId = BaseId + "_B" + std::to_string(Block->getBlockID());
+            SerializedBlock Serialized;
+            Serialized.Id = Block->getBlockID();
+            Serialized.Lines = blockLabelLines(*Block, Context);
+
             for (CFGBlock::const_succ_iterator I = Block->succ_begin(); I != Block->succ_end(); ++I) {
                 const CFGBlock *Succ = I->getReachableBlock();
                 if (!Succ) {
                     continue;
                 }
-
-                const std::string DstId = BaseId + "_B" + std::to_string(Succ->getBlockID());
-                Out << "    " << SrcId << " -> " << DstId << ";\n";
+                Serialized.Successors.push_back(Succ->getBlockID());
             }
+
+            Function.Blocks.push_back(std::move(Serialized));
         }
 
-        Out << "  }\n";
+        Functions.push_back(std::move(Function));
     }
 
     ASTContext &Context;
     llvm::raw_ostream &Out;
     bool &AnyFound;
-    std::unordered_map<std::string, std::string> FunctionEntryNode;
-    std::set<std::pair<std::string, std::string>> InterFunctionCalls;
+    std::vector<SerializedFunction> Functions;
 };
 
 class CfgCollectorConsumer : public ASTConsumer {
@@ -278,7 +415,7 @@ public:
 
     void HandleTranslationUnit(ASTContext &Context) override {
         Visitor.TraverseDecl(Context.getTranslationUnitDecl());
-        Visitor.emitInterFunctionDependencies();
+        Visitor.emitOutput();
     }
 
 private:
@@ -344,15 +481,9 @@ int main(int argc, const char **argv) {
         Out = FileOut.get();
     }
 
-    *Out << "digraph cfg {\n";
-    *Out << "  rankdir=TB;\n";
-    *Out << "  node [fontname=\"Courier New\", fontsize=10];\n";
-
     bool AnyFound = false;
     CfgActionFactory Factory(*Out, AnyFound);
     const int ToolResult = Tool.run(&Factory);
-
-    *Out << "}\n";
     Out->flush();
 
     if (ToolResult != 0) {
