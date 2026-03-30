@@ -2,8 +2,10 @@
 #include <cctype>
 #include <fstream>
 #include <memory>
+#include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "clang/Analysis/CFG.h"
@@ -137,6 +139,19 @@ public:
     CfgCollectorVisitor(ASTContext &Context, llvm::raw_ostream &Out, bool &AnyFound)
         : Context(Context), Out(Out), AnyFound(AnyFound) {}
 
+    void emitInterFunctionDependencies() {
+        for (const auto &Edge : InterFunctionCalls) {
+            auto CallerIt = FunctionEntryNode.find(Edge.first);
+            auto CalleeIt = FunctionEntryNode.find(Edge.second);
+            if (CallerIt == FunctionEntryNode.end() || CalleeIt == FunctionEntryNode.end()) {
+                continue;
+            }
+
+            Out << "  " << CallerIt->second << " -> " << CalleeIt->second
+                << " [style=dashed,color=blue,label=\"calls\"];\n";
+        }
+    }
+
     bool VisitFunctionDecl(FunctionDecl *Func) {
         if (!Func) {
             return true;
@@ -169,9 +184,43 @@ public:
     }
 
 private:
+    class DirectCallVisitor : public RecursiveASTVisitor<DirectCallVisitor> {
+    public:
+        explicit DirectCallVisitor(std::set<std::string> &Callees) : Callees(Callees) {}
+
+        bool VisitCallExpr(CallExpr *Call) {
+            if (!Call) {
+                return true;
+            }
+
+            if (const FunctionDecl *Callee = Call->getDirectCallee()) {
+                Callees.insert(Callee->getQualifiedNameAsString());
+            }
+            return true;
+        }
+
+    private:
+        std::set<std::string> &Callees;
+    };
+
     void emitFunctionCfg(const FunctionDecl &Func, const CFG &Graph) {
         const std::string FunctionName = Func.getQualifiedNameAsString();
         const std::string BaseId = sanitizeId(FunctionName);
+        const std::string EntryNodeId = BaseId + "_B" + std::to_string(Graph.getEntry().getBlockID());
+
+        FunctionEntryNode[FunctionName] = EntryNodeId;
+
+        if (const Stmt *Body = Func.getBody()) {
+            std::set<std::string> Callees;
+            DirectCallVisitor CallCollector(Callees);
+            CallCollector.TraverseStmt(const_cast<Stmt *>(Body));
+
+            for (const std::string &Callee : Callees) {
+                if (Callee != FunctionName) {
+                    InterFunctionCalls.insert({FunctionName, Callee});
+                }
+            }
+        }
 
         Out << "  subgraph cluster_" << BaseId << " {\n";
         Out << "    label=\"" << escapeDot(FunctionName) << "\";\n";
@@ -218,6 +267,8 @@ private:
     ASTContext &Context;
     llvm::raw_ostream &Out;
     bool &AnyFound;
+    std::unordered_map<std::string, std::string> FunctionEntryNode;
+    std::set<std::pair<std::string, std::string>> InterFunctionCalls;
 };
 
 class CfgCollectorConsumer : public ASTConsumer {
@@ -227,6 +278,7 @@ public:
 
     void HandleTranslationUnit(ASTContext &Context) override {
         Visitor.TraverseDecl(Context.getTranslationUnitDecl());
+        Visitor.emitInterFunctionDependencies();
     }
 
 private:
