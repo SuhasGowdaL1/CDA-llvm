@@ -52,13 +52,48 @@ Filter a single function:
 
 The Docker setup is dependency-only and Linux-only.
 
-Build Linux binary from Docker:
+### Exact Steps: Build and Run with Docker
+
+1. Build the Linux dependency image once:
+
+```sh
+scripts/build_linux_binary_docker.sh --build-image
+```
+
+2. Build the Linux binary using the stored image:
 
 ```sh
 scripts/build_linux_binary_docker.sh
 ```
 
-Build dependency image once (then scripts reuse stored image):
+3. Create output directory:
+
+```sh
+mkdir -p out
+```
+
+4. Run the generated binary inside the Docker image:
+
+```sh
+docker run --rm -v "$PWD:/work" -w /work cfggen:linux-build-deps \
+	-lc './build-linux/cfg_generator -o out/sample.dot examples/sample.c -- -I. -DTEST=1'
+```
+
+5. Verify output:
+
+```sh
+ls -l out/sample.dot
+```
+
+### Alternative Commands
+
+Build Linux binary from Docker (reuses image if already available):
+
+```sh
+scripts/build_linux_binary_docker.sh
+```
+
+Build dependency image once (if you have not built it yet):
 
 ```sh
 scripts/build_linux_binary_docker.sh --build-image

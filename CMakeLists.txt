@@ -24,14 +24,8 @@ target_include_directories(cfg_generator PRIVATE
 
 add_definitions(${LLVM_DEFINITIONS})
 
-# Core LLVM components used by the tool and its support libraries.
-llvm_map_components_to_libnames(LLVM_LIBS
-    Support
-    Option
-)
-
 target_link_libraries(cfg_generator PRIVATE
-    ${LLVM_LIBS}
+    LLVM
     clangTooling
     clangFrontend
     clangSerialization

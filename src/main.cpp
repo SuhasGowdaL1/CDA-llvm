@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cctype>
 #include <fstream>
 #include <memory>
 #include <sstream>
@@ -43,12 +44,36 @@ std::string escapeDot(const std::string &Input) {
         if (C == '"' || C == '\\') {
             Out.push_back('\\');
         }
-        if (C == '\n' || C == '\r') {
-            Out.push_back(' ');
+        Out.push_back(C);
+    }
+    return Out;
+}
+
+std::string normalizeWhitespace(const std::string &Input) {
+    std::string Out;
+    Out.reserve(Input.size());
+
+    bool InSpace = false;
+    for (char C : Input) {
+        const unsigned char UC = static_cast<unsigned char>(C);
+        if (std::isspace(UC)) {
+            if (!InSpace) {
+                Out.push_back(' ');
+                InSpace = true;
+            }
             continue;
         }
         Out.push_back(C);
+        InSpace = false;
     }
+
+    while (!Out.empty() && Out.front() == ' ') {
+        Out.erase(Out.begin());
+    }
+    while (!Out.empty() && Out.back() == ' ') {
+        Out.pop_back();
+    }
+
     return Out;
 }
 
@@ -69,18 +94,42 @@ std::string sanitizeId(const std::string &Input) {
     return Out;
 }
 
-std::string blockLabel(const CFGBlock &Block) {
-    std::ostringstream Ss;
-    Ss << "B" << Block.getBlockID();
+std::vector<std::string> blockLabelLines(const CFGBlock &Block, ASTContext &Context) {
+    std::vector<std::string> Lines;
+    Lines.emplace_back("B" + std::to_string(Block.getBlockID()));
 
     if (Block.hasNoReturnElement()) {
-        Ss << "\\n[noreturn]";
+        Lines.emplace_back("[noreturn]");
     }
     if (Block.isInevitablySinking()) {
-        Ss << "\\n[sink]";
+        Lines.emplace_back("[sink]");
     }
 
-    return Ss.str();
+    for (const CFGElement &Element : Block) {
+        if (auto Statement = Element.getAs<CFGStmt>()) {
+            const Stmt *S = Statement->getStmt();
+            if (!S) {
+                continue;
+            }
+
+            std::string Raw;
+            llvm::raw_string_ostream Ros(Raw);
+            PrintingPolicy Policy(Context.getLangOpts());
+            S->printPretty(Ros, nullptr, Policy);
+            Ros.flush();
+
+            const std::string Pretty = normalizeWhitespace(Raw);
+            if (!Pretty.empty()) {
+                Lines.push_back(Pretty);
+            }
+            continue;
+        }
+
+        Lines.emplace_back("[cfg element kind " +
+                           std::to_string(static_cast<unsigned>(Element.getKind())) + "]");
+    }
+
+    return Lines;
 }
 
 class CfgCollectorVisitor : public RecursiveASTVisitor<CfgCollectorVisitor> {
@@ -134,8 +183,16 @@ private:
             }
 
             const std::string NodeId = BaseId + "_B" + std::to_string(Block->getBlockID());
-            Out << "    " << NodeId << " [shape=box,label=\""
-                << escapeDot(blockLabel(*Block)) << "\"];\n";
+            const std::vector<std::string> Lines = blockLabelLines(*Block, Context);
+
+            Out << "    " << NodeId << " [shape=box,label=\"";
+            for (size_t I = 0; I < Lines.size(); ++I) {
+                if (I != 0) {
+                    Out << "\\l";
+                }
+                Out << escapeDot(Lines[I]);
+            }
+            Out << "\\l\"];\n";
         }
 
         for (const CFGBlock *Block : Graph) {
