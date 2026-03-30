@@ -13,13 +13,15 @@ find_package(Clang CONFIG REQUIRED)
 message(STATUS "Found LLVM ${LLVM_PACKAGE_VERSION}")
 message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
+# CFG Generator executable
 add_executable(cfg_generator
-    src/main.cpp
+    src/cfg_generator.cpp
 )
 
 target_include_directories(cfg_generator PRIVATE
     ${LLVM_INCLUDE_DIRS}
     ${CLANG_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
 add_definitions(${LLVM_DEFINITIONS})
@@ -40,11 +42,29 @@ target_link_libraries(cfg_generator PRIVATE
 )
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CFGGEN_BUILD_STATIC_LINUX)
-    target_link_options(cfg_generator PRIVATE
-        -static
-        -static-libgcc
-        -static-libstdc++
-    )
+    # Note: Alpine LLVM 17 only provides dynamic libraries, so static linking won't work
+    # Disabling static link options
+    # target_link_options(cfg_generator PRIVATE
+    #     -static
+    #     -static-libgcc
+    #     -static-libstdc++
+    # )
 endif()
 
-install(TARGETS cfg_generator RUNTIME DESTINATION bin)
+# Path Finder executable
+add_executable(path_finder
+    src/path_finder.cpp
+)
+
+target_include_directories(path_finder PRIVATE
+    ${LLVM_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+add_definitions(${LLVM_DEFINITIONS})
+
+target_link_libraries(path_finder PRIVATE
+    LLVM
+)
+
+install(TARGETS cfg_generator path_finder RUNTIME DESTINATION bin)

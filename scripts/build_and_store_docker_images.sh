@@ -11,7 +11,7 @@ LINUX_IMAGE=${CFGGEN_LINUX_IMAGE:-cfggen:linux-build-deps}
 mkdir -p "$OUT_DIR"
 
 echo "[1/2] Building image for linux-deps target: $LINUX_IMAGE"
-docker build --target linux-deps -t "$LINUX_IMAGE" -f "$DOCKERFILE_PATH" "$ROOT_DIR"
+docker buildx build --target linux-deps -t "$LINUX_IMAGE" -f "$DOCKERFILE_PATH" "$ROOT_DIR"
 
 echo "[2/2] Saving image tar: $OUT_DIR/linux-deps.tar"
 docker save -o "$OUT_DIR/linux-deps.tar" "$LINUX_IMAGE"

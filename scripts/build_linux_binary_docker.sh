@@ -24,7 +24,7 @@ elif docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
   echo "[1/2] Using existing Linux dependency image: $IMAGE_NAME"
 elif [ "$AUTO_BUILD" = "1" ]; then
   echo "[1/2] Image not found. Building Linux dependency image: $IMAGE_NAME"
-  docker build --target linux-deps -t "$IMAGE_NAME" -f "$DOCKERFILE_PATH" "$ROOT_DIR"
+  docker buildx build --target linux-deps -t "$IMAGE_NAME" -f "$DOCKERFILE_PATH" "$ROOT_DIR"
 else
   echo "Missing Docker image: $IMAGE_NAME"
   echo "Build it once with:"
@@ -40,4 +40,6 @@ docker run --rm \
   "$IMAGE_NAME" \
   -lc "cmake -S . -B $BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DCFGGEN_BUILD_STATIC_LINUX=$STATIC_LINUX && cmake --build $BUILD_DIR -j"
 
-echo "Done. Expected output: $BUILD_DIR/cfg_generator"
+echo "Done. Expected outputs:"
+echo "  $BUILD_DIR/cfg_generator (CFG generation tool)"
+echo "  $BUILD_DIR/path_finder (Path enumeration tool)"
