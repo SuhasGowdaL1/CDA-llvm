@@ -15,7 +15,10 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # CFG Generator executable
 add_executable(cfg_generator
-    src/cfg_generator.cpp
+    src/cfg_generator_main.cpp
+    src/cfg_generation.cpp
+    src/serialization.cpp
+    src/varuint.cpp
 )
 
 target_include_directories(cfg_generator PRIVATE
@@ -51,20 +54,32 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CFGGEN_BUILD_STATIC_LINUX)
     # )
 endif()
 
-# Path Finder executable
-add_executable(path_finder
-    src/path_finder.cpp
+add_executable(cfgb_interpreter
+    src/cfgb_interpreter.cpp
+    src/cfg_generation.cpp
+    src/serialization.cpp
+    src/varuint.cpp
 )
 
-target_include_directories(path_finder PRIVATE
+target_include_directories(cfgb_interpreter PRIVATE
     ${LLVM_INCLUDE_DIRS}
+    ${CLANG_INCLUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-add_definitions(${LLVM_DEFINITIONS})
-
-target_link_libraries(path_finder PRIVATE
+target_link_libraries(cfgb_interpreter PRIVATE
     LLVM
+    clangTooling
+    clangFrontend
+    clangSerialization
+    clangDriver
+    clangParse
+    clangSema
+    clangAnalysis
+    clangAST
+    clangASTMatchers
+    clangBasic
+    clangLex
 )
 
-install(TARGETS cfg_generator path_finder RUNTIME DESTINATION bin)
+install(TARGETS cfg_generator cfgb_interpreter RUNTIME DESTINATION bin)

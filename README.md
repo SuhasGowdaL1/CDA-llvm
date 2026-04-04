@@ -1,228 +1,138 @@
-# C CFG Generator & Path Finder (LibTooling)
+# C CFG Binary Generator (Docker-First)
 
-This project provides two complementary tools for analyzing C code:
+This repository provides a Docker-first workflow to:
 
-1. **cfg_generator** - Parses a directory of interdependent C/header files and generates:
-   - per-function DOT CFG files
-   - one aggregated binary serialization for all discovered functions
+1. Generate function CFGs from C sources.
+2. Serialize CFGs into a compact `CFGB` binary.
+3. Optionally emit DOT artifacts for inspection.
 
-2. **path_finder** - Reads the CFG binary and enumerates:
-   - all possible function call paths from a specified entry point
-   - complete call graph summary
+The recommended entry point is `manage.sh`.
 
-## What It Produces
+## Tools
 
-- `cfg_generator`: CLI tool for CFG generation from C source directories
-  - `out/dotfiles/*.dot`: one DOT file per function (when `--format=dot`)
-  - `out/cfg.cfgb` (or custom `-o`): single binary for all functions
-  
-- `path_finder`: CLI tool for path enumeration from CFG binary
-  - `out/paths.txt`: all possible function call sequences from entry point
-  - Call graph summary printed to stdout
+- `cfg_generator`: creates `CFGB` from source inputs.
+- `cfgb_interpreter`: reads `CFGB` and emits per-function DOT files.
 
-## Features
+## Prerequisites
 
-- **Multi-file Support**: Handles interdependent C and header files in a directory
-- **Inter-file Function Calls**: Correctly tracks function calls across different source files
-- **Path Enumeration**: Enumerates all possible execution paths from a specified entry point
-- **Cycle Detection**: Avoids infinite loops in recursive function calls
-- **Compact Binary Format**: Lossless serialization with deduplication (magic: `CFGB2`)
+- Docker
 
-## Requirements
+No host LLVM/Clang installation is required.
 
-- LLVM/Clang 17 development packages with LibTooling.
-- CMake 3.20+.
-- A C toolchain.
+## Quick Start (Recommended)
 
-## Build (Linux)
+Build image, compile with Ninja in Docker, and generate CFGB:
 
 ```sh
-cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release -DCFGGEN_BUILD_STATIC_LINUX=OFF
-cmake --build build-linux -j
-```
-
-If full static linking is not available in your distro packages, disable it:
-
-```sh
-cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release -DCFGGEN_BUILD_STATIC_LINUX=OFF
-cmake --build build-linux -j
-```
-
-## Run
-
-### Step 1: Generate CFG
-
-Input should be a directory that contains C sources (and headers used by those sources).
-
-```sh
-./build-linux/cfg_generator --format=dot --dot-dir out/dotfiles -o out/cfg.cfgb examples -- -I.
+./manage.sh --build-image --docker-build --dot
 ```
 
 This produces:
-- per-function DOT files in `out/dotfiles/`
-- one binary file `out/cfg.cfgb`
 
-Filter a single function name:
+- `out/cfg.cfgb`
+- `out/dotfiles/*.dot` (if `--dot` is set)
+
+## manage.sh Options
+
+```text
+--build-image              Build Docker dependency image
+--docker-build             Build binaries inside Docker using Ninja
+--format-src               Format files in src/ using clang-format
+--cfg-input PATH           CFG input path (default: examples)
+--cfg-output FILE          CFGB output file (default: out/cfg.cfgb)
+--cfg-mode MODE            CFG mode: call|full (default: call)
+--dot                      Emit per-function DOT files
+--dot-dir DIR              DOT output directory (default: out/dotfiles)
+--svg                      Convert DOT files to SVG (requires graphviz `dot`)
+```
+
+Notes:
+
+- Docker containers are run as host UID/GID, so generated files are user-owned.
+- `--cfg-mode call` is default and emits call-focused CFG data.
+- `--cfg-mode full` preserves richer per-block statement content.
+
+## Direct Binary Generation (Without manage.sh)
+
+After Docker build has created `build-linux/*` binaries:
 
 ```sh
-./build-linux/cfg_generator --format=dot --dot-dir out/dotfiles -o out/cfg.cfgb \
-	--function classify examples -- -I.
+./build-linux/cfg_generator --cfg-mode call --emit-dot --dot-dir out/dotfiles -o out/cfg.cfgb examples -- -I.
 ```
 
-### Step 2: Enumerate Function Paths
+## Binary Format Reference
 
-Use the CFG binary to discover all possible function call paths from an entry point:
+### CFGB (CFG binary)
+
+Magic: `CFGB` (4 bytes)
+
+Encoding:
+
+- Integer fields use unsigned varint encoding (`varuint`).
+- String table entries are encoded as `varuint(length)` + raw bytes.
+- Most string-bearing fields reference string table indices.
+
+Top-level layout:
+
+| Order | Field | Type | Description |
+|---|---|---|---|
+| 1 | Magic | bytes[4] | ASCII `CFGB` |
+| 2 | Version | varuint | Format version (`2`) |
+| 3 | Mode | varuint | `0=call`, `1=full` |
+| 4 | String Count | varuint | Number of strings in table |
+| 5 | String Table | repeated string | `varuint(len)` + raw bytes |
+| 6 | Function Count | varuint | Total functions serialized |
+| 7 | Log Function Count | varuint | Number of functions with state-change logs |
+| 8 | Function CFGs | repeated record | See function record table below |
+| 9 | Checksum | varuint | FNV-1a 32-bit checksum value |
+
+Function record (`Function CFGs`) layout:
+
+| Order | Field | Type | Description |
+|---|---|---|---|
+| 1 | Function Name Index | varuint | Index into string table |
+| 2 | Entry Block ID | varuint | LLVM CFG entry block id |
+| 3 | Exit Block ID | varuint | LLVM CFG exit block id |
+| 4 | Function Flags | varuint | Bit flags (direct recursion, indirect recursion, state-change calls) |
+| 5 | Indirect Recursion Peer Count | varuint | SCC peer count |
+| 6 | Indirect Recursion Peers | repeated varuint | String indices of peer names |
+| 7 | State Parameter Count | varuint | Number of tracked state-change parameters |
+| 8 | State Parameter Value Sets | nested repeated varuint | For each parameter: count + value string indices |
+| 9 | Block Count | varuint | Number of blocks in this function |
+| 10 | Blocks | repeated record | See block record table below |
+
+Block record (`Blocks`) layout:
+
+| Order | Field | Type | Description |
+|---|---|---|---|
+| 1 | Block ID | varuint | CFG block id |
+| 2 | Block Flags | varuint | Bit flags (loop marker) |
+| 3 | Line Count | varuint | Number of label/statement lines |
+| 4 | Lines | repeated varuint | String indices for each line |
+| 5 | Successor Count | varuint | Number of CFG successors |
+| 6 | Successors | repeated varuint | Successor block ids |
+
+## Interpreter Usage
+
+Generate DOT files from an existing `CFGB`:
 
 ```sh
-./build-linux/path_finder out/cfg.cfgb --entrypoint classify_series -o out/paths.txt
+./build-linux/cfgb_interpreter out/cfg.cfgb --dot-dir out/dotfiles
 ```
 
-This produces:
-- `out/paths.txt`: List of all enumerated paths
-- stdout: Function call paths and call graph summary
+## Project Structure (src)
 
-Options:
-- `--entrypoint NAME`: Start path enumeration from function NAME (default: main)
-- `--max-paths N`: Limit number of paths to enumerate (default: 256)
-@@**Generate both text and binary path formats:**
-@@
-@@```sh
-@@./build-linux/path_finder out/cfg.cfgb --entrypoint classify_series -o out/paths.txt -ob out/paths.bin
-@@```
-@@
-@@- `-o FILE`: Output text format paths (human-readable)
-@@- `-ob FILE`: Output binary format paths (compact, ~40% of text size with function deduplication)
-@@
-@@**Binary Path Format:**
-@@The `-ob` option stores paths in a compact binary format:
-@@- **Magic header:** `PTHS` (4 bytes)
-@@- **Function lookup table:** Unique function names stored once with uint32_t length prefixes
-@@- **Paths:** Encoded as sequences of function name indices (uint32_t values)
-@@- **Compression:** ~59% size reduction vs text format by eliminating repeated function names
-
-Example output:
-```
-Path 1: classify_series -> adjust_with_limit -> clamp_range
-Path 2: classify_series -> adjust_with_limit -> sign_score
-Path 3: classify_series -> choose_bucket -> score_penalty -> clamp_range
-...
-```
-
-## Docker (Linux)
-
-The Docker setup is dependency-only and Linux-only.
-
-### Exact Steps: Build and Run with Docker
-
-1. Build the Linux dependency image once:
-
-```sh
-scripts/build_linux_binary_docker.sh --build-image
-```
-
-2. Build both binaries using the stored image:
-
-```sh
-scripts/build_linux_binary_docker.sh
-```
-
-Verify the output:
-
-```sh
-ls -lh build-linux/{cfg_generator,path_finder}
-```
-
-3. Create output directory:
-
-```sh
-mkdir -p out
-```
-
-4. Generate CFG from source directory:
-
-```sh
-docker run --rm -v "$PWD:/work" -w /work cfggen:linux-build-deps \
-	-lc './build-linux/cfg_generator --format=dot --dot-dir out/dotfiles -o out/cfg.cfgb examples -- -I.'
-```
-
-5. Enumerate function paths:
-
-```sh
-docker run --rm -v "$PWD:/work" -w /work cfggen:linux-build-deps \
-	-lc './build-linux/path_finder out/cfg.cfgb --entrypoint classify_series -o out/paths.txt'
-```
-
-6. View results:
-
-```sh
-```sh
-ls -l out/cfg.cfgb
-ls -1 out/dotfiles | head
-cat out/paths.txt
-```
-
-## Advanced Usage
-
-### Binary Format
-
-The CFG is stored in a compact, lossless binary format (magic header: `CFGB2`):
-
-```sh
-# Generate only binary (skip DOT files)
-./build-linux/cfg_generator --format=bin -o out/cfg.cfgb examples -- -I.
-```
-
-Features:
-- Lossless: all graph information preserved
-- Compact: line table deduplication
-- Self-contained: all function data in single file
-- Portable: independent of DOT visualization
-
-### Path Finding Options
-
-Control path enumeration with these flags:
-
-```sh
-# Find paths from different entry points
-./build-linux/path_finder out/cfg.cfgb --entrypoint classify -o out/classify_paths.txt
-
-# Limit the number of paths (default: 256)
-./build-linux/path_finder out/cfg.cfgb --entrypoint main --max-paths 100
-```
-
-### Single Function CFG
-
-Generate CFG for a specific function only:
-
-```sh
-./build-linux/cfg_generator --function classify_series --format=dot --dot-dir out/dotfiles -o out/cfg.cfgb examples -- -I.
-```
-
-## Helper Scripts
-
-Build and run with a single command:
-
-```sh
-scripts/build_linux_binary_docker.sh --build-image
-scripts/build_linux_binary_docker.sh
-```
-
-Store Docker image as tar for transport/reuse:
-
-```sh
-scripts/build_and_store_docker_images.sh ./artifacts
-docker load -i ./artifacts/linux-deps.tar
-```
+- `cfg_generator_main.cpp`: CFG generation CLI entrypoint.
+- `cfg_generation.*`: CFG extraction and DOT emission.
+- `serialization.*`: CFGB read-write logic.
+- `varuint.*`: varuint encoding/decoding helpers.
+- `cfgb_interpreter.cpp`: CFGB to DOT interpreter.
 
 ## Exit Codes
 
 ### cfg_generator
-- `0`: success; at least one function CFG generated
-- `1`: output file errors
-- `2`: command-line parsing errors
-- `3`: no function definitions found
 
-### path_finder
-- `0`: success; paths enumerated (may be 0 if entry point is a leaf)
-- `1`: input file errors or I/O failures
-- Other codes: execution errors
+- `0`: success
+- `1`: runtime/IO/tooling failure
+- `2`: CLI parsing/usage error
+- `3`: no function definitions discovered
