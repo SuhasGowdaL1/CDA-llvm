@@ -6,31 +6,41 @@ BUILD_DIR="${BUILD_DIR:-build-linux}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 IMAGE_NAME="${CFGGEN_LINUX_IMAGE:-cfggen:linux-build-deps}"
 CFG_INPUT="examples"
-CFG_OUTPUT="out/cfg.cfgb"
-CFG_MODE="call"
+CFG_OUTPUT="out/cfg-analysis.json"
 DOT_DIR="out/dotfiles"
+CALLGRAPH_OUTPUT="out/callgraph.json"
+CALLGRAPH_DOT_OUTPUT="out/callgraph.dot"
+CALLGRAPH_CONTEXT_DEPTH=3
 DO_BUILD_IMAGE=0
 DO_FORMAT=0
 DO_DOT=0
 DO_SVG=0
+DO_CALLGRAPH=0
+DO_CALLGRAPH_DOT=1
 DO_DOCKER_BUILD=0
 
 usage() {
   cat <<'EOF'
 Usage: ./manage.sh [options]
 
-Build and run helper for CFG binaries.
+Build and run helper for CFG analysis artifacts.
 
 Options:
   --build-image              Build Docker dependency image
   --docker-build             Build binaries inside Docker (Ninja)
   --format-src               Format source files in src/ with clang-format
   --cfg-input PATH           CFG input path (default: examples)
-  --cfg-output FILE          CFGB output file (default: out/cfg.cfgb)
-  --cfg-mode MODE            CFG mode: call|full (default: call)
+  --cfg-output FILE          Analysis JSON output file (default: out/cfg-analysis.json)
   --dot                      Emit per-function DOT files
   --dot-dir DIR              DOT output directory (default: out/dotfiles)
   --svg                      Convert DOT files to SVG (requires dot command)
+  --callgraph                Generate callgraph JSON from analysis JSON
+  --callgraph-output FILE    Callgraph JSON output file (default: out/callgraph.json)
+  --callgraph-dot-output FILE
+                             Callgraph DOT output file (default: out/callgraph.dot)
+  --callgraph-context-depth N
+                             Callgraph bounded context depth (default: 3)
+  --no-callgraph-dot         Disable callgraph DOT output
   -h, --help                 Show help
 EOF
 }
@@ -68,11 +78,26 @@ format_sources() {
 }
 
 generate_cfg() {
-  local cmd="./$BUILD_DIR/cfg_generator --cfg-mode $CFG_MODE -o $CFG_OUTPUT"
+  local cmd="./$BUILD_DIR/cfg_generator -o $CFG_OUTPUT"
   if [[ "$DO_DOT" -eq 1 ]]; then
     cmd="$cmd --emit-dot --dot-dir $DOT_DIR"
   fi
   cmd="$cmd $CFG_INPUT -- -I."
+
+  if [[ "$DO_DOCKER_BUILD" -eq 1 ]]; then
+    run_in_docker "$cmd"
+  else
+    eval "$cmd"
+  fi
+}
+
+generate_callgraph() {
+  local cmd="./$BUILD_DIR/callgraph_generator -i $CFG_OUTPUT -o $CALLGRAPH_OUTPUT --context-depth $CALLGRAPH_CONTEXT_DEPTH"
+  if [[ "$DO_CALLGRAPH_DOT" -eq 1 ]]; then
+    cmd="$cmd --dot-output $CALLGRAPH_DOT_OUTPUT"
+  else
+    cmd="$cmd --no-dot"
+  fi
 
   if [[ "$DO_DOCKER_BUILD" -eq 1 ]]; then
     run_in_docker "$cmd"
@@ -117,10 +142,6 @@ while [[ $# -gt 0 ]]; do
       CFG_OUTPUT="$2"
       shift 2
       ;;
-    --cfg-mode)
-      CFG_MODE="$2"
-      shift 2
-      ;;
     --dot)
       DO_DOT=1
       shift
@@ -131,6 +152,26 @@ while [[ $# -gt 0 ]]; do
       ;;
     --svg)
       DO_SVG=1
+      shift
+      ;;
+    --callgraph)
+      DO_CALLGRAPH=1
+      shift
+      ;;
+    --callgraph-output)
+      CALLGRAPH_OUTPUT="$2"
+      shift 2
+      ;;
+    --callgraph-dot-output)
+      CALLGRAPH_DOT_OUTPUT="$2"
+      shift 2
+      ;;
+    --callgraph-context-depth)
+      CALLGRAPH_CONTEXT_DEPTH="$2"
+      shift 2
+      ;;
+    --no-callgraph-dot)
+      DO_CALLGRAPH_DOT=0
       shift
       ;;
     -h|--help)
@@ -144,11 +185,6 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
-
-if [[ "$CFG_MODE" != "call" && "$CFG_MODE" != "full" ]]; then
-  echo "--cfg-mode must be call or full"
-  exit 2
-fi
 
 if [[ "$DO_BUILD_IMAGE" -eq 1 ]]; then
   run_docker_build_image
@@ -164,6 +200,13 @@ fi
 
 if [[ -f "$ROOT_DIR/$BUILD_DIR/cfg_generator" ]]; then
   generate_cfg
+  if [[ "$DO_CALLGRAPH" -eq 1 ]]; then
+    if [[ ! -f "$ROOT_DIR/$BUILD_DIR/callgraph_generator" ]]; then
+      echo "callgraph_generator not found in $BUILD_DIR"
+      exit 1
+    fi
+    generate_callgraph
+  fi
   if [[ "$DO_SVG" -eq 1 ]]; then
     generate_svgs
   fi

@@ -16,9 +16,9 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 # CFG Generator executable
 add_executable(cfg_generator
     src/cfg_generator_main.cpp
+    src/analysis_output.cpp
     src/cfg_generation.cpp
     src/serialization.cpp
-    src/varuint.cpp
 )
 
 target_include_directories(cfg_generator PRIVATE
@@ -44,6 +44,21 @@ target_link_libraries(cfg_generator PRIVATE
     clangLex
 )
 
+# Callgraph generator executable
+add_executable(callgraph_generator
+    src/callgraph_generator_main.cpp
+    src/callgraph_analysis.cpp
+)
+
+target_include_directories(callgraph_generator PRIVATE
+    ${LLVM_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(callgraph_generator PRIVATE
+    LLVM
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CFGGEN_BUILD_STATIC_LINUX)
     # Note: Alpine LLVM 17 only provides dynamic libraries, so static linking won't work
     # Disabling static link options
@@ -54,32 +69,4 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CFGGEN_BUILD_STATIC_LINUX)
     # )
 endif()
 
-add_executable(cfgb_interpreter
-    src/cfgb_interpreter.cpp
-    src/cfg_generation.cpp
-    src/serialization.cpp
-    src/varuint.cpp
-)
-
-target_include_directories(cfgb_interpreter PRIVATE
-    ${LLVM_INCLUDE_DIRS}
-    ${CLANG_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
-)
-
-target_link_libraries(cfgb_interpreter PRIVATE
-    LLVM
-    clangTooling
-    clangFrontend
-    clangSerialization
-    clangDriver
-    clangParse
-    clangSema
-    clangAnalysis
-    clangAST
-    clangASTMatchers
-    clangBasic
-    clangLex
-)
-
-install(TARGETS cfg_generator cfgb_interpreter RUNTIME DESTINATION bin)
+install(TARGETS cfg_generator callgraph_generator RUNTIME DESTINATION bin)

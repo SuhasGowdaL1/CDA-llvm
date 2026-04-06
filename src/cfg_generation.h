@@ -7,13 +7,12 @@
 #include "model.h"
 
 /**
- * @brief Generates serialized CFGs for all discovered functions in the provided sources.
+ * @brief Generates CFGs and analysis facts for all discovered functions in the provided sources.
  */
 bool generateCfgBundle(
     const std::vector<std::string> &inputs,
     const std::vector<std::string> &compilationArgs,
     const std::string &functionFilter,
-    CfgMode mode,
     CfgBundle &bundle,
     std::string &errorMessage);
 

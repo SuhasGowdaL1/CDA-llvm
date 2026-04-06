@@ -5,8 +5,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
+#include "analysis_output.h"
 #include "cfg_generation.h"
-#include "serialization.h"
 
 namespace
 {
@@ -15,9 +15,9 @@ namespace
 
     llvm::cl::opt<std::string> kOutput(
         "o",
-        llvm::cl::desc("Path to output CFGB binary"),
+        llvm::cl::desc("Path to output analysis JSON"),
         llvm::cl::value_desc("file"),
-        llvm::cl::init("out/cfg.cfgb"),
+        llvm::cl::init("out/cfg-analysis.json"),
         llvm::cl::cat(kCategory));
 
     llvm::cl::opt<std::string> kDotDir(
@@ -40,13 +40,6 @@ namespace
         llvm::cl::init(""),
         llvm::cl::cat(kCategory));
 
-    llvm::cl::opt<std::string> kCfgMode(
-        "cfg-mode",
-        llvm::cl::desc("CFG mode: call (default) or full"),
-        llvm::cl::value_desc("call|full"),
-        llvm::cl::init("call"),
-        llvm::cl::cat(kCategory));
-
 } // namespace
 
 int main(int argc, const char **argv)
@@ -55,17 +48,6 @@ int main(int argc, const char **argv)
     if (!parser)
     {
         llvm::errs() << parser.takeError();
-        return 2;
-    }
-
-    CfgMode mode = CfgMode::kCallOnly;
-    if (kCfgMode == "full")
-    {
-        mode = CfgMode::kFull;
-    }
-    else if (kCfgMode != "call")
-    {
-        llvm::errs() << "error: unsupported --cfg-mode value: " << kCfgMode << "\n";
         return 2;
     }
 
@@ -78,7 +60,6 @@ int main(int argc, const char **argv)
             parser.get().getSourcePathList(),
             compileArgs,
             kFunctionFilter,
-            mode,
             bundle,
             error))
     {
@@ -92,7 +73,7 @@ int main(int argc, const char **argv)
         return 3;
     }
 
-    if (!writeCfgBinary(kOutput, bundle, error))
+    if (!writeCfgAnalysisJson(kOutput, bundle, error))
     {
         llvm::errs() << "error: " << error << "\n";
         return 1;
@@ -108,7 +89,7 @@ int main(int argc, const char **argv)
         llvm::outs() << "Wrote DOT files to: " << kDotDir << "\n";
     }
 
-    llvm::outs() << "Wrote CFGB binary to: " << kOutput << "\n";
+    llvm::outs() << "Wrote analysis JSON to: " << kOutput << "\n";
     llvm::outs() << "Functions: " << bundle.functions.size() << "\n";
     return 0;
 }

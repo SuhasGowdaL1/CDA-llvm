@@ -1,11 +1,11 @@
 #include "cfg_generation.h"
 
 #include <algorithm>
+#include <cctype>
 #include <filesystem>
 #include <fstream>
-#include <functional>
+#include <map>
 #include <memory>
-#include <set>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
@@ -26,11 +26,442 @@
 namespace
 {
 
-    struct LocatedCall
+    std::string trimCopy(const std::string &text)
     {
-        std::string name;
-        unsigned locationKey = 0;
+        std::size_t begin = 0;
+        while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0)
+        {
+            ++begin;
+        }
+
+        std::size_t end = text.size();
+        while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1U])) != 0)
+        {
+            --end;
+        }
+
+        return text.substr(begin, end - begin);
+    }
+
+    std::size_t findTopLevelChar(const std::string &text, char target, std::size_t startIndex = 0U)
+    {
+        int depthParen = 0;
+        int depthBracket = 0;
+        int depthBrace = 0;
+        bool inSingleQuote = false;
+        bool inDoubleQuote = false;
+
+        for (std::size_t i = startIndex; i < text.size(); ++i)
+        {
+            const char ch = text[i];
+            const char prev = i > 0U ? text[i - 1U] : '\0';
+
+            if (inSingleQuote)
+            {
+                if (ch == '\'' && prev != '\\')
+                {
+                    inSingleQuote = false;
+                }
+                continue;
+            }
+
+            if (inDoubleQuote)
+            {
+                if (ch == '"' && prev != '\\')
+                {
+                    inDoubleQuote = false;
+                }
+                continue;
+            }
+
+            if (ch == '\'')
+            {
+                inSingleQuote = true;
+                continue;
+            }
+            if (ch == '"')
+            {
+                inDoubleQuote = true;
+                continue;
+            }
+
+            if (ch == '(')
+            {
+                ++depthParen;
+                continue;
+            }
+            if (ch == ')' && depthParen > 0)
+            {
+                --depthParen;
+                continue;
+            }
+            if (ch == '[')
+            {
+                ++depthBracket;
+                continue;
+            }
+            if (ch == ']' && depthBracket > 0)
+            {
+                --depthBracket;
+                continue;
+            }
+            if (ch == '{')
+            {
+                ++depthBrace;
+                continue;
+            }
+            if (ch == '}' && depthBrace > 0)
+            {
+                --depthBrace;
+                continue;
+            }
+
+            if (depthParen == 0 && depthBracket == 0 && depthBrace == 0 && ch == target)
+            {
+                return i;
+            }
+        }
+
+        return std::string::npos;
+    }
+
+    struct ConditionalStoreInfo
+    {
+        std::string left;
+        std::string variable;
+        std::string trueExpression;
+        std::string falseExpression;
+        bool isDeclaration = false;
     };
+
+    bool parseConditionalStoreLine(const std::string &line, ConditionalStoreInfo &info)
+    {
+        const std::string trimmed = trimCopy(line);
+        if (trimmed.empty() || trimmed.back() != ';')
+        {
+            return false;
+        }
+
+        const std::string withoutSemicolon = trimCopy(trimmed.substr(0, trimmed.size() - 1U));
+        const std::size_t equalIndex = findTopLevelChar(withoutSemicolon, '=');
+        if (equalIndex == std::string::npos)
+        {
+            return false;
+        }
+
+        const std::string left = trimCopy(withoutSemicolon.substr(0, equalIndex));
+        const std::string right = trimCopy(withoutSemicolon.substr(equalIndex + 1U));
+        if (left.empty() || right.empty())
+        {
+            return false;
+        }
+
+        const std::size_t questionIndex = findTopLevelChar(right, '?');
+        if (questionIndex == std::string::npos)
+        {
+            return false;
+        }
+
+        const std::size_t colonIndex = findTopLevelChar(right, ':', questionIndex + 1U);
+        if (colonIndex == std::string::npos)
+        {
+            return false;
+        }
+
+        const std::string trueExpression = trimCopy(right.substr(questionIndex + 1U, colonIndex - (questionIndex + 1U)));
+        const std::string falseExpression = trimCopy(right.substr(colonIndex + 1U));
+        if (trueExpression.empty() || falseExpression.empty())
+        {
+            return false;
+        }
+
+        std::size_t end = left.size();
+        while (end > 0U && std::isspace(static_cast<unsigned char>(left[end - 1U])) != 0)
+        {
+            --end;
+        }
+        std::size_t begin = end;
+        while (begin > 0U)
+        {
+            const char ch = left[begin - 1U];
+            if (std::isalnum(static_cast<unsigned char>(ch)) == 0 && ch != '_')
+            {
+                break;
+            }
+            --begin;
+        }
+        if (begin == end)
+        {
+            return false;
+        }
+
+        info.left = left;
+        info.variable = left.substr(begin, end - begin);
+        info.trueExpression = trueExpression;
+        info.falseExpression = falseExpression;
+        info.isDeclaration =
+            left.find(' ') != std::string::npos &&
+            left.find("->") == std::string::npos &&
+            left.find('.') == std::string::npos &&
+            left.find('[') == std::string::npos;
+        return true;
+    }
+
+    void applyConditionalStoreDuplication(SerializedFunction &function)
+    {
+        std::unordered_map<std::uint32_t, std::size_t> blockIndexById;
+        std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> predecessors;
+        std::unordered_map<std::uint32_t, std::vector<std::string>> pendingDeclarationInsertions;
+
+        for (std::size_t index = 0; index < function.blocks.size(); ++index)
+        {
+            blockIndexById[function.blocks[index].id] = index;
+        }
+
+        for (const SerializedBlock &block : function.blocks)
+        {
+            for (std::uint32_t successor : block.successors)
+            {
+                predecessors[successor].push_back(block.id);
+            }
+        }
+
+        auto assignInPredecessor = [&](std::uint32_t predecessorId, const std::string &variable, const std::string &expression)
+        {
+            const auto blockIt = blockIndexById.find(predecessorId);
+            if (blockIt == blockIndexById.end())
+            {
+                return;
+            }
+
+            SerializedBlock &pred = function.blocks[blockIt->second];
+            const std::string assignmentLine = variable + " = " + expression + ";";
+
+            for (std::string &line : pred.lines)
+            {
+                if (trimCopy(line) == expression)
+                {
+                    line = assignmentLine;
+                    return;
+                }
+            }
+
+            if (std::find(pred.lines.begin(), pred.lines.end(), assignmentLine) == pred.lines.end())
+            {
+                pred.lines.push_back(assignmentLine);
+            }
+        };
+
+        for (SerializedBlock &block : function.blocks)
+        {
+            std::vector<std::string> updatedLines;
+            updatedLines.reserve(block.lines.size());
+
+            for (const std::string &line : block.lines)
+            {
+                ConditionalStoreInfo storeInfo;
+                if (!parseConditionalStoreLine(line, storeInfo))
+                {
+                    updatedLines.push_back(line);
+                    continue;
+                }
+
+                const auto predsIt = predecessors.find(block.id);
+                if (predsIt == predecessors.end() || predsIt->second.size() != 2U)
+                {
+                    updatedLines.push_back(line);
+                    continue;
+                }
+
+                std::vector<std::uint32_t> predIds = predsIt->second;
+                std::sort(predIds.begin(), predIds.end());
+
+                std::unordered_map<std::uint32_t, std::string> expressionByPred;
+                std::unordered_set<std::uint32_t> usedPreds;
+
+                auto matchExpressionToPred = [&](const std::string &expression)
+                {
+                    for (std::uint32_t predId : predIds)
+                    {
+                        if (usedPreds.find(predId) != usedPreds.end())
+                        {
+                            continue;
+                        }
+
+                        const auto predBlockIt = blockIndexById.find(predId);
+                        if (predBlockIt == blockIndexById.end())
+                        {
+                            continue;
+                        }
+
+                        const SerializedBlock &predBlock = function.blocks[predBlockIt->second];
+                        for (const std::string &predLine : predBlock.lines)
+                        {
+                            const std::string trimmedPredLine = trimCopy(predLine);
+                            if (trimmedPredLine == expression)
+                            {
+                                expressionByPred[predId] = expression;
+                                usedPreds.insert(predId);
+                                return;
+                            }
+                        }
+                    }
+                };
+
+                matchExpressionToPred(storeInfo.trueExpression);
+                matchExpressionToPred(storeInfo.falseExpression);
+
+                std::vector<std::string> remainingExpressions;
+                if (std::find_if(expressionByPred.begin(), expressionByPred.end(),
+                                 [&](const auto &entry)
+                                 { return entry.second == storeInfo.trueExpression; }) == expressionByPred.end())
+                {
+                    remainingExpressions.push_back(storeInfo.trueExpression);
+                }
+                if (std::find_if(expressionByPred.begin(), expressionByPred.end(),
+                                 [&](const auto &entry)
+                                 { return entry.second == storeInfo.falseExpression; }) == expressionByPred.end())
+                {
+                    remainingExpressions.push_back(storeInfo.falseExpression);
+                }
+
+                std::size_t fallbackIndex = 0;
+                for (std::uint32_t predId : predIds)
+                {
+                    if (usedPreds.find(predId) != usedPreds.end())
+                    {
+                        continue;
+                    }
+
+                    if (fallbackIndex < remainingExpressions.size())
+                    {
+                        expressionByPred[predId] = remainingExpressions[fallbackIndex++];
+                    }
+                }
+
+                for (const auto &entry : expressionByPred)
+                {
+                    assignInPredecessor(entry.first, storeInfo.variable, entry.second);
+                }
+
+                if (storeInfo.isDeclaration)
+                {
+                    std::uint32_t declarationBlockId = function.entryBlockId;
+                    for (const SerializedBlock &candidate : function.blocks)
+                    {
+                        bool reachesFirst = false;
+                        bool reachesSecond = false;
+                        for (std::uint32_t successor : candidate.successors)
+                        {
+                            if (successor == predIds[0])
+                            {
+                                reachesFirst = true;
+                            }
+                            if (successor == predIds[1])
+                            {
+                                reachesSecond = true;
+                            }
+                        }
+
+                        if (reachesFirst && reachesSecond)
+                        {
+                            declarationBlockId = candidate.id;
+                            break;
+                        }
+                    }
+
+                    const std::string declarationLine = storeInfo.left + ";";
+                    std::vector<std::string> &pending = pendingDeclarationInsertions[declarationBlockId];
+                    if (std::find(pending.begin(), pending.end(), declarationLine) == pending.end())
+                    {
+                        pending.push_back(declarationLine);
+                    }
+                }
+            }
+
+            block.lines.swap(updatedLines);
+        }
+
+        for (SerializedBlock &block : function.blocks)
+        {
+            const auto pendingIt = pendingDeclarationInsertions.find(block.id);
+            if (pendingIt == pendingDeclarationInsertions.end())
+            {
+                continue;
+            }
+
+            std::vector<std::string> insertions;
+            for (const std::string &declarationLine : pendingIt->second)
+            {
+                if (std::find(block.lines.begin(), block.lines.end(), declarationLine) == block.lines.end())
+                {
+                    insertions.push_back(declarationLine);
+                }
+            }
+
+            if (insertions.empty())
+            {
+                continue;
+            }
+
+            std::vector<std::string> merged;
+            merged.reserve(insertions.size() + block.lines.size());
+            merged.insert(merged.end(), insertions.begin(), insertions.end());
+            merged.insert(merged.end(), block.lines.begin(), block.lines.end());
+            block.lines.swap(merged);
+        }
+    }
+
+    bool containsSpellingRange(
+        const clang::SourceRange &outer,
+        const clang::SourceRange &inner,
+        const clang::SourceManager &sourceManager)
+    {
+        const clang::SourceLocation outerBegin = sourceManager.getSpellingLoc(outer.getBegin());
+        const clang::SourceLocation outerEnd = sourceManager.getSpellingLoc(outer.getEnd());
+        const clang::SourceLocation innerBegin = sourceManager.getSpellingLoc(inner.getBegin());
+        const clang::SourceLocation innerEnd = sourceManager.getSpellingLoc(inner.getEnd());
+
+        if (outerBegin.isInvalid() || outerEnd.isInvalid() || innerBegin.isInvalid() || innerEnd.isInvalid())
+        {
+            return false;
+        }
+
+        if (!sourceManager.isWrittenInSameFile(outerBegin, innerBegin) ||
+            !sourceManager.isWrittenInSameFile(outerBegin, innerEnd) ||
+            !sourceManager.isWrittenInSameFile(outerBegin, outerEnd))
+        {
+            return false;
+        }
+
+        const bool beginInside =
+            outerBegin == innerBegin || sourceManager.isBeforeInTranslationUnit(outerBegin, innerBegin);
+        const bool endInside =
+            innerEnd == outerEnd || sourceManager.isBeforeInTranslationUnit(innerEnd, outerEnd);
+        return beginInside && endInside;
+    }
+
+    SourceLocationRecord buildSourceLocationRecord(
+        clang::SourceLocation location,
+        const clang::SourceManager &sourceManager)
+    {
+        SourceLocationRecord record;
+        if (!location.isValid())
+        {
+            return record;
+        }
+
+        const clang::SourceLocation spellingLocation = sourceManager.getSpellingLoc(location);
+        if (spellingLocation.isInvalid())
+        {
+            return record;
+        }
+
+        record.file = sourceManager.getFilename(spellingLocation).str();
+        record.line = sourceManager.getSpellingLineNumber(spellingLocation);
+        record.column = sourceManager.getSpellingColumnNumber(spellingLocation);
+        return record;
+    }
 
     class CallVisitor : public clang::RecursiveASTVisitor<CallVisitor>
     {
@@ -47,44 +478,155 @@ namespace
                 return true;
             }
 
-            clang::FunctionDecl *callee = call->getDirectCallee();
-            if (callee == nullptr)
-            {
-                return true;
-            }
-
-            const std::string calleeName = callee->getQualifiedNameAsString();
             const clang::SourceManager &sourceManager = context_.getSourceManager();
             const clang::SourceLocation location = sourceManager.getSpellingLoc(call->getExprLoc());
             const unsigned locationKey = location.getRawEncoding();
 
-            const std::string key = calleeName + "#" + std::to_string(locationKey);
-            if (seen_.insert(key).second)
+            CallSiteRecord callsite;
+            callsite.calleeExpression = extractExpressionText(call->getCallee());
+            callsite.location = buildSourceLocationRecord(location, sourceManager);
+
+            clang::FunctionDecl *callee = call->getDirectCallee();
+            if (callee != nullptr)
             {
-                calls_.push_back(LocatedCall{calleeName, locationKey});
+                callsite.directCallee = callee->getQualifiedNameAsString();
+
+                if (callsite.directCallee == "State_Change")
+                {
+                    if (stateChangeValues_.empty())
+                    {
+                        stateChangeValues_.assign(3, std::set<std::string>{});
+                    }
+                    for (unsigned argIndex = 0; argIndex < 3U; ++argIndex)
+                    {
+                        if (argIndex < call->getNumArgs())
+                        {
+                            stateChangeValues_[argIndex].insert(extractExpressionText(call->getArg(argIndex)));
+                        }
+                    }
+                }
+            }
+            else
+            {
+                callsite.isIndirect = true;
+                callsite.throughIdentifier = extractReferencedIdentifier(call->getCallee());
             }
 
-            if (calleeName == "State_Change")
+            for (const clang::Expr *argument : call->arguments())
             {
-                if (stateChangeValues_.empty())
+                callsite.argumentExpressions.push_back(extractExpressionText(argument));
+            }
+
+            const std::string siteKey =
+                std::to_string(locationKey) +
+                "#" +
+                callsite.directCallee +
+                "#" +
+                callsite.calleeExpression;
+            if (seenCallSites_.insert(siteKey).second)
+            {
+                callSites_.push_back(std::move(callsite));
+            }
+
+            for (const clang::Expr *argument : call->arguments())
+            {
+                const std::string functionSymbol = extractFunctionSymbol(argument);
+                if (!functionSymbol.empty())
                 {
-                    stateChangeValues_.assign(3, std::set<std::string>{});
-                }
-                for (unsigned argIndex = 0; argIndex < 3U; ++argIndex)
-                {
-                    if (argIndex < call->getNumArgs())
-                    {
-                        stateChangeValues_[argIndex].insert(extractArgumentText(call->getArg(argIndex)));
-                    }
+                    addressTakenFunctions_.insert(functionSymbol);
                 }
             }
 
             return true;
         }
 
-        const std::vector<LocatedCall> &calls() const
+        bool VisitBinaryOperator(clang::BinaryOperator *binaryOperator)
         {
-            return calls_;
+            if (binaryOperator == nullptr || !binaryOperator->isAssignmentOp())
+            {
+                return true;
+            }
+
+            PointerAssignmentRecord assignment;
+            assignment.lhsExpression = extractExpressionText(binaryOperator->getLHS());
+            assignment.rhsExpression = extractExpressionText(binaryOperator->getRHS());
+            assignment.assignedFunction = extractFunctionSymbol(binaryOperator->getRHS());
+            assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
+
+            const clang::SourceManager &sourceManager = context_.getSourceManager();
+            const clang::SourceLocation location = sourceManager.getSpellingLoc(binaryOperator->getExprLoc());
+            assignment.location = buildSourceLocationRecord(location, sourceManager);
+
+            if (assignment.rhsTakesFunctionAddress)
+            {
+                addressTakenFunctions_.insert(assignment.assignedFunction);
+            }
+
+            const std::string key =
+                assignment.lhsExpression +
+                "#" +
+                assignment.rhsExpression +
+                "#" +
+                std::to_string(location.getRawEncoding());
+            if (!assignment.lhsExpression.empty() && !assignment.rhsExpression.empty() &&
+                seenAssignments_.insert(key).second)
+            {
+                pointerAssignments_.push_back(std::move(assignment));
+            }
+
+            return true;
+        }
+
+        bool VisitVarDecl(clang::VarDecl *varDecl)
+        {
+            if (varDecl == nullptr || !varDecl->hasInit())
+            {
+                return true;
+            }
+
+            PointerAssignmentRecord assignment;
+            assignment.lhsExpression = varDecl->getQualifiedNameAsString();
+            assignment.rhsExpression = extractExpressionText(varDecl->getInit());
+            assignment.assignedFunction = extractFunctionSymbol(varDecl->getInit());
+            assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
+
+            const clang::SourceManager &sourceManager = context_.getSourceManager();
+            const clang::SourceLocation location = sourceManager.getSpellingLoc(varDecl->getLocation());
+            assignment.location = buildSourceLocationRecord(location, sourceManager);
+
+            if (assignment.rhsTakesFunctionAddress)
+            {
+                addressTakenFunctions_.insert(assignment.assignedFunction);
+            }
+
+            const std::string key =
+                assignment.lhsExpression +
+                "#" +
+                assignment.rhsExpression +
+                "#" +
+                std::to_string(location.getRawEncoding());
+            if (!assignment.lhsExpression.empty() && !assignment.rhsExpression.empty() &&
+                seenAssignments_.insert(key).second)
+            {
+                pointerAssignments_.push_back(std::move(assignment));
+            }
+
+            return true;
+        }
+
+        const std::vector<CallSiteRecord> &callSites() const
+        {
+            return callSites_;
+        }
+
+        const std::vector<PointerAssignmentRecord> &pointerAssignments() const
+        {
+            return pointerAssignments_;
+        }
+
+        const std::set<std::string> &addressTakenFunctions() const
+        {
+            return addressTakenFunctions_;
         }
 
         const std::vector<std::set<std::string>> &stateChangeValues() const
@@ -93,7 +635,7 @@ namespace
         }
 
     private:
-        std::string extractArgumentText(const clang::Expr *expr)
+        std::string extractExpressionText(const clang::Expr *expr)
         {
             if (expr == nullptr)
             {
@@ -107,22 +649,76 @@ namespace
             return normalizeWhitespace(text.str());
         }
 
+        std::string extractFunctionSymbol(const clang::Expr *expr)
+        {
+            if (expr == nullptr)
+            {
+                return "";
+            }
+
+            const clang::Expr *stripped = expr->IgnoreParenImpCasts();
+
+            if (const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped))
+            {
+                if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(declRef->getDecl()))
+                {
+                    return functionDecl->getQualifiedNameAsString();
+                }
+            }
+
+            if (const auto *unaryOperator = llvm::dyn_cast<clang::UnaryOperator>(stripped))
+            {
+                if (unaryOperator->getOpcode() == clang::UO_AddrOf)
+                {
+                    const clang::Expr *subExpression = unaryOperator->getSubExpr()->IgnoreParenImpCasts();
+                    if (const auto *subDeclRef = llvm::dyn_cast<clang::DeclRefExpr>(subExpression))
+                    {
+                        if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(subDeclRef->getDecl()))
+                        {
+                            return functionDecl->getQualifiedNameAsString();
+                        }
+                    }
+                }
+            }
+
+            return "";
+        }
+
+        std::string extractReferencedIdentifier(const clang::Expr *expr)
+        {
+            if (expr == nullptr)
+            {
+                return "";
+            }
+            const clang::Expr *stripped = expr->IgnoreParenImpCasts();
+            const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped);
+            if (declRef == nullptr)
+            {
+                return "";
+            }
+
+            const auto *valueDecl = llvm::dyn_cast<clang::ValueDecl>(declRef->getDecl());
+            if (valueDecl == nullptr)
+            {
+                return "";
+            }
+
+            if (llvm::isa<clang::FunctionDecl>(valueDecl))
+            {
+                return "";
+            }
+
+            return valueDecl->getQualifiedNameAsString();
+        }
+
         clang::ASTContext &context_;
-        std::vector<LocatedCall> calls_;
-        std::unordered_set<std::string> seen_;
+        std::vector<CallSiteRecord> callSites_;
+        std::vector<PointerAssignmentRecord> pointerAssignments_;
+        std::set<std::string> addressTakenFunctions_;
+        std::unordered_set<std::string> seenCallSites_;
+        std::unordered_set<std::string> seenAssignments_;
         std::vector<std::set<std::string>> stateChangeValues_;
     };
-
-    std::vector<LocatedCall> extractDirectCallees(const clang::Stmt *statement, clang::ASTContext &context)
-    {
-        if (statement == nullptr)
-        {
-            return {};
-        }
-        CallVisitor visitor(context);
-        visitor.TraverseStmt(const_cast<clang::Stmt *>(statement));
-        return visitor.calls();
-    }
 
     std::string extractStatementText(const clang::Stmt *statement, clang::ASTContext &context)
     {
@@ -137,11 +733,49 @@ namespace
         return normalizeWhitespace(text.str());
     }
 
-    std::vector<std::string> collectBlockLines(const clang::CFGBlock &block, clang::ASTContext &context, CfgMode mode)
+    std::vector<std::string> collectBlockLines(const clang::CFGBlock &block, clang::ASTContext &context)
     {
         std::vector<std::string> lines;
         std::set<const clang::Stmt *> seenStatements;
-        std::set<std::string> seenCallSites;
+        std::unordered_map<unsigned, std::string> bestTextByLine;
+        std::unordered_map<unsigned, int> bestScoreByLine;
+        std::vector<unsigned> lineOrder;
+        std::vector<clang::SourceRange> containerRanges;
+
+        for (const clang::CFGElement &element : block)
+        {
+            auto statement = element.getAs<clang::CFGStmt>();
+            if (!statement)
+            {
+                continue;
+            }
+
+            const clang::Stmt *stmt = statement->getStmt();
+            if (stmt == nullptr)
+            {
+                continue;
+            }
+
+            if (llvm::isa<clang::ReturnStmt>(stmt) || llvm::isa<clang::DeclStmt>(stmt))
+            {
+                containerRanges.push_back(stmt->getSourceRange());
+            }
+        }
+
+        auto scoreStatement = [](const clang::Stmt *stmt, const std::string &text)
+        {
+            int score = 0;
+            if (!llvm::isa<clang::Expr>(stmt))
+            {
+                score += 100;
+            }
+            if (llvm::isa<clang::DeclStmt>(stmt) || llvm::isa<clang::ReturnStmt>(stmt))
+            {
+                score += 25;
+            }
+            score += static_cast<int>(std::min<std::size_t>(text.size(), 200U));
+            return score;
+        };
 
         for (const clang::CFGElement &element : block)
         {
@@ -156,132 +790,78 @@ namespace
                 continue;
             }
 
-            if (mode == CfgMode::kFull)
+            if (llvm::isa<clang::Expr>(stmt))
             {
-                const std::string stmtText = extractStatementText(stmt, context);
-                if (!stmtText.empty())
+                bool nestedInContainer = false;
+                const clang::SourceManager &sourceManager = context.getSourceManager();
+                const clang::SourceRange sourceRange = stmt->getSourceRange();
+                for (const clang::SourceRange &containerRange : containerRanges)
                 {
-                    lines.push_back(stmtText);
-                }
-            }
-            else
-            {
-                const std::vector<LocatedCall> calls = extractDirectCallees(stmt, context);
-                for (const LocatedCall &call : calls)
-                {
-                    const std::string siteKey = call.name + "#" + std::to_string(call.locationKey);
-                    if (seenCallSites.insert(siteKey).second)
+                    if (containsSpellingRange(containerRange, sourceRange, sourceManager))
                     {
-                        lines.push_back(call.name);
+                        nestedInContainer = true;
+                        break;
                     }
                 }
+
+                if (nestedInContainer)
+                {
+                    continue;
+                }
+            }
+
+            const std::string stmtText = extractStatementText(stmt, context);
+            if (stmtText.empty())
+            {
+                continue;
+            }
+
+            const clang::SourceManager &sourceManager = context.getSourceManager();
+            const clang::SourceLocation begin = sourceManager.getSpellingLoc(stmt->getBeginLoc());
+            const unsigned line = begin.isValid() ? sourceManager.getSpellingLineNumber(begin) : 0U;
+
+            if (line == 0U)
+            {
+                lines.push_back(stmtText);
+                continue;
+            }
+
+            const int score = scoreStatement(stmt, stmtText);
+            const auto existing = bestTextByLine.find(line);
+            if (existing == bestTextByLine.end())
+            {
+                bestTextByLine[line] = stmtText;
+                bestScoreByLine[line] = score;
+                lineOrder.push_back(line);
+                continue;
+            }
+
+            const int currentBest = bestScoreByLine[line];
+            if (score > currentBest ||
+                (score == currentBest && stmtText.size() > existing->second.size()))
+            {
+                bestTextByLine[line] = stmtText;
+                bestScoreByLine[line] = score;
+            }
+        }
+
+        for (unsigned line : lineOrder)
+        {
+            const auto it = bestTextByLine.find(line);
+            if (it != bestTextByLine.end())
+            {
+                lines.push_back(it->second);
             }
         }
 
         return lines;
     }
 
-    std::vector<LoopGroup> detectLoopGroups(const std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> &graph)
-    {
-        std::unordered_map<std::uint32_t, int> indexByNode;
-        std::unordered_map<std::uint32_t, int> lowlinkByNode;
-        std::unordered_set<std::uint32_t> onStack;
-        std::vector<std::uint32_t> stack;
-        std::vector<LoopGroup> loopGroups;
-        int nextIndex = 0;
-
-        std::function<void(std::uint32_t)> strongConnect = [&](std::uint32_t node)
-        {
-            indexByNode[node] = nextIndex;
-            lowlinkByNode[node] = nextIndex;
-            ++nextIndex;
-            stack.push_back(node);
-            onStack.insert(node);
-
-            const auto it = graph.find(node);
-            if (it != graph.end())
-            {
-                for (std::uint32_t successor : it->second)
-                {
-                    if (indexByNode.find(successor) == indexByNode.end())
-                    {
-                        strongConnect(successor);
-                        lowlinkByNode[node] = std::min(lowlinkByNode[node], lowlinkByNode[successor]);
-                    }
-                    else if (onStack.find(successor) != onStack.end())
-                    {
-                        lowlinkByNode[node] = std::min(lowlinkByNode[node], indexByNode[successor]);
-                    }
-                }
-            }
-
-            if (lowlinkByNode[node] == indexByNode[node])
-            {
-                std::vector<std::uint32_t> component;
-                while (!stack.empty())
-                {
-                    const std::uint32_t top = stack.back();
-                    stack.pop_back();
-                    onStack.erase(top);
-                    component.push_back(top);
-                    if (top == node)
-                    {
-                        break;
-                    }
-                }
-
-                bool isLoop = component.size() > 1U;
-                if (!isLoop && !component.empty())
-                {
-                    const auto selfIt = graph.find(component.front());
-                    if (selfIt != graph.end())
-                    {
-                        for (std::uint32_t successor : selfIt->second)
-                        {
-                            if (successor == component.front())
-                            {
-                                isLoop = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (isLoop)
-                {
-                    std::sort(component.begin(), component.end());
-                    loopGroups.push_back(LoopGroup{std::move(component)});
-                }
-            }
-        };
-
-        for (const auto &entry : graph)
-        {
-            if (indexByNode.find(entry.first) == indexByNode.end())
-            {
-                strongConnect(entry.first);
-            }
-        }
-
-        std::sort(loopGroups.begin(), loopGroups.end(), [](const LoopGroup &lhs, const LoopGroup &rhs)
-                  {
-            if (lhs.blockIds.size() != rhs.blockIds.size())
-            {
-                return lhs.blockIds.size() < rhs.blockIds.size();
-            }
-            return lhs.blockIds < rhs.blockIds; });
-
-        return loopGroups;
-    }
-
     struct CollectorState
     {
         clang::ASTContext *context = nullptr;
-        CfgMode mode = CfgMode::kCallOnly;
         std::string functionFilter;
         std::vector<SerializedFunction> *functions = nullptr;
-        std::unordered_map<std::string, std::vector<std::set<std::string>>> stateChangeMap;
-        std::unordered_map<std::string, std::set<std::string>> directCallGraph;
     };
 
     class CfgVisitor : public clang::RecursiveASTVisitor<CfgVisitor>
@@ -325,8 +905,6 @@ namespace
             function.exitBlockId = static_cast<std::uint32_t>(graph->getExit().getBlockID());
 
             std::vector<SerializedBlock> rawBlocks;
-            std::unordered_map<std::uint32_t, const SerializedBlock *> rawById;
-            std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> adjacency;
 
             for (const clang::CFGBlock *block : *graph)
             {
@@ -337,7 +915,7 @@ namespace
 
                 SerializedBlock serializedBlock;
                 serializedBlock.id = static_cast<std::uint32_t>(block->getBlockID());
-                serializedBlock.lines = collectBlockLines(*block, *state_.context, state_.mode);
+                serializedBlock.lines = collectBlockLines(*block, *state_.context);
 
                 for (clang::CFGBlock::const_succ_iterator successorIt = block->succ_begin();
                      successorIt != block->succ_end();
@@ -350,232 +928,18 @@ namespace
                     }
                 }
 
-                adjacency[serializedBlock.id] = serializedBlock.successors;
                 rawBlocks.push_back(std::move(serializedBlock));
             }
 
-            const std::vector<LoopGroup> loopGroups = detectLoopGroups(adjacency);
-            std::unordered_set<std::uint32_t> loopMembers;
-            for (const LoopGroup &group : loopGroups)
-            {
-                for (std::uint32_t blockId : group.blockIds)
-                {
-                    loopMembers.insert(blockId);
-                }
-            }
-            for (SerializedBlock &block : rawBlocks)
-            {
-                block.attributes.hasLoop = loopMembers.find(block.id) != loopMembers.end();
-                rawById[block.id] = &block;
-            }
-
-            function.attributes.loopGroups = loopGroups;
-
-            auto hasContent = [](const SerializedBlock &block)
-            {
-                for (const std::string &line : block.lines)
-                {
-                    if (!line.empty())
-                    {
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            if (state_.mode == CfgMode::kFull)
-            {
-                function.blocks = rawBlocks;
-            }
-            else
-            {
-                auto isKeptId = [&](std::uint32_t blockId)
-                {
-                    const auto blockIt = rawById.find(blockId);
-                    if (blockIt == rawById.end())
-                    {
-                        return false;
-                    }
-                    const SerializedBlock &block = *blockIt->second;
-                    return hasContent(block) ||
-                           block.id == function.entryBlockId ||
-                           block.id == function.exitBlockId ||
-                           loopMembers.find(block.id) != loopMembers.end();
-                };
-
-                std::set<std::uint32_t> callBlocks;
-                for (const SerializedBlock &block : rawBlocks)
-                {
-                    if (hasContent(block))
-                    {
-                        callBlocks.insert(block.id);
-                    }
-                }
-
-                auto nextCallBlocks = [&](std::uint32_t startId)
-                {
-                    std::set<std::uint32_t> result;
-                    std::set<std::uint32_t> visited;
-                    std::vector<std::uint32_t> work;
-
-                    const auto startIt = rawById.find(startId);
-                    if (startIt == rawById.end())
-                    {
-                        return result;
-                    }
-
-                    for (std::uint32_t successor : startIt->second->successors)
-                    {
-                        work.push_back(successor);
-                    }
-
-                    while (!work.empty())
-                    {
-                        const std::uint32_t current = work.back();
-                        work.pop_back();
-                        if (!visited.insert(current).second)
-                        {
-                            continue;
-                        }
-
-                        const auto currentIt = rawById.find(current);
-                        if (currentIt == rawById.end())
-                        {
-                            continue;
-                        }
-
-                        if (callBlocks.find(current) != callBlocks.end())
-                        {
-                            result.insert(current);
-                            continue;
-                        }
-
-                        if (current == function.exitBlockId)
-                        {
-                            result.insert(current);
-                            continue;
-                        }
-
-                        for (std::uint32_t successor : currentIt->second->successors)
-                        {
-                            work.push_back(successor);
-                        }
-                    }
-
-                    return result;
-                };
-
-                for (const SerializedBlock &block : rawBlocks)
-                {
-                    const bool keepBlock =
-                        hasContent(block) ||
-                        block.id == function.entryBlockId ||
-                        block.id == function.exitBlockId ||
-                        loopMembers.find(block.id) != loopMembers.end();
-
-                    if (!keepBlock)
-                    {
-                        continue;
-                    }
-
-                    SerializedBlock reduced;
-                    reduced.id = block.id;
-                    reduced.attributes = block.attributes;
-
-                    if (block.id == function.exitBlockId)
-                    {
-                        reduced.successors.clear();
-                    }
-                    else if (loopMembers.find(block.id) != loopMembers.end())
-                    {
-                        for (std::uint32_t successor : block.successors)
-                        {
-                            if (isKeptId(successor))
-                            {
-                                reduced.successors.push_back(successor);
-                            }
-                        }
-                    }
-                    else
-                    {
-                        const std::set<std::uint32_t> next = nextCallBlocks(block.id);
-                        reduced.successors.assign(next.begin(), next.end());
-                    }
-                    for (const std::string &line : block.lines)
-                    {
-                        if (!line.empty())
-                        {
-                            reduced.lines.push_back(line);
-                        }
-                    }
-                    function.blocks.push_back(std::move(reduced));
-                }
-
-                // Final cleanup for call-only binary storage: keep only entry, exit, and call-bearing blocks.
-                std::unordered_set<std::uint32_t> keptIds;
-                for (const SerializedBlock &block : function.blocks)
-                {
-                    const bool keep =
-                        block.id == function.entryBlockId ||
-                        block.id == function.exitBlockId ||
-                        hasContent(block) ||
-                        loopMembers.find(block.id) != loopMembers.end();
-                    if (keep)
-                    {
-                        keptIds.insert(block.id);
-                    }
-                }
-
-                std::vector<SerializedBlock> compacted;
-                compacted.reserve(function.blocks.size());
-                for (const SerializedBlock &block : function.blocks)
-                {
-                    if (keptIds.find(block.id) == keptIds.end())
-                    {
-                        continue;
-                    }
-
-                    SerializedBlock compact = block;
-                    std::vector<std::uint32_t> filteredSucc;
-                    for (std::uint32_t successor : compact.successors)
-                    {
-                        if (keptIds.find(successor) != keptIds.end())
-                        {
-                            filteredSucc.push_back(successor);
-                        }
-                    }
-                    compact.successors.swap(filteredSucc);
-                    compacted.push_back(std::move(compact));
-                }
-                function.blocks.swap(compacted);
-
-                std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> reducedAdjacency;
-                for (const SerializedBlock &block : function.blocks)
-                {
-                    reducedAdjacency[block.id] = block.successors;
-                }
-                const std::vector<LoopGroup> reducedLoopGroups = detectLoopGroups(reducedAdjacency);
-                std::unordered_set<std::uint32_t> reducedLoopMembers;
-                for (const LoopGroup &group : reducedLoopGroups)
-                {
-                    for (std::uint32_t blockId : group.blockIds)
-                    {
-                        reducedLoopMembers.insert(blockId);
-                    }
-                }
-                function.attributes.loopGroups = reducedLoopGroups;
-                for (SerializedBlock &block : function.blocks)
-                {
-                    block.attributes.hasLoop = reducedLoopMembers.find(block.id) != reducedLoopMembers.end();
-                }
-            }
+            function.blocks = rawBlocks;
+            applyConditionalStoreDuplication(function);
 
             CallVisitor callVisitor(*state_.context);
             callVisitor.TraverseStmt(body);
-            for (const LocatedCall &call : callVisitor.calls())
-            {
-                state_.directCallGraph[function.name].insert(call.name);
-            }
+
+            function.attributes.callSites = callVisitor.callSites();
+            function.attributes.pointerAssignments = callVisitor.pointerAssignments();
+            function.attributes.addressTakenFunctions = callVisitor.addressTakenFunctions();
 
             if (!callVisitor.stateChangeValues().empty())
             {
@@ -647,109 +1011,12 @@ namespace
         CollectorState &state_;
     };
 
-    void computeRecursionAttributes(
-        std::vector<SerializedFunction> &functions,
-        const std::unordered_map<std::string, std::set<std::string>> &directCallGraph)
-    {
-        std::unordered_map<std::string, std::size_t> indexByName;
-        for (std::size_t index = 0; index < functions.size(); ++index)
-        {
-            indexByName[functions[index].name] = index;
-        }
-
-        for (SerializedFunction &function : functions)
-        {
-            const auto graphIt = directCallGraph.find(function.name);
-            function.attributes.hasDirectRecursion =
-                graphIt != directCallGraph.end() && graphIt->second.find(function.name) != graphIt->second.end();
-        }
-
-        std::vector<int> index(functions.size(), -1);
-        std::vector<int> lowlink(functions.size(), -1);
-        std::vector<bool> onStack(functions.size(), false);
-        std::vector<std::size_t> stack;
-        int nextIndex = 0;
-
-        std::function<void(std::size_t)> strongConnect = [&](std::size_t v)
-        {
-            index[v] = nextIndex;
-            lowlink[v] = nextIndex;
-            ++nextIndex;
-            stack.push_back(v);
-            onStack[v] = true;
-
-            const auto graphIt = directCallGraph.find(functions[v].name);
-            if (graphIt != directCallGraph.end())
-            {
-                for (const std::string &callee : graphIt->second)
-                {
-                    auto it = indexByName.find(callee);
-                    if (it == indexByName.end())
-                    {
-                        continue;
-                    }
-                    const std::size_t w = it->second;
-                    if (index[w] == -1)
-                    {
-                        strongConnect(w);
-                        lowlink[v] = std::min(lowlink[v], lowlink[w]);
-                    }
-                    else if (onStack[w])
-                    {
-                        lowlink[v] = std::min(lowlink[v], index[w]);
-                    }
-                }
-            }
-
-            if (lowlink[v] == index[v])
-            {
-                std::vector<std::size_t> component;
-                while (!stack.empty())
-                {
-                    const std::size_t w = stack.back();
-                    stack.pop_back();
-                    onStack[w] = false;
-                    component.push_back(w);
-                    if (w == v)
-                    {
-                        break;
-                    }
-                }
-
-                if (component.size() > 1U)
-                {
-                    for (std::size_t functionIndex : component)
-                    {
-                        functions[functionIndex].attributes.hasIndirectRecursion = true;
-                        for (std::size_t peerIndex : component)
-                        {
-                            if (peerIndex != functionIndex)
-                            {
-                                functions[functionIndex].attributes.indirectRecursionPeers.insert(
-                                    functions[peerIndex].name);
-                            }
-                        }
-                    }
-                }
-            }
-        };
-
-        for (std::size_t i = 0; i < functions.size(); ++i)
-        {
-            if (index[i] == -1)
-            {
-                strongConnect(i);
-            }
-        }
-    }
-
 } // namespace
 
 bool generateCfgBundle(
     const std::vector<std::string> &inputs,
     const std::vector<std::string> &compilationArgs,
     const std::string &functionFilter,
-    CfgMode mode,
     CfgBundle &bundle,
     std::string &errorMessage)
 {
@@ -806,7 +1073,6 @@ bool generateCfgBundle(
 
     std::vector<SerializedFunction> functions;
     CollectorState state;
-    state.mode = mode;
     state.functionFilter = functionFilter;
     state.functions = &functions;
 
@@ -818,166 +1084,6 @@ bool generateCfgBundle(
         return false;
     }
 
-    computeRecursionAttributes(functions, state.directCallGraph);
-
-    if (mode == CfgMode::kCallOnly)
-    {
-        std::unordered_set<std::string> definedFunctions;
-        for (const SerializedFunction &function : functions)
-        {
-            definedFunctions.insert(function.name);
-        }
-
-        auto callNameFromLine = [](const std::string &line)
-        {
-            const std::size_t open = line.find('(');
-            if (open == std::string::npos)
-            {
-                return line;
-            }
-            return line.substr(0, open);
-        };
-
-        for (SerializedFunction &function : functions)
-        {
-            for (SerializedBlock &block : function.blocks)
-            {
-                std::vector<std::string> filtered;
-                filtered.reserve(block.lines.size());
-                for (const std::string &line : block.lines)
-                {
-                    const std::string callee = callNameFromLine(line);
-                    if (!callee.empty() && definedFunctions.find(callee) != definedFunctions.end())
-                    {
-                        filtered.push_back(line);
-                    }
-                }
-                block.lines.swap(filtered);
-            }
-
-            auto hasContent = [](const SerializedBlock &block)
-            {
-                for (const std::string &line : block.lines)
-                {
-                    if (!line.empty())
-                    {
-                        return true;
-                    }
-                }
-                return false;
-            };
-
-            std::unordered_map<std::uint32_t, const SerializedBlock *> byId;
-            for (const SerializedBlock &block : function.blocks)
-            {
-                byId[block.id] = &block;
-            }
-
-            std::unordered_set<std::uint32_t> kept;
-            for (const SerializedBlock &block : function.blocks)
-            {
-                if (block.id == function.entryBlockId ||
-                    block.id == function.exitBlockId ||
-                    hasContent(block))
-                {
-                    kept.insert(block.id);
-                }
-            }
-
-            auto nextKept = [&](std::uint32_t startId)
-            {
-                std::set<std::uint32_t> result;
-                std::set<std::uint32_t> visited;
-                std::vector<std::uint32_t> work;
-
-                const auto startIt = byId.find(startId);
-                if (startIt == byId.end())
-                {
-                    return result;
-                }
-                for (std::uint32_t successor : startIt->second->successors)
-                {
-                    work.push_back(successor);
-                }
-
-                while (!work.empty())
-                {
-                    const std::uint32_t current = work.back();
-                    work.pop_back();
-                    if (!visited.insert(current).second)
-                    {
-                        continue;
-                    }
-
-                    if (kept.find(current) != kept.end())
-                    {
-                        result.insert(current);
-                        continue;
-                    }
-
-                    const auto it = byId.find(current);
-                    if (it == byId.end())
-                    {
-                        continue;
-                    }
-
-                    for (std::uint32_t successor : it->second->successors)
-                    {
-                        work.push_back(successor);
-                    }
-                }
-
-                return result;
-            };
-
-            std::vector<SerializedBlock> compacted;
-            compacted.reserve(function.blocks.size());
-            for (const SerializedBlock &block : function.blocks)
-            {
-                if (kept.find(block.id) == kept.end())
-                {
-                    continue;
-                }
-
-                SerializedBlock reduced;
-                reduced.id = block.id;
-                reduced.lines = block.lines;
-                if (block.id == function.exitBlockId)
-                {
-                    reduced.successors.clear();
-                }
-                else
-                {
-                    const std::set<std::uint32_t> next = nextKept(block.id);
-                    reduced.successors.assign(next.begin(), next.end());
-                }
-                compacted.push_back(std::move(reduced));
-            }
-            function.blocks.swap(compacted);
-
-            std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> reducedAdj;
-            for (const SerializedBlock &block : function.blocks)
-            {
-                reducedAdj[block.id] = block.successors;
-            }
-            const std::vector<LoopGroup> loops = detectLoopGroups(reducedAdj);
-            std::unordered_set<std::uint32_t> loopMembers;
-            for (const LoopGroup &group : loops)
-            {
-                for (std::uint32_t blockId : group.blockIds)
-                {
-                    loopMembers.insert(blockId);
-                }
-            }
-            function.attributes.loopGroups = loops;
-            for (SerializedBlock &block : function.blocks)
-            {
-                block.attributes.hasLoop = loopMembers.find(block.id) != loopMembers.end();
-            }
-        }
-    }
-
-    bundle.mode = mode;
     bundle.functions = std::move(functions);
     return true;
 }
@@ -1018,14 +1124,6 @@ bool emitFunctionDotFiles(const CfgBundle &bundle, const std::string &outputDire
                 }
                 dotFile << escapeDot(line);
                 first = false;
-            }
-            if (block.attributes.hasLoop)
-            {
-                if (!first)
-                {
-                    dotFile << "\\l";
-                }
-                dotFile << "[loop]";
             }
             dotFile << "\\l\"];\n";
         }

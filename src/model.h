@@ -7,28 +7,38 @@
 #include <vector>
 
 /**
- * @brief CFG extraction mode for emitted function graphs.
+ * @brief Source location information for extracted analysis facts.
  */
-enum class CfgMode : std::uint8_t
+struct SourceLocationRecord
 {
-    kCallOnly = 0,
-    kFull = 1
+    std::string file;
+    std::uint32_t line = 0;
+    std::uint32_t column = 0;
 };
 
 /**
- * @brief A loop group made of CFG block ids.
+ * @brief One callsite with direct/indirect metadata.
  */
-struct LoopGroup
+struct CallSiteRecord
 {
-    std::vector<std::uint32_t> blockIds;
+    std::string calleeExpression;
+    std::string directCallee;
+    std::string throughIdentifier;
+    std::vector<std::string> argumentExpressions;
+    bool isIndirect = false;
+    SourceLocationRecord location;
 };
 
 /**
- * @brief Block-level attributes.
+ * @brief One pointer assignment/init fact used by indirect-call analysis.
  */
-struct BlockAttributes
+struct PointerAssignmentRecord
 {
-    bool hasLoop = false;
+    std::string lhsExpression;
+    std::string rhsExpression;
+    std::string assignedFunction;
+    bool rhsTakesFunctionAddress = false;
+    SourceLocationRecord location;
 };
 
 /**
@@ -39,7 +49,6 @@ struct SerializedBlock
     std::uint32_t id = 0;
     std::vector<std::string> lines;
     std::vector<std::uint32_t> successors;
-    BlockAttributes attributes;
 };
 
 /**
@@ -47,12 +56,11 @@ struct SerializedBlock
  */
 struct FunctionAttributes
 {
-    bool hasDirectRecursion = false;
-    bool hasIndirectRecursion = false;
     bool callsStateChange = false;
+    std::vector<CallSiteRecord> callSites;
+    std::vector<PointerAssignmentRecord> pointerAssignments;
+    std::set<std::string> addressTakenFunctions;
     std::vector<std::set<std::string>> stateChangeParameterValues;
-    std::set<std::string> indirectRecursionPeers;
-    std::vector<LoopGroup> loopGroups;
 };
 
 /**
@@ -68,11 +76,10 @@ struct SerializedFunction
 };
 
 /**
- * @brief Full CFG bundle emitted to CFGB binary.
+ * @brief Full CFG bundle emitted to analysis JSON.
  */
 struct CfgBundle
 {
-    CfgMode mode = CfgMode::kCallOnly;
     std::vector<SerializedFunction> functions;
 };
 
