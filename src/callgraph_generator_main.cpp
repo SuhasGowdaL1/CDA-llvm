@@ -1,3 +1,8 @@
+/**
+ * @file callgraph_generator_main.cpp
+ * @brief CLI entrypoint for callgraph generation from analysis JSON.
+ */
+
 #include <cstddef>
 #include <string>
 
@@ -47,6 +52,12 @@ namespace
 
 } // namespace
 
+/**
+ * @brief Program entrypoint for callgraph_generator.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return Process exit code.
+ */
 int main(int argc, const char **argv)
 {
     llvm::cl::HideUnrelatedOptions(kCategory);

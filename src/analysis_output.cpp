@@ -1,3 +1,8 @@
+/**
+ * @file analysis_output.cpp
+ * @brief JSON writer for CFG analysis bundles.
+ */
+
 #include "analysis_output.h"
 
 #include <filesystem>
@@ -7,6 +12,9 @@
 namespace
 {
 
+    /**
+     * @brief Escape a string for JSON encoding.
+     */
     std::string escapeJson(const std::string &input)
     {
         std::string output;
@@ -54,6 +62,9 @@ namespace
         return output;
     }
 
+    /**
+     * @brief Emit indentation spaces.
+     */
     void writeIndent(std::ostream &out, int indent)
     {
         for (int i = 0; i < indent; ++i)
@@ -62,11 +73,17 @@ namespace
         }
     }
 
+    /**
+     * @brief Emit a JSON string value.
+     */
     void writeString(std::ostream &out, const std::string &value)
     {
         out << '"' << escapeJson(value) << '"';
     }
 
+    /**
+     * @brief Emit a source location object.
+     */
     void writeLocation(std::ostream &out, const SourceLocationRecord &location, int indent)
     {
         out << "{\n";
@@ -82,6 +99,9 @@ namespace
         out << "}";
     }
 
+    /**
+     * @brief Emit a JSON array of strings.
+     */
     void writeStringArray(std::ostream &out, const std::vector<std::string> &values, int indent)
     {
         out << "[";
@@ -103,6 +123,9 @@ namespace
         out << "]";
     }
 
+    /**
+     * @brief Emit a deterministic JSON array for a set of strings.
+     */
     void writeStringSet(std::ostream &out, const std::set<std::string> &values, int indent)
     {
         out << "[";
@@ -126,6 +149,9 @@ namespace
         out << "]";
     }
 
+    /**
+     * @brief Emit state-change parameter value sets.
+     */
     void writeStateChangeValues(
         std::ostream &out,
         const std::vector<std::set<std::string>> &values,
@@ -150,6 +176,9 @@ namespace
         out << "]";
     }
 
+    /**
+     * @brief Emit callsite records.
+     */
     void writeCallSites(std::ostream &out, const std::vector<CallSiteRecord> &callSites, int indent)
     {
         out << "[";
@@ -161,6 +190,10 @@ namespace
                 const CallSiteRecord &callSite = callSites[i];
                 writeIndent(out, indent + 2);
                 out << "{\n";
+                writeIndent(out, indent + 4);
+                out << "\"callSiteId\": ";
+                writeString(out, callSite.callSiteId);
+                out << ",\n";
                 writeIndent(out, indent + 4);
                 out << "\"calleeExpression\": ";
                 writeString(out, callSite.calleeExpression);
@@ -196,6 +229,9 @@ namespace
         out << "]";
     }
 
+    /**
+     * @brief Emit pointer-assignment records.
+     */
     void writePointerAssignments(
         std::ostream &out,
         const std::vector<PointerAssignmentRecord> &assignments,
@@ -242,6 +278,9 @@ namespace
         out << "]";
     }
 
+    /**
+     * @brief Emit one serialized CFG block.
+     */
     void writeBlock(std::ostream &out, const SerializedBlock &block, int indent)
     {
         out << "{\n";
@@ -269,6 +308,9 @@ namespace
         out << "}";
     }
 
+    /**
+     * @brief Emit one serialized function and its attributes/blocks.
+     */
     void writeFunction(std::ostream &out, const SerializedFunction &function, int indent)
     {
         out << "{\n";
@@ -336,6 +378,10 @@ namespace
 
 } // namespace
 
+/**
+ * @brief Write the full CFG analysis bundle to JSON.
+ * @return true on success, false on failure.
+ */
 bool writeCfgAnalysisJson(const std::string &path, const CfgBundle &bundle, std::string &errorMessage)
 {
     const std::filesystem::path output(path);

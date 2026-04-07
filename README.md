@@ -113,6 +113,23 @@ Pointer assignment record fields:
 - `callgraph_generator_main.cpp`: callgraph generation CLI entrypoint.
 - `serialization.*`: shared text and DOT escaping helpers.
 
+## Design Documentation
+
+- Detailed callgraph-analysis rationale (decisions, limitations, alternatives, and challenges):
+	- `docs/callgraph-analysis-design.md`
+
+## API Documentation (Doxygen)
+
+Generate HTML docs:
+
+```sh
+doxygen Doxyfile
+```
+
+Generated site:
+
+- `docs/build/html/index.html`
+
 ## Exit Codes
 
 ### cfg_generator

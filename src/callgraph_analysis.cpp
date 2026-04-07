@@ -1,3 +1,8 @@
+/**
+ * @file callgraph_analysis.cpp
+ * @brief Flow-sensitive, context-sensitive static call graph resolver.
+ */
+
 #include "callgraph_analysis.h"
 
 #include <algorithm>
@@ -123,6 +128,9 @@ namespace
         PointsToMap seededPointsTo;
     };
 
+    /**
+     * @brief Parse a plain signed integer literal.
+     */
     bool isIntegerLiteral(const std::string &text, long long &value)
     {
         if (text.empty())
@@ -161,16 +169,25 @@ namespace
         return true;
     }
 
+    /**
+     * @brief Check whether a binding token encodes a scalar integer value.
+     */
     bool isIntegerBinding(const std::string &value)
     {
         return value.rfind("#int:", 0) == 0;
     }
 
+    /**
+     * @brief Encode scalar integer value into binding-map token format.
+     */
     std::string makeIntegerBinding(long long value)
     {
         return "#int:" + std::to_string(value);
     }
 
+    /**
+     * @brief Decode scalar integer binding token.
+     */
     std::optional<long long> parseIntegerBinding(const std::string &value)
     {
         if (!isIntegerBinding(value))
@@ -188,6 +205,9 @@ namespace
         }
     }
 
+    /**
+     * @brief Trim leading/trailing whitespace.
+     */
     std::string trimLine(const std::string &text)
     {
         std::size_t begin = 0;
@@ -205,6 +225,9 @@ namespace
         return text.substr(begin, end - begin);
     }
 
+    /**
+     * @brief Parse one serialized block from analysis JSON.
+     */
     std::optional<FunctionFacts::BlockFact> parseBlockFact(const llvm::json::Object &blockObject)
     {
         FunctionFacts::BlockFact block;
@@ -244,6 +267,9 @@ namespace
         return block;
     }
 
+    /**
+     * @brief Extract unique identifier-like tokens in appearance order.
+     */
     std::vector<std::string> extractIdentifiers(const std::string &text)
     {
         std::vector<std::string> identifiers;
@@ -282,6 +308,9 @@ namespace
         return identifiers;
     }
 
+    /**
+     * @brief Derive a canonical slot name from an expression.
+     */
     std::string canonicalSlot(const std::string &expression)
     {
         const std::vector<std::string> identifiers = extractIdentifiers(expression);
@@ -292,6 +321,9 @@ namespace
         return identifiers.back();
     }
 
+    /**
+     * @brief Parse optional source location metadata object.
+     */
     SourceLocation parseLocation(const llvm::json::Object *locationObject)
     {
         SourceLocation location;
@@ -325,6 +357,9 @@ namespace
         return location;
     }
 
+    /**
+     * @brief Parse all function facts from cfg-analysis JSON.
+     */
     bool parseFunctions(
         const llvm::json::Object &root,
         std::vector<FunctionFacts> &functions,
@@ -500,6 +535,9 @@ namespace
         return true;
     }
 
+    /**
+     * @brief Build deterministic event ordering from source locations.
+     */
     std::vector<Event> buildEvents(const FunctionFacts &function)
     {
         std::vector<Event> events;
@@ -547,6 +585,9 @@ namespace
         return events;
     }
 
+    /**
+     * @brief Resolve assignment RHS targets under current points-to map.
+     */
     std::set<std::string> resolveAssignmentTargets(
         const PointerAssignment &assignment,
         const std::set<std::string> &knownFunctions,
@@ -608,6 +649,9 @@ namespace
         return targets;
     }
 
+    /**
+     * @brief Resolve indirect call targets under current bindings.
+     */
     std::set<std::string> resolveIndirectTargets(
         const CallSite &callSite,
         const std::set<std::string> &knownFunctions,
@@ -648,6 +692,9 @@ namespace
         return targets;
     }
 
+    /**
+     * @brief Resolve function targets referenced by an expression.
+     */
     std::set<std::string> resolveExpressionTargets(
         const std::string &expression,
         const std::set<std::string> &knownFunctions,
@@ -676,6 +723,9 @@ namespace
         return targets;
     }
 
+    /**
+     * @brief Detect wrapper-style parameter dispatch functions.
+     */
     std::unordered_map<std::string, ParameterDispatchInfo> detectParameterDispatchFunctions(
         const std::vector<FunctionFacts> &functions)
     {
@@ -730,6 +780,9 @@ namespace
         return result;
     }
 
+    /**
+     * @brief Collect slots that are expected to hold function targets.
+     */
     std::set<std::string> collectPointerSlots(const FunctionFacts &function)
     {
         std::set<std::string> slots;
@@ -767,6 +820,9 @@ namespace
         return slots;
     }
 
+    /**
+     * @brief Resolve mixed scalar/function values from an expression.
+     */
     std::set<std::string> resolveMixedExpressionValues(
         const std::string &expression,
         const std::set<std::string> &knownFunctions,
@@ -807,6 +863,9 @@ namespace
         return values;
     }
 
+    /**
+     * @brief Legacy linear analyzer (retained for debugging/reference).
+     */
     void analyzeFunction(
         const FunctionFacts &function,
         const std::set<std::string> &knownFunctions,
@@ -897,6 +956,9 @@ namespace
         }
     }
 
+    /**
+     * @brief Infer parameter-like slots that should be seeded from call arguments.
+     */
     std::vector<std::string> collectParameterSlots(
         const FunctionFacts &function,
         const std::set<std::string> &knownFunctions)
@@ -979,6 +1041,9 @@ namespace
         return parameterSlots;
     }
 
+    /**
+     * @brief Build stable context key for worklist deduplication.
+     */
     std::string buildContextKey(const std::string &functionName, const PointsToMap &pointsTo)
     {
         std::vector<std::pair<std::string, std::vector<std::string>>> entries;
@@ -1010,6 +1075,9 @@ namespace
         return key;
     }
 
+    /**
+     * @brief Build callee seed bindings from caller argument expressions.
+     */
     PointsToMap buildSeedBindings(
         const CallSite &callSite,
         const std::vector<std::string> &parameterSlots,
@@ -1049,6 +1117,9 @@ namespace
         return seeds;
     }
 
+    /**
+     * @brief Run flow-sensitive and context-sensitive callgraph resolution.
+     */
     void runContextSensitiveAnalysis(
         const std::vector<FunctionFacts> &functions,
         const std::set<std::string> &knownFunctions,
@@ -1058,6 +1129,7 @@ namespace
         std::unordered_map<std::string, const FunctionFacts *> functionMap;
         std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
         std::unordered_map<std::string, std::set<std::string>> pointerSlotsByFunction;
+        // Precompute per-function metadata used during traversal.
         for (const FunctionFacts &function : functions)
         {
             functionMap[function.name] = &function;
@@ -1068,6 +1140,7 @@ namespace
         std::deque<ContextJob> worklist;
         std::unordered_set<std::string> seenContexts;
 
+        // Start from every discovered function so snippets without main are covered.
         for (const auto &entry : functionMap)
         {
             worklist.push_back(ContextJob{entry.first, {}});
@@ -1080,6 +1153,7 @@ namespace
             worklist.pop_front();
 
             const auto functionIt = functionMap.find(job.functionName);
+            // Skip stale jobs if the function cannot be found.
             if (functionIt == functionMap.end())
             {
                 continue;
@@ -1089,6 +1163,7 @@ namespace
 
             const auto blockIt = std::find_if(function.blocks.begin(), function.blocks.end(), [&](const FunctionFacts::BlockFact &block)
                                               { return block.id == function.entryBlockId; });
+            // Without a valid entry block we cannot evaluate this function.
             if (blockIt == function.blocks.end())
             {
                 continue;
@@ -1118,6 +1193,7 @@ namespace
                 return std::to_string(blockId) + "|" + buildContextKey(function.name, bindings);
             };
 
+            // Enqueue a callee analysis context seeded from this callsite.
             auto enqueueCallee = [&](const CallSite &callSite, const PointsToMap &callerBindings, const std::string &calleeName)
             {
                 const auto calleeIt = functionMap.find(calleeName);
@@ -1141,6 +1217,7 @@ namespace
                 }
             };
 
+            // Match a serialized block line to a parsed callsite record.
             auto lineMatchesCallSite = [&](const std::string &line, const CallSite &callSite)
             {
                 const std::string trimmedLine = trimLine(line);
@@ -1162,6 +1239,7 @@ namespace
                 return trimmedLine.find(callSite.calleeExpression + "(") != std::string::npos;
             };
 
+            // Lightweight evaluator retained for diagnostics and future branch pruning.
             std::function<std::optional<long long>(const std::string &, const PointsToMap &)> evaluateCondition =
                 [&](const std::string &expression, const PointsToMap &bindings) -> std::optional<long long>
             {
@@ -1244,6 +1322,7 @@ namespace
                 blockWorklist.pop_front();
 
                 const auto currentBlockIt = blockMap.find(state.blockId);
+                // Ignore invalid CFG successor IDs.
                 if (currentBlockIt == blockMap.end())
                 {
                     continue;
@@ -1251,6 +1330,7 @@ namespace
 
                 const FunctionFacts::BlockFact &block = *currentBlockIt->second;
                 const std::string stateKey = makeStateKey(block.id, state.bindings);
+                // Worklist dedup per (block, bindings) state prevents infinite loops.
                 if (!seenBlockStates.insert(stateKey).second)
                 {
                     continue;
@@ -1261,20 +1341,24 @@ namespace
                 for (const std::string &rawLine : block.lines)
                 {
                     const std::string line = trimLine(rawLine);
+                    // Empty lines carry no transfer information.
                     if (line.empty())
                     {
                         continue;
                     }
 
+                    // Try call transfer before assignment transfer on the same line.
                     if (line.find('(') != std::string::npos)
                     {
                         for (const CallSite &callSite : function.callSites)
                         {
+                            // Branch: line does not correspond to this callsite candidate.
                             if (!lineMatchesCallSite(line, callSite))
                             {
                                 continue;
                             }
 
+                            // Branch: direct call, emit direct edge and enqueue callee.
                             if (!callSite.directCallee.empty())
                             {
                                 CallEdge edge;
@@ -1291,6 +1375,7 @@ namespace
                             }
 
                             const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, bindings);
+                            // Branch: unresolved indirect call under current bindings.
                             if (targets.empty())
                             {
                                 CallEdge edge;
@@ -1320,6 +1405,7 @@ namespace
                         }
                     }
 
+                    // Filter out non-assignment lines and comparison operators.
                     if (line.find('=') == std::string::npos || line.find("==") != std::string::npos ||
                         line.find("!=") != std::string::npos || line.find("<=") != std::string::npos ||
                         line.find(">=") != std::string::npos)
@@ -1328,6 +1414,7 @@ namespace
                     }
 
                     const std::size_t equalIndex = line.find('=');
+                    // Defensive guard for malformed assignment text.
                     if (equalIndex == std::string::npos)
                     {
                         continue;
@@ -1342,18 +1429,21 @@ namespace
                     }
 
                     const std::vector<std::string> lhsIdentifiers = extractIdentifiers(lhs);
+                    // Cannot update state when no LHS slot can be identified.
                     if (lhsIdentifiers.empty())
                     {
                         continue;
                     }
                     const std::string lhsSlot = lhsIdentifiers.back();
                     const std::set<std::string> values = resolveMixedExpressionValues(rhs, knownFunctions, bindings);
+                    // Ignore assignments that resolve to no usable values.
                     if (values.empty())
                     {
                         continue;
                     }
 
                     std::set<std::string> &slotValues = bindings[lhsSlot];
+                    // Strong update: reassignment overwrites prior slot values on this path.
                     slotValues.clear();
                     const bool isPointerSlot = pointerSlots.find(lhsSlot) != pointerSlots.end();
                     for (const std::string &value : values)
@@ -1375,6 +1465,7 @@ namespace
                     }
                 }
 
+                // Propagate current state to all CFG successors.
                 for (std::uint32_t successor : block.successors)
                 {
                     blockWorklist.push_back(BlockState{successor, bindings});
@@ -1383,6 +1474,9 @@ namespace
         }
     }
 
+    /**
+     * @brief Join context stack entries with a separator.
+     */
     std::string joinContext(const std::vector<std::string> &context, const std::string &separator)
     {
         std::string joined;
@@ -1397,6 +1491,9 @@ namespace
         return joined;
     }
 
+    /**
+     * @brief Choose root functions for context-statistics traversal.
+     */
     std::vector<std::string> chooseRoots(
         const std::set<std::string> &knownFunctions,
         const std::set<CollapsedEdge> &collapsedEdges)
@@ -1443,6 +1540,9 @@ namespace
         return {};
     }
 
+    /**
+     * @brief Serialize source location to JSON object.
+     */
     llvm::json::Object locationToJson(const SourceLocation &location)
     {
         llvm::json::Object object;
@@ -1454,6 +1554,10 @@ namespace
 
 } // namespace
 
+/**
+ * @brief Generate callgraph outputs from analysis JSON.
+ * @return true on success, false on failure.
+ */
 bool generateCallGraphFromAnalysisJson(
     const std::string &analysisJsonPath,
     const std::string &outputJsonPath,

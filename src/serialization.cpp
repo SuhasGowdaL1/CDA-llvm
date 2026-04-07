@@ -1,7 +1,16 @@
+/**
+ * @file serialization.cpp
+ * @brief Implementations of string normalization and escaping helpers.
+ */
+
 #include "serialization.h"
 
 #include <cctype>
 
+/**
+ * @brief Convert arbitrary text into a conservative DOT identifier.
+ * @return Sanitized identifier or "anon" when empty.
+ */
 std::string sanitizeId(const std::string &input)
 {
     std::string output;
@@ -18,6 +27,10 @@ std::string sanitizeId(const std::string &input)
     return output.empty() ? "anon" : output;
 }
 
+/**
+ * @brief Escape a string for safe DOT label emission.
+ * @return Escaped label.
+ */
 std::string escapeDot(const std::string &input)
 {
     std::string output;
@@ -33,6 +46,10 @@ std::string escapeDot(const std::string &input)
     return output;
 }
 
+/**
+ * @brief Collapse whitespace runs and trim outer whitespace.
+ * @return Canonicalized text for stable serialization.
+ */
 std::string normalizeWhitespace(const std::string &input)
 {
     std::string output;

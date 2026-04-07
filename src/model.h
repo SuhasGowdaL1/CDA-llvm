@@ -1,3 +1,8 @@
+/**
+ * @file model.h
+ * @brief Shared analysis data model for CFG and callgraph generation.
+ */
+
 #ifndef CFG_MODEL_H
 #define CFG_MODEL_H
 
@@ -21,6 +26,7 @@ struct SourceLocationRecord
  */
 struct CallSiteRecord
 {
+    std::string callSiteId;
     std::string calleeExpression;
     std::string directCallee;
     std::string throughIdentifier;

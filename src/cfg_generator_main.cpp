@@ -1,3 +1,8 @@
+/**
+ * @file cfg_generator_main.cpp
+ * @brief CLI entrypoint for CFG and analysis-fact generation.
+ */
+
 #include <string>
 #include <vector>
 
@@ -42,6 +47,12 @@ namespace
 
 } // namespace
 
+/**
+ * @brief Program entrypoint for cfg_generator.
+ * @param argc Argument count.
+ * @param argv Argument vector.
+ * @return Process exit code.
+ */
 int main(int argc, const char **argv)
 {
     auto parser = clang::tooling::CommonOptionsParser::create(argc, argv, kCategory);

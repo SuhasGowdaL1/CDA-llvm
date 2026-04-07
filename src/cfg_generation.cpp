@@ -1,7 +1,13 @@
+/**
+ * @file cfg_generation.cpp
+ * @brief Implementation of CFG extraction, callsite fact collection, and DOT emission.
+ */
+
 #include "cfg_generation.h"
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -26,6 +32,9 @@
 namespace
 {
 
+    /**
+     * @brief Trim leading and trailing whitespace.
+     */
     std::string trimCopy(const std::string &text)
     {
         std::size_t begin = 0;
@@ -43,6 +52,9 @@ namespace
         return text.substr(begin, end - begin);
     }
 
+    /**
+     * @brief Find a character outside nested delimiters/quotes.
+     */
     std::size_t findTopLevelChar(const std::string &text, char target, std::size_t startIndex = 0U)
     {
         int depthParen = 0;
@@ -134,6 +146,9 @@ namespace
         bool isDeclaration = false;
     };
 
+    /**
+     * @brief Parse a conditional assignment statement into normalized parts.
+     */
     bool parseConditionalStoreLine(const std::string &line, ConditionalStoreInfo &info)
     {
         const std::string trimmed = trimCopy(line);
@@ -207,6 +222,9 @@ namespace
         return true;
     }
 
+    /**
+     * @brief Duplicate conditional store effects into predecessor blocks.
+     */
     void applyConditionalStoreDuplication(SerializedFunction &function)
     {
         std::unordered_map<std::uint32_t, std::size_t> blockIndexById;
@@ -412,6 +430,9 @@ namespace
         }
     }
 
+    /**
+     * @brief Check whether one source range contains another in spelling coordinates.
+     */
     bool containsSpellingRange(
         const clang::SourceRange &outer,
         const clang::SourceRange &inner,
@@ -441,6 +462,9 @@ namespace
         return beginInside && endInside;
     }
 
+    /**
+     * @brief Build a serializable source location record from a Clang location.
+     */
     SourceLocationRecord buildSourceLocationRecord(
         clang::SourceLocation location,
         const clang::SourceManager &sourceManager)
@@ -463,14 +487,52 @@ namespace
         return record;
     }
 
+    std::uint64_t fnv1a64(const std::string &text)
+    {
+        std::uint64_t hash = 1469598103934665603ULL;
+        for (unsigned char c : text)
+        {
+            hash ^= static_cast<std::uint64_t>(c);
+            hash *= 1099511628211ULL;
+        }
+        return hash;
+    }
+
+    std::string buildStableCallSiteId(const std::string &functionName, const CallSiteRecord &callsite)
+    {
+        std::ostringstream key;
+        key << functionName << "|"
+            << callsite.location.file << ":" << callsite.location.line << ":" << callsite.location.column << "|"
+            << callsite.directCallee << "|"
+            << callsite.throughIdentifier << "|"
+            << callsite.calleeExpression << "|";
+
+        for (std::size_t i = 0; i < callsite.argumentExpressions.size(); ++i)
+        {
+            if (i > 0U)
+            {
+                key << ",";
+            }
+            key << callsite.argumentExpressions[i];
+        }
+
+        return "cs_" + std::to_string(fnv1a64(key.str()));
+    }
+
+    /**
+     * @brief AST visitor that captures callsite and pointer-assignment facts.
+     */
     class CallVisitor : public clang::RecursiveASTVisitor<CallVisitor>
     {
     public:
-        explicit CallVisitor(clang::ASTContext &context)
-            : context_(context)
+        explicit CallVisitor(clang::ASTContext &context, std::string functionName)
+            : context_(context), functionName_(std::move(functionName))
         {
         }
 
+        /**
+         * @brief Record one call expression.
+         */
         bool VisitCallExpr(clang::CallExpr *call)
         {
             if (call == nullptr)
@@ -517,12 +579,12 @@ namespace
                 callsite.argumentExpressions.push_back(extractExpressionText(argument));
             }
 
+            callsite.callSiteId = buildStableCallSiteId(functionName_, callsite);
+
             const std::string siteKey =
-                std::to_string(locationKey) +
+                callsite.callSiteId +
                 "#" +
-                callsite.directCallee +
-                "#" +
-                callsite.calleeExpression;
+                std::to_string(locationKey);
             if (seenCallSites_.insert(siteKey).second)
             {
                 callSites_.push_back(std::move(callsite));
@@ -540,6 +602,9 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Record one assignment operation used for pointer flow facts.
+         */
         bool VisitBinaryOperator(clang::BinaryOperator *binaryOperator)
         {
             if (binaryOperator == nullptr || !binaryOperator->isAssignmentOp())
@@ -577,6 +642,9 @@ namespace
             return true;
         }
 
+        /**
+         * @brief Record declaration initializers relevant to pointer facts.
+         */
         bool VisitVarDecl(clang::VarDecl *varDecl)
         {
             if (varDecl == nullptr || !varDecl->hasInit())
@@ -635,6 +703,9 @@ namespace
         }
 
     private:
+        /**
+         * @brief Convert an expression into normalized source text.
+         */
         std::string extractExpressionText(const clang::Expr *expr)
         {
             if (expr == nullptr)
@@ -649,6 +720,9 @@ namespace
             return normalizeWhitespace(text.str());
         }
 
+        /**
+         * @brief Resolve a function symbol if the expression denotes one.
+         */
         std::string extractFunctionSymbol(const clang::Expr *expr)
         {
             if (expr == nullptr)
@@ -684,6 +758,9 @@ namespace
             return "";
         }
 
+        /**
+         * @brief Resolve the referenced non-function identifier, if any.
+         */
         std::string extractReferencedIdentifier(const clang::Expr *expr)
         {
             if (expr == nullptr)
@@ -712,6 +789,7 @@ namespace
         }
 
         clang::ASTContext &context_;
+        std::string functionName_;
         std::vector<CallSiteRecord> callSites_;
         std::vector<PointerAssignmentRecord> pointerAssignments_;
         std::set<std::string> addressTakenFunctions_;
@@ -720,6 +798,9 @@ namespace
         std::vector<std::set<std::string>> stateChangeValues_;
     };
 
+    /**
+     * @brief Convert a statement to normalized source text.
+     */
     std::string extractStatementText(const clang::Stmt *statement, clang::ASTContext &context)
     {
         if (statement == nullptr)
@@ -733,6 +814,9 @@ namespace
         return normalizeWhitespace(text.str());
     }
 
+    /**
+     * @brief Collect representative textual lines for one CFG block.
+     */
     std::vector<std::string> collectBlockLines(const clang::CFGBlock &block, clang::ASTContext &context)
     {
         std::vector<std::string> lines;
@@ -864,6 +948,9 @@ namespace
         std::vector<SerializedFunction> *functions = nullptr;
     };
 
+    /**
+     * @brief Visitor that serializes each function CFG and associated facts.
+     */
     class CfgVisitor : public clang::RecursiveASTVisitor<CfgVisitor>
     {
     public:
@@ -872,6 +959,9 @@ namespace
         {
         }
 
+        /**
+         * @brief Visit and serialize a function definition.
+         */
         bool VisitFunctionDecl(clang::FunctionDecl *functionDecl)
         {
             if (functionDecl == nullptr || !functionDecl->hasBody() || !functionDecl->isThisDeclarationADefinition())
@@ -934,7 +1024,7 @@ namespace
             function.blocks = rawBlocks;
             applyConditionalStoreDuplication(function);
 
-            CallVisitor callVisitor(*state_.context);
+            CallVisitor callVisitor(*state_.context, functionName);
             callVisitor.TraverseStmt(body);
 
             function.attributes.callSites = callVisitor.callSites();
@@ -955,6 +1045,9 @@ namespace
         CollectorState &state_;
     };
 
+    /**
+     * @brief Translation-unit consumer that runs CFG visitor traversal.
+     */
     class CfgConsumer : public clang::ASTConsumer
     {
     public:
@@ -963,6 +1056,9 @@ namespace
         {
         }
 
+        /**
+         * @brief Handle the parsed translation unit.
+         */
         void HandleTranslationUnit(clang::ASTContext &context) override
         {
             (void)context;
@@ -973,6 +1069,9 @@ namespace
         CfgVisitor visitor_;
     };
 
+    /**
+     * @brief Frontend action creating CFG-oriented AST consumers.
+     */
     class CfgAction : public clang::ASTFrontendAction
     {
     public:
@@ -994,6 +1093,9 @@ namespace
         CollectorState &state_;
     };
 
+    /**
+     * @brief Frontend action factory for clang::tooling invocation.
+     */
     class CfgActionFactory : public clang::tooling::FrontendActionFactory
     {
     public:
@@ -1013,6 +1115,10 @@ namespace
 
 } // namespace
 
+/**
+ * @brief Generate CFG and call/pointer facts from input sources.
+ * @return true on success, false on failure.
+ */
 bool generateCfgBundle(
     const std::vector<std::string> &inputs,
     const std::vector<std::string> &compilationArgs,
@@ -1088,6 +1194,10 @@ bool generateCfgBundle(
     return true;
 }
 
+/**
+ * @brief Emit per-function DOT CFG files.
+ * @return true on success, false on failure.
+ */
 bool emitFunctionDotFiles(const CfgBundle &bundle, const std::string &outputDirectory, std::string &errorMessage)
 {
     std::error_code ec;
