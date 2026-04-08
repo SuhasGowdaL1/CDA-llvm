@@ -84,30 +84,49 @@ run_docker_build_image() {
 }
 
 run_docker_build() {
-  local container_name
-  container_name="$(new_container_name)"
-  ACTIVE_CONTAINER_NAMES+=("$container_name")
-  docker run --rm \
-    --name "$container_name" \
-    --user "$(id -u):$(id -g)" \
-    -v "$ROOT_DIR:/work" \
-    -w /work \
-    "$IMAGE_NAME" \
-    -lc "cmake -S . -B $BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE && cmake --build $BUILD_DIR -j"
+  run_in_docker "cmake -S . -B $BUILD_DIR -G Ninja -DCMAKE_BUILD_TYPE=$BUILD_TYPE && cmake --build $BUILD_DIR -j"
 }
 
 run_in_docker() {
   local cmd="$1"
   local container_name
+  local logger_pid
+  local wait_code
+  local exit_code
+
   container_name="$(new_container_name)"
   ACTIVE_CONTAINER_NAMES+=("$container_name")
-  docker run --rm \
+
+  docker run --rm -d \
     --name "$container_name" \
     --user "$(id -u):$(id -g)" \
     -v "$ROOT_DIR:/work" \
     -w /work \
     "$IMAGE_NAME" \
     -lc "$cmd"
+
+  docker logs -f "$container_name" &
+  logger_pid=$!
+
+  wait_code="$(docker wait "$container_name")"
+  exit_code="${wait_code%%[^0-9]*}"
+  if [[ -z "$exit_code" ]]; then
+    exit_code=1
+  fi
+
+  kill "$logger_pid" >/dev/null 2>&1 || true
+  wait "$logger_pid" 2>/dev/null || true
+
+  # Remove from active list once container has exited.
+  local remaining=()
+  for name in "${ACTIVE_CONTAINER_NAMES[@]}"; do
+    if [[ "$name" != "$container_name" ]]; then
+      remaining+=("$name")
+    fi
+  done
+  ACTIVE_CONTAINER_NAMES=("${remaining[@]}")
+
+  return "$exit_code"
 }
 
 format_sources() {
