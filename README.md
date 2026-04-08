@@ -42,6 +42,9 @@ This produces:
 --docker-build             Build binaries inside Docker using Ninja
 --format-src               Format files in src/ using clang-format
 --cfg-input PATH           CFG input path (default: examples)
+--cfg-include DIR          Additional include directory (may be repeated)
+--compile-args-file FILE   Compiler args file forwarded to cfg_generator (may be repeated)
+--blacklist-file FILE      Exact function names to skip, forwarded to both generators
 --cfg-output FILE          Analysis JSON output file (default: out/cfg-analysis.json)
 --dot                      Emit per-function DOT files
 --dot-dir DIR              DOT output directory (default: out/dotfiles)
@@ -65,8 +68,32 @@ Notes:
 After Docker build has created `build-linux/*` binaries:
 
 ```sh
-./build-linux/cfg_generator --emit-dot --dot-dir out/dotfiles -o out/cfg-analysis.json examples -- -I.
+./build-linux/cfg_generator --emit-dot --dot-dir out/dotfiles -o out/cfg-analysis.json examples src --include-dir include --include-dir third_party/include -- -I.
 ./build-linux/callgraph_generator -i out/cfg-analysis.json -o out/callgraph.json --dot-output out/callgraph.dot --context-depth 3
+```
+
+You can also pass multiple source roots through `manage.sh` by repeating `--cfg-input`, for example:
+
+```sh
+./manage.sh --docker-build --cfg-input examples --cfg-input src --cfg-include include --cfg-include third_party/include --dot --callgraph
+```
+
+If you want to keep compiler flags in a file, add one or more `--compile-args-file` options. Each file is read by `cfg_generator` and appended to the Clang arguments list before analysis starts.
+
+To exclude functions completely, pass `--blacklist-file` with a text file containing exact function names. Blank lines and `#` comments are ignored.
+
+Example file contents:
+
+```text
+-Iinclude
+-isystem /opt/sdk/include
+-DPROJECT_FEATURE_X=1
+```
+
+Example invocation:
+
+```sh
+./manage.sh --docker-build --cfg-input examples --compile-args-file compiler.args
 ```
 
 ## Analysis JSON Schema

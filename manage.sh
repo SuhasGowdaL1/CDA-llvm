@@ -6,6 +6,10 @@ BUILD_DIR="${BUILD_DIR:-build-linux}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 IMAGE_NAME="${CFGGEN_LINUX_IMAGE:-cfggen:linux-build-deps}"
 CFG_INPUT="examples"
+CFG_INPUTS=()
+CFG_INCLUDE_DIRS=(".")
+CFG_COMPILE_ARGS_FILES=()
+BLACKLIST_FILE=""
 CFG_OUTPUT="out/cfg-analysis.json"
 DOT_DIR="out/dotfiles"
 CALLGRAPH_OUTPUT="out/callgraph.json"
@@ -29,7 +33,10 @@ Options:
   --build-image              Build Docker dependency image
   --docker-build             Build binaries inside Docker (Ninja)
   --format-src               Format source files in src/ with clang-format
-  --cfg-input PATH           CFG input path (default: examples)
+  --source-dir DIR           Source directory/file for CFG input (may be repeated; default: examples)
+  --include-dir DIR          Additional include directory (may be repeated)
+  --compile-args-file FILE   Compiler args file forwarded to cfg_generator (may be repeated)
+  --blacklist-file FILE      Exact function names to skip, forwarded to both generators
   --cfg-output FILE          Analysis JSON output file (default: out/cfg-analysis.json)
   --dot                      Emit per-function DOT files
   --dot-dir DIR              DOT output directory (default: out/dotfiles)
@@ -82,7 +89,29 @@ generate_cfg() {
   if [[ "$DO_DOT" -eq 1 ]]; then
     cmd="$cmd --emit-dot --dot-dir $DOT_DIR"
   fi
-  cmd="$cmd $CFG_INPUT -- -I."
+
+  local inputs=()
+  if [[ ${#CFG_INPUTS[@]} -gt 0 ]]; then
+    inputs=("${CFG_INPUTS[@]}")
+  else
+    inputs=("$CFG_INPUT")
+  fi
+
+  for include_dir in "${CFG_INCLUDE_DIRS[@]}"; do
+    cmd="$cmd --include-dir $(printf '%q' "$include_dir")"
+  done
+
+  for args_file in "${CFG_COMPILE_ARGS_FILES[@]}"; do
+    cmd="$cmd --compile-args-file $(printf '%q' "$args_file")"
+  done
+
+  if [[ -n "$BLACKLIST_FILE" ]]; then
+    cmd="$cmd --blacklist-file $(printf '%q' "$BLACKLIST_FILE")"
+  fi
+
+  for input in "${inputs[@]}"; do
+    cmd="$cmd $(printf '%q' "$input")"
+  done
 
   if [[ "$DO_DOCKER_BUILD" -eq 1 ]]; then
     run_in_docker "$cmd"
@@ -97,6 +126,10 @@ generate_callgraph() {
     cmd="$cmd --dot-output $CALLGRAPH_DOT_OUTPUT"
   else
     cmd="$cmd --no-dot"
+  fi
+
+  if [[ -n "$BLACKLIST_FILE" ]]; then
+    cmd="$cmd --blacklist-file $(printf '%q' "$BLACKLIST_FILE")"
   fi
 
   if [[ "$DO_DOCKER_BUILD" -eq 1 ]]; then
@@ -134,8 +167,20 @@ while [[ $# -gt 0 ]]; do
       DO_FORMAT=1
       shift
       ;;
-    --cfg-input)
-      CFG_INPUT="$2"
+    --source-dir)
+      CFG_INPUTS+=("$2")
+      shift 2
+      ;;
+    --include-dir)
+      CFG_INCLUDE_DIRS+=("$2")
+      shift 2
+      ;;
+    --compile-args-file)
+      CFG_COMPILE_ARGS_FILES+=("$2")
+      shift 2
+      ;;
+    --blacklist-file)
+      BLACKLIST_FILE="$2"
       shift 2
       ;;
     --cfg-output)

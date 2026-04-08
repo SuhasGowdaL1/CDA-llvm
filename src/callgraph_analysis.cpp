@@ -322,6 +322,76 @@ namespace
     }
 
     /**
+     * @brief Extract callee identifier from a simple call expression text.
+     */
+    std::string extractCallCalleeIdentifier(const std::string &expression)
+    {
+        const std::string trimmed = trimLine(expression);
+        const std::size_t openParen = trimmed.find('(');
+        if (openParen == std::string::npos)
+        {
+            return "";
+        }
+
+        const std::string calleeExpr = trimLine(trimmed.substr(0, openParen));
+        if (calleeExpr.empty())
+        {
+            return "";
+        }
+
+        return canonicalSlot(calleeExpr);
+    }
+
+    /**
+     * @brief Resolve possible direct/indirect callee function targets for a call expression text.
+     */
+    std::set<std::string> resolveCallCalleeTargets(
+        const std::string &expression,
+        const std::set<std::string> &knownFunctions,
+        const std::unordered_map<std::string, std::set<std::string>> &bindings)
+    {
+        std::set<std::string> targets;
+
+        const std::string trimmed = trimLine(expression);
+        const std::size_t openParen = trimmed.find('(');
+        if (openParen == std::string::npos)
+        {
+            return targets;
+        }
+
+        const std::string calleeExpr = trimLine(trimmed.substr(0, openParen));
+        if (calleeExpr.empty())
+        {
+            return targets;
+        }
+
+        const std::string slot = canonicalSlot(calleeExpr);
+        if (!slot.empty())
+        {
+            const auto it = bindings.find(slot);
+            if (it != bindings.end())
+            {
+                targets.insert(it->second.begin(), it->second.end());
+            }
+        }
+
+        for (const std::string &identifier : extractIdentifiers(calleeExpr))
+        {
+            const auto it = bindings.find(identifier);
+            if (it != bindings.end())
+            {
+                targets.insert(it->second.begin(), it->second.end());
+            }
+            if (knownFunctions.find(identifier) != knownFunctions.end())
+            {
+                targets.insert(identifier);
+            }
+        }
+
+        return targets;
+    }
+
+    /**
      * @brief Parse optional source location metadata object.
      */
     SourceLocation parseLocation(const llvm::json::Object *locationObject)
@@ -357,6 +427,13 @@ namespace
         return location;
     }
 
+    bool isBlacklistedFunction(
+        const std::string &functionName,
+        const std::set<std::string> &blacklistedFunctions)
+    {
+        return blacklistedFunctions.find(functionName) != blacklistedFunctions.end();
+    }
+
     /**
      * @brief Parse all function facts from cfg-analysis JSON.
      */
@@ -364,6 +441,7 @@ namespace
         const llvm::json::Object &root,
         std::vector<FunctionFacts> &functions,
         std::set<std::string> &knownFunctionNames,
+        const std::set<std::string> &blacklistedFunctions,
         std::string &errorMessage)
     {
         const llvm::json::Array *functionArray = root.getArray("functions");
@@ -389,6 +467,10 @@ namespace
 
             FunctionFacts facts;
             facts.name = name->str();
+            if (isBlacklistedFunction(facts.name, blacklistedFunctions))
+            {
+                continue;
+            }
             knownFunctionNames.insert(facts.name);
 
             if (const std::optional<std::int64_t> entryBlockId = functionObject->getInteger("entryBlockId"))
@@ -863,12 +945,122 @@ namespace
         return values;
     }
 
+    void seedBindingsFromAssignments(
+        const FunctionFacts &function,
+        const std::set<std::string> &knownFunctions,
+        PointsToMap &bindings);
+
+    /**
+     * @brief Collect direct function targets returned by each function.
+     */
+    std::unordered_map<std::string, std::set<std::string>> collectReturnTargetsByFunction(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions)
+    {
+        std::unordered_map<std::string, std::set<std::string>> targetsByFunction;
+
+        for (const FunctionFacts &function : functions)
+        {
+            std::set<std::string> targets;
+            PointsToMap bindings;
+            seedBindingsFromAssignments(function, knownFunctions, bindings);
+
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &rawLine : block.lines)
+                {
+                    const std::string line = trimLine(rawLine);
+                    if (line.rfind("return ", 0) != 0)
+                    {
+                        continue;
+                    }
+
+                    std::string returned = trimLine(line.substr(7U));
+                    if (!returned.empty() && returned.back() == ';')
+                    {
+                        returned.pop_back();
+                        returned = trimLine(returned);
+                    }
+
+                    const std::set<std::string> values =
+                        resolveMixedExpressionValues(returned, knownFunctions, bindings);
+                    for (const std::string &value : values)
+                    {
+                        if (knownFunctions.find(value) != knownFunctions.end())
+                        {
+                            targets.insert(value);
+                        }
+                    }
+                }
+            }
+
+            if (!targets.empty())
+            {
+                targetsByFunction[function.name] = std::move(targets);
+            }
+        }
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+
+            for (const FunctionFacts &function : functions)
+            {
+                PointsToMap bindings;
+                seedBindingsFromAssignments(function, knownFunctions, bindings);
+                std::set<std::string> expanded = targetsByFunction[function.name];
+
+                for (const FunctionFacts::BlockFact &block : function.blocks)
+                {
+                    for (const std::string &rawLine : block.lines)
+                    {
+                        const std::string line = trimLine(rawLine);
+                        if (line.rfind("return ", 0) != 0)
+                        {
+                            continue;
+                        }
+
+                        std::string returned = trimLine(line.substr(7U));
+                        if (!returned.empty() && returned.back() == ';')
+                        {
+                            returned.pop_back();
+                            returned = trimLine(returned);
+                        }
+
+                        const std::set<std::string> callees =
+                            resolveCallCalleeTargets(returned, knownFunctions, bindings);
+                        for (const std::string &callee : callees)
+                        {
+                            const auto it = targetsByFunction.find(callee);
+                            if (it != targetsByFunction.end())
+                            {
+                                expanded.insert(it->second.begin(), it->second.end());
+                            }
+                        }
+                    }
+                }
+
+                std::set<std::string> &current = targetsByFunction[function.name];
+                const std::size_t before = current.size();
+                current.insert(expanded.begin(), expanded.end());
+                if (current.size() != before)
+                {
+                    changed = true;
+                }
+            }
+        }
+
+        return targetsByFunction;
+    }
+
     /**
      * @brief Legacy linear analyzer (retained for debugging/reference).
      */
     void analyzeFunction(
         const FunctionFacts &function,
         const std::set<std::string> &knownFunctions,
+        const std::set<std::string> &blacklistedFunctions,
         const std::unordered_map<std::string, ParameterDispatchInfo> &parameterDispatchFunctions,
         std::unordered_map<std::string, std::set<std::string>> &wrapperDispatchTargets,
         std::vector<CallEdge> &resolvedEdges,
@@ -901,6 +1093,11 @@ namespace
             const CallSite &callSite = *event.callSite;
             if (!callSite.directCallee.empty())
             {
+                if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
+                {
+                    continue;
+                }
+
                 CallEdge edge;
                 edge.caller = function.name;
                 edge.callee = callSite.directCallee;
@@ -930,7 +1127,16 @@ namespace
             }
 
             const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, pointsTo);
-            if (targets.empty())
+            std::set<std::string> filteredTargets;
+            for (const std::string &target : targets)
+            {
+                if (!isBlacklistedFunction(target, blacklistedFunctions))
+                {
+                    filteredTargets.insert(target);
+                }
+            }
+
+            if (filteredTargets.empty())
             {
                 CallEdge edge;
                 edge.caller = function.name;
@@ -942,7 +1148,7 @@ namespace
                 continue;
             }
 
-            for (const std::string &callee : targets)
+            for (const std::string &callee : filteredTargets)
             {
                 CallEdge edge;
                 edge.caller = function.name;
@@ -1118,17 +1324,53 @@ namespace
     }
 
     /**
+     * @brief Seed bindings from recorded pointer assignment facts.
+     */
+    void seedBindingsFromAssignments(
+        const FunctionFacts &function,
+        const std::set<std::string> &knownFunctions,
+        PointsToMap &bindings)
+    {
+        for (const Event &event : buildEvents(function))
+        {
+            if (event.kind != EventKind::kAssignment || event.assignment == nullptr)
+            {
+                continue;
+            }
+
+            const PointerAssignment &assignment = *event.assignment;
+            const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
+            if (lhsSlot.empty())
+            {
+                continue;
+            }
+
+            const std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, bindings);
+            if (targets.empty())
+            {
+                continue;
+            }
+
+            std::set<std::string> &slotTargets = bindings[lhsSlot];
+            slotTargets.insert(targets.begin(), targets.end());
+        }
+    }
+
+    /**
      * @brief Run flow-sensitive and context-sensitive callgraph resolution.
      */
     void runContextSensitiveAnalysis(
         const std::vector<FunctionFacts> &functions,
         const std::set<std::string> &knownFunctions,
+        const std::set<std::string> &blacklistedFunctions,
         std::vector<CallEdge> &resolvedEdges,
         std::vector<CallEdge> &unresolvedIndirect)
     {
         std::unordered_map<std::string, const FunctionFacts *> functionMap;
         std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
         std::unordered_map<std::string, std::set<std::string>> pointerSlotsByFunction;
+        const std::unordered_map<std::string, std::set<std::string>> returnTargetsByFunction =
+            collectReturnTargetsByFunction(functions, knownFunctions);
         // Precompute per-function metadata used during traversal.
         for (const FunctionFacts &function : functions)
         {
@@ -1186,7 +1428,9 @@ namespace
 
             std::deque<BlockState> blockWorklist;
             std::unordered_set<std::string> seenBlockStates;
-            blockWorklist.push_back(BlockState{function.entryBlockId, std::move(job.seededPointsTo)});
+            PointsToMap initialBindings = std::move(job.seededPointsTo);
+            seedBindingsFromAssignments(function, knownFunctions, initialBindings);
+            blockWorklist.push_back(BlockState{function.entryBlockId, std::move(initialBindings)});
 
             auto makeStateKey = [&](std::uint32_t blockId, const PointsToMap &bindings)
             {
@@ -1361,6 +1605,11 @@ namespace
                             // Branch: direct call, emit direct edge and enqueue callee.
                             if (!callSite.directCallee.empty())
                             {
+                                if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
+                                {
+                                    break;
+                                }
+
                                 CallEdge edge;
                                 edge.caller = function.name;
                                 edge.callee = callSite.directCallee;
@@ -1375,8 +1624,16 @@ namespace
                             }
 
                             const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, bindings);
+                            std::set<std::string> filteredTargets;
+                            for (const std::string &target : targets)
+                            {
+                                if (!isBlacklistedFunction(target, blacklistedFunctions))
+                                {
+                                    filteredTargets.insert(target);
+                                }
+                            }
                             // Branch: unresolved indirect call under current bindings.
-                            if (targets.empty())
+                            if (filteredTargets.empty())
                             {
                                 CallEdge edge;
                                 edge.caller = function.name;
@@ -1388,7 +1645,7 @@ namespace
                                 break;
                             }
 
-                            for (const std::string &callee : targets)
+                            for (const std::string &callee : filteredTargets)
                             {
                                 CallEdge edge;
                                 edge.caller = function.name;
@@ -1435,7 +1692,26 @@ namespace
                         continue;
                     }
                     const std::string lhsSlot = lhsIdentifiers.back();
-                    const std::set<std::string> values = resolveMixedExpressionValues(rhs, knownFunctions, bindings);
+                    std::set<std::string> values = resolveMixedExpressionValues(rhs, knownFunctions, bindings);
+                    const std::set<std::string> rhsCallees =
+                        resolveCallCalleeTargets(rhs, knownFunctions, bindings);
+                    if (!rhsCallees.empty())
+                    {
+                        std::set<std::string> callReturns;
+                        for (const std::string &callee : rhsCallees)
+                        {
+                            const auto returnIt = returnTargetsByFunction.find(callee);
+                            if (returnIt != returnTargetsByFunction.end())
+                            {
+                                callReturns.insert(returnIt->second.begin(), returnIt->second.end());
+                            }
+                        }
+
+                        if (!callReturns.empty())
+                        {
+                            values = std::move(callReturns);
+                        }
+                    }
                     // Ignore assignments that resolve to no usable values.
                     if (values.empty())
                     {
@@ -1563,6 +1839,7 @@ bool generateCallGraphFromAnalysisJson(
     const std::string &outputJsonPath,
     const std::string &outputDotPath,
     std::size_t contextDepth,
+    const std::set<std::string> &blacklistedFunctions,
     CallGraphStats &stats,
     std::string &errorMessage)
 {
@@ -1590,14 +1867,14 @@ bool generateCallGraphFromAnalysisJson(
 
     std::vector<FunctionFacts> functions;
     std::set<std::string> knownFunctions;
-    if (!parseFunctions(*root, functions, knownFunctions, errorMessage))
+    if (!parseFunctions(*root, functions, knownFunctions, blacklistedFunctions, errorMessage))
     {
         return false;
     }
 
     std::vector<CallEdge> resolvedEdges;
     std::vector<CallEdge> unresolvedIndirect;
-    runContextSensitiveAnalysis(functions, knownFunctions, resolvedEdges, unresolvedIndirect);
+    runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
 
     std::set<CollapsedEdge> collapsedEdges;
     for (const CallEdge &edge : resolvedEdges)

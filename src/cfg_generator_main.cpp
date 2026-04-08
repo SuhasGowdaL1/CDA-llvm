@@ -4,6 +4,9 @@
  */
 
 #include <string>
+#include <fstream>
+#include <sstream>
+#include <set>
 #include <vector>
 
 #include "clang/Tooling/CommonOptionsParser.h"
@@ -45,6 +48,88 @@ namespace
         llvm::cl::init(""),
         llvm::cl::cat(kCategory));
 
+    llvm::cl::list<std::string> kIncludeDirs(
+        "include-dir",
+        llvm::cl::desc("Additional include directory to forward to Clang; may be repeated"),
+        llvm::cl::value_desc("dir"),
+        llvm::cl::cat(kCategory));
+
+    llvm::cl::list<std::string> kCompileArgsFiles(
+        "compile-args-file",
+        llvm::cl::desc("File containing additional compiler arguments; may be repeated"),
+        llvm::cl::value_desc("file"),
+        llvm::cl::cat(kCategory));
+
+    llvm::cl::opt<std::string> kBlacklistFile(
+        "blacklist-file",
+        llvm::cl::desc("Text file with exact function names to skip"),
+        llvm::cl::value_desc("file"),
+        llvm::cl::init(""),
+        llvm::cl::cat(kCategory));
+
+    bool loadCompileArgsFile(const std::string &filePath, std::vector<std::string> &compileArgs, std::string &error)
+    {
+        std::ifstream input(filePath);
+        if (!input)
+        {
+            error = "failed to open compiler args file: " + filePath;
+            return false;
+        }
+
+        std::string line;
+        while (std::getline(input, line))
+        {
+            const std::size_t commentPos = line.find('#');
+            if (commentPos != std::string::npos)
+            {
+                line = line.substr(0, commentPos);
+            }
+
+            std::istringstream stream(line);
+            std::string argument;
+            while (stream >> argument)
+            {
+                compileArgs.push_back(argument);
+            }
+        }
+
+        return true;
+    }
+
+    bool loadNameListFile(const std::string &filePath, std::set<std::string> &names, std::string &error)
+    {
+        if (filePath.empty())
+        {
+            return true;
+        }
+
+        std::ifstream input(filePath);
+        if (!input)
+        {
+            error = "failed to open blacklist file: " + filePath;
+            return false;
+        }
+
+        std::string line;
+        while (std::getline(input, line))
+        {
+            const std::size_t commentPos = line.find('#');
+            if (commentPos != std::string::npos)
+            {
+                line = line.substr(0, commentPos);
+            }
+
+            std::istringstream stream(line);
+            std::string name;
+            while (stream >> name)
+            {
+                names.insert(name);
+            }
+        }
+
+        return true;
+    }
+
 } // namespace
 
 /**
@@ -64,6 +149,28 @@ int main(int argc, const char **argv)
 
     std::vector<std::string> compileArgs;
     compileArgs.push_back("-I.");
+    for (const std::string &includeDir : kIncludeDirs)
+    {
+        compileArgs.push_back("-I" + includeDir);
+    }
+
+    std::string compileArgsError;
+    for (const std::string &argsFile : kCompileArgsFiles)
+    {
+        if (!loadCompileArgsFile(argsFile, compileArgs, compileArgsError))
+        {
+            llvm::errs() << "error: " << compileArgsError << "\n";
+            return 1;
+        }
+    }
+
+    std::set<std::string> blacklistedFunctions;
+    std::string blacklistError;
+    if (!loadNameListFile(kBlacklistFile, blacklistedFunctions, blacklistError))
+    {
+        llvm::errs() << "error: " << blacklistError << "\n";
+        return 1;
+    }
 
     CfgBundle bundle;
     std::string error;
@@ -71,6 +178,7 @@ int main(int argc, const char **argv)
             parser.get().getSourcePathList(),
             compileArgs,
             kFunctionFilter,
+            blacklistedFunctions,
             bundle,
             error))
     {

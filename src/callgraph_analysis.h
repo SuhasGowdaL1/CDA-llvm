@@ -7,6 +7,7 @@
 #define CALLGRAPH_ANALYSIS_H
 
 #include <cstddef>
+#include <set>
 #include <string>
 
 /**
@@ -36,6 +37,7 @@ bool generateCallGraphFromAnalysisJson(
     const std::string &outputJsonPath,
     const std::string &outputDotPath,
     std::size_t contextDepth,
+    const std::set<std::string> &blacklistedFunctions,
     CallGraphStats &stats,
     std::string &errorMessage);
 

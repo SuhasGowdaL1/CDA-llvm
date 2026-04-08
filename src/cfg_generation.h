@@ -24,6 +24,7 @@ bool generateCfgBundle(
     const std::vector<std::string> &inputs,
     const std::vector<std::string> &compilationArgs,
     const std::string &functionFilter,
+    const std::set<std::string> &blacklistedFunctions,
     CfgBundle &bundle,
     std::string &errorMessage);
 

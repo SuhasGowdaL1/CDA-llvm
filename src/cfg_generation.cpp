@@ -487,6 +487,61 @@ namespace
         return record;
     }
 
+    /**
+     * @brief Convert expression text to normalized spelling source.
+     */
+    std::string extractExpressionText(clang::ASTContext &context, const clang::Expr *expr)
+    {
+        if (expr == nullptr)
+        {
+            return "";
+        }
+
+        const clang::SourceManager &sourceManager = context.getSourceManager();
+        const clang::LangOptions &langOptions = context.getLangOpts();
+        const clang::CharSourceRange tokenRange = clang::CharSourceRange::getTokenRange(expr->getSourceRange());
+        const llvm::StringRef text = clang::Lexer::getSourceText(tokenRange, sourceManager, langOptions);
+        return normalizeWhitespace(text.str());
+    }
+
+    /**
+     * @brief Resolve function symbol for an expression denoting a function address.
+     */
+    std::string extractFunctionSymbol(const clang::Expr *expr)
+    {
+        if (expr == nullptr)
+        {
+            return "";
+        }
+
+        const clang::Expr *stripped = expr->IgnoreParenImpCasts();
+
+        if (const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped))
+        {
+            if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(declRef->getDecl()))
+            {
+                return functionDecl->getQualifiedNameAsString();
+            }
+        }
+
+        if (const auto *unaryOperator = llvm::dyn_cast<clang::UnaryOperator>(stripped))
+        {
+            if (unaryOperator->getOpcode() == clang::UO_AddrOf)
+            {
+                const clang::Expr *subExpression = unaryOperator->getSubExpr()->IgnoreParenImpCasts();
+                if (const auto *subDeclRef = llvm::dyn_cast<clang::DeclRefExpr>(subExpression))
+                {
+                    if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(subDeclRef->getDecl()))
+                    {
+                        return functionDecl->getQualifiedNameAsString();
+                    }
+                }
+            }
+        }
+
+        return "";
+    }
+
     std::uint64_t fnv1a64(const std::string &text)
     {
         std::uint64_t hash = 1469598103934665603ULL;
@@ -525,8 +580,11 @@ namespace
     class CallVisitor : public clang::RecursiveASTVisitor<CallVisitor>
     {
     public:
-        explicit CallVisitor(clang::ASTContext &context, std::string functionName)
-            : context_(context), functionName_(std::move(functionName))
+        explicit CallVisitor(
+            clang::ASTContext &context,
+            std::string functionName,
+            const std::set<std::string> &blacklistedFunctions)
+            : context_(context), functionName_(std::move(functionName)), blacklistedFunctions_(blacklistedFunctions)
         {
         }
 
@@ -552,6 +610,10 @@ namespace
             if (callee != nullptr)
             {
                 callsite.directCallee = callee->getQualifiedNameAsString();
+                if (blacklistedFunctions_.find(callsite.directCallee) != blacklistedFunctions_.end())
+                {
+                    return true;
+                }
 
                 if (callsite.directCallee == "State_Change")
                 {
@@ -592,8 +654,8 @@ namespace
 
             for (const clang::Expr *argument : call->arguments())
             {
-                const std::string functionSymbol = extractFunctionSymbol(argument);
-                if (!functionSymbol.empty())
+                const std::string functionSymbol = ::extractFunctionSymbol(argument);
+                if (!functionSymbol.empty() && blacklistedFunctions_.find(functionSymbol) == blacklistedFunctions_.end())
                 {
                     addressTakenFunctions_.insert(functionSymbol);
                 }
@@ -615,8 +677,14 @@ namespace
             PointerAssignmentRecord assignment;
             assignment.lhsExpression = extractExpressionText(binaryOperator->getLHS());
             assignment.rhsExpression = extractExpressionText(binaryOperator->getRHS());
-            assignment.assignedFunction = extractFunctionSymbol(binaryOperator->getRHS());
+            assignment.assignedFunction = ::extractFunctionSymbol(binaryOperator->getRHS());
             assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
+
+            if (!assignment.assignedFunction.empty() &&
+                blacklistedFunctions_.find(assignment.assignedFunction) != blacklistedFunctions_.end())
+            {
+                return true;
+            }
 
             const clang::SourceManager &sourceManager = context_.getSourceManager();
             const clang::SourceLocation location = sourceManager.getSpellingLoc(binaryOperator->getExprLoc());
@@ -655,8 +723,14 @@ namespace
             PointerAssignmentRecord assignment;
             assignment.lhsExpression = varDecl->getQualifiedNameAsString();
             assignment.rhsExpression = extractExpressionText(varDecl->getInit());
-            assignment.assignedFunction = extractFunctionSymbol(varDecl->getInit());
+            assignment.assignedFunction = ::extractFunctionSymbol(varDecl->getInit());
             assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
+
+            if (!assignment.assignedFunction.empty() &&
+                blacklistedFunctions_.find(assignment.assignedFunction) != blacklistedFunctions_.end())
+            {
+                return true;
+            }
 
             const clang::SourceManager &sourceManager = context_.getSourceManager();
             const clang::SourceLocation location = sourceManager.getSpellingLoc(varDecl->getLocation());
@@ -721,44 +795,6 @@ namespace
         }
 
         /**
-         * @brief Resolve a function symbol if the expression denotes one.
-         */
-        std::string extractFunctionSymbol(const clang::Expr *expr)
-        {
-            if (expr == nullptr)
-            {
-                return "";
-            }
-
-            const clang::Expr *stripped = expr->IgnoreParenImpCasts();
-
-            if (const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped))
-            {
-                if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(declRef->getDecl()))
-                {
-                    return functionDecl->getQualifiedNameAsString();
-                }
-            }
-
-            if (const auto *unaryOperator = llvm::dyn_cast<clang::UnaryOperator>(stripped))
-            {
-                if (unaryOperator->getOpcode() == clang::UO_AddrOf)
-                {
-                    const clang::Expr *subExpression = unaryOperator->getSubExpr()->IgnoreParenImpCasts();
-                    if (const auto *subDeclRef = llvm::dyn_cast<clang::DeclRefExpr>(subExpression))
-                    {
-                        if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(subDeclRef->getDecl()))
-                        {
-                            return functionDecl->getQualifiedNameAsString();
-                        }
-                    }
-                }
-            }
-
-            return "";
-        }
-
-        /**
          * @brief Resolve the referenced non-function identifier, if any.
          */
         std::string extractReferencedIdentifier(const clang::Expr *expr)
@@ -790,6 +826,7 @@ namespace
 
         clang::ASTContext &context_;
         std::string functionName_;
+        const std::set<std::string> &blacklistedFunctions_;
         std::vector<CallSiteRecord> callSites_;
         std::vector<PointerAssignmentRecord> pointerAssignments_;
         std::set<std::string> addressTakenFunctions_;
@@ -945,6 +982,7 @@ namespace
     {
         clang::ASTContext *context = nullptr;
         std::string functionFilter;
+        std::set<std::string> blacklistedFunctions;
         std::vector<SerializedFunction> *functions = nullptr;
     };
 
@@ -970,6 +1008,10 @@ namespace
             }
 
             const std::string functionName = functionDecl->getQualifiedNameAsString();
+            if (state_.blacklistedFunctions.find(functionName) != state_.blacklistedFunctions.end())
+            {
+                return true;
+            }
             if (!state_.functionFilter.empty() && functionName != state_.functionFilter)
             {
                 return true;
@@ -1024,12 +1066,22 @@ namespace
             function.blocks = rawBlocks;
             applyConditionalStoreDuplication(function);
 
-            CallVisitor callVisitor(*state_.context, functionName);
+            CallVisitor callVisitor(*state_.context, functionName, state_.blacklistedFunctions);
             callVisitor.TraverseStmt(body);
 
+            ensureGlobalFactsCollected();
+
             function.attributes.callSites = callVisitor.callSites();
-            function.attributes.pointerAssignments = callVisitor.pointerAssignments();
-            function.attributes.addressTakenFunctions = callVisitor.addressTakenFunctions();
+            function.attributes.pointerAssignments = globalPointerAssignments_;
+            function.attributes.pointerAssignments.insert(
+                function.attributes.pointerAssignments.end(),
+                callVisitor.pointerAssignments().begin(),
+                callVisitor.pointerAssignments().end());
+
+            function.attributes.addressTakenFunctions = globalAddressTakenFunctions_;
+            function.attributes.addressTakenFunctions.insert(
+                callVisitor.addressTakenFunctions().begin(),
+                callVisitor.addressTakenFunctions().end());
 
             if (!callVisitor.stateChangeValues().empty())
             {
@@ -1042,7 +1094,114 @@ namespace
         }
 
     private:
+        /**
+         * @brief Gather file-scope pointer facts once and reuse for all functions.
+         */
+        void ensureGlobalFactsCollected()
+        {
+            if (globalFactsCollected_ || state_.context == nullptr)
+            {
+                return;
+            }
+
+            const clang::SourceManager &sourceManager = state_.context->getSourceManager();
+            clang::TranslationUnitDecl *translationUnit = state_.context->getTranslationUnitDecl();
+            if (translationUnit == nullptr)
+            {
+                globalFactsCollected_ = true;
+                return;
+            }
+
+            std::unordered_set<std::string> seenGlobalAssignments;
+
+            for (const clang::Decl *decl : translationUnit->decls())
+            {
+                const auto *varDecl = llvm::dyn_cast<clang::VarDecl>(decl);
+                if (varDecl == nullptr || !varDecl->isFileVarDecl() || !varDecl->hasInit())
+                {
+                    continue;
+                }
+
+                const clang::Expr *initializer = varDecl->getInit();
+                if (initializer == nullptr)
+                {
+                    continue;
+                }
+
+                const clang::Expr *strippedInitializer = initializer->IgnoreParenImpCasts();
+                const clang::SourceLocation location = sourceManager.getSpellingLoc(varDecl->getLocation());
+
+                const auto *initList = llvm::dyn_cast<clang::InitListExpr>(strippedInitializer);
+                if (initList != nullptr)
+                {
+                    for (unsigned i = 0; i < initList->getNumInits(); ++i)
+                    {
+                        const clang::Expr *initExpr = initList->getInit(i);
+                        const std::string assignedFunction = ::extractFunctionSymbol(initExpr);
+                        if (assignedFunction.empty() ||
+                            state_.blacklistedFunctions.find(assignedFunction) != state_.blacklistedFunctions.end())
+                        {
+                            continue;
+                        }
+
+                        PointerAssignmentRecord assignment;
+                        assignment.lhsExpression = varDecl->getQualifiedNameAsString();
+                        assignment.rhsExpression = extractExpressionText(*state_.context, initExpr);
+                        assignment.assignedFunction = assignedFunction;
+                        assignment.rhsTakesFunctionAddress = true;
+                        assignment.location = buildSourceLocationRecord(location, sourceManager);
+
+                        const std::string key =
+                            assignment.lhsExpression +
+                            "#" +
+                            assignment.assignedFunction +
+                            "#" +
+                            std::to_string(i) +
+                            "#" +
+                            std::to_string(location.getRawEncoding());
+                        if (seenGlobalAssignments.insert(key).second)
+                        {
+                            globalPointerAssignments_.push_back(std::move(assignment));
+                            globalAddressTakenFunctions_.insert(assignedFunction);
+                        }
+                    }
+                    continue;
+                }
+
+                const std::string assignedFunction = ::extractFunctionSymbol(initializer);
+                if (assignedFunction.empty() ||
+                    state_.blacklistedFunctions.find(assignedFunction) != state_.blacklistedFunctions.end())
+                {
+                    continue;
+                }
+
+                PointerAssignmentRecord assignment;
+                assignment.lhsExpression = varDecl->getQualifiedNameAsString();
+                assignment.rhsExpression = extractExpressionText(*state_.context, initializer);
+                assignment.assignedFunction = assignedFunction;
+                assignment.rhsTakesFunctionAddress = true;
+                assignment.location = buildSourceLocationRecord(location, sourceManager);
+
+                const std::string key =
+                    assignment.lhsExpression +
+                    "#" +
+                    assignment.assignedFunction +
+                    "#" +
+                    std::to_string(location.getRawEncoding());
+                if (seenGlobalAssignments.insert(key).second)
+                {
+                    globalPointerAssignments_.push_back(std::move(assignment));
+                    globalAddressTakenFunctions_.insert(assignedFunction);
+                }
+            }
+
+            globalFactsCollected_ = true;
+        }
+
         CollectorState &state_;
+        bool globalFactsCollected_ = false;
+        std::vector<PointerAssignmentRecord> globalPointerAssignments_;
+        std::set<std::string> globalAddressTakenFunctions_;
     };
 
     /**
@@ -1123,6 +1282,7 @@ bool generateCfgBundle(
     const std::vector<std::string> &inputs,
     const std::vector<std::string> &compilationArgs,
     const std::string &functionFilter,
+    const std::set<std::string> &blacklistedFunctions,
     CfgBundle &bundle,
     std::string &errorMessage)
 {
@@ -1180,6 +1340,7 @@ bool generateCfgBundle(
     std::vector<SerializedFunction> functions;
     CollectorState state;
     state.functionFilter = functionFilter;
+    state.blacklistedFunctions = blacklistedFunctions;
     state.functions = &functions;
 
     CfgActionFactory factory(state);
