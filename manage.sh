@@ -22,6 +22,33 @@ DO_SVG=0
 DO_CALLGRAPH=0
 DO_CALLGRAPH_DOT=1
 DO_DOCKER_BUILD=0
+ACTIVE_CONTAINER_NAMES=()
+
+cleanup_docker_containers() {
+  for name in "${ACTIVE_CONTAINER_NAMES[@]}"; do
+    if [[ -n "$name" ]]; then
+      docker stop "$name" >/dev/null 2>&1 || true
+    fi
+  done
+  ACTIVE_CONTAINER_NAMES=()
+}
+
+on_interrupt() {
+  echo "Interrupted. Stopping active Docker containers..." >&2
+  cleanup_docker_containers
+  exit 130
+}
+
+on_exit() {
+  cleanup_docker_containers
+}
+
+trap on_interrupt INT TERM
+trap on_exit EXIT
+
+new_container_name() {
+  echo "cfggen_${$}_${RANDOM}_${RANDOM}"
+}
 
 usage() {
   cat <<'EOF'
@@ -57,7 +84,11 @@ run_docker_build_image() {
 }
 
 run_docker_build() {
+  local container_name
+  container_name="$(new_container_name)"
+  ACTIVE_CONTAINER_NAMES+=("$container_name")
   docker run --rm \
+    --name "$container_name" \
     --user "$(id -u):$(id -g)" \
     -v "$ROOT_DIR:/work" \
     -w /work \
@@ -67,7 +98,11 @@ run_docker_build() {
 
 run_in_docker() {
   local cmd="$1"
+  local container_name
+  container_name="$(new_container_name)"
+  ACTIVE_CONTAINER_NAMES+=("$container_name")
   docker run --rm \
+    --name "$container_name" \
     --user "$(id -u):$(id -g)" \
     -v "$ROOT_DIR:/work" \
     -w /work \
