@@ -867,6 +867,42 @@ namespace
     {
         std::set<std::string> targets;
 
+        auto resolveAliasSlots = [&](const std::string &slot)
+        {
+            std::set<std::string> resolved;
+            std::deque<std::string> pending;
+            std::unordered_set<std::string> seen;
+            pending.push_back(slot);
+
+            while (!pending.empty())
+            {
+                const std::string current = pending.front();
+                pending.pop_front();
+
+                if (!seen.insert(current).second)
+                {
+                    continue;
+                }
+
+                const auto it = pointsTo.find(current);
+                if (it == pointsTo.end())
+                {
+                    continue;
+                }
+
+                for (const std::string &next : it->second)
+                {
+                    resolved.insert(next);
+                    if (pointsTo.find(next) != pointsTo.end())
+                    {
+                        pending.push_back(next);
+                    }
+                }
+            }
+
+            return resolved;
+        };
+
         auto removeArrayIndices = [](const std::string &text)
         {
             std::string out;
@@ -933,17 +969,34 @@ namespace
                 }
             }
 
-            const auto aliasIt = pointsTo.find(structVar);
-            if (aliasIt != pointsTo.end())
+            const std::set<std::string> aliasSlots = resolveAliasSlots(structVar);
+            bool aliasChainLooksIndirect = false;
+            if (!aliasSlots.empty())
             {
-                for (const std::string &aliasBase : aliasIt->second)
+                for (const std::string &aliasBase : aliasSlots)
                 {
+                    if (knownFunctions.find(aliasBase) == knownFunctions.end())
+                    {
+                        aliasChainLooksIndirect = true;
+                    }
+
                     for (const StructMemberMapping &mapping : structMappings)
                     {
                         if (mapping.structVariable == aliasBase && mapping.memberName == memberName)
                         {
                             targets.insert(mapping.functionName);
                         }
+                    }
+                }
+            }
+
+            if (targets.empty() && aliasChainLooksIndirect)
+            {
+                for (const StructMemberMapping &mapping : structMappings)
+                {
+                    if (mapping.memberName == memberName)
+                    {
+                        targets.insert(mapping.functionName);
                     }
                 }
             }
