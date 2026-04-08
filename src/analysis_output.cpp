@@ -262,12 +262,61 @@ namespace
                 out << "\"rhsTakesFunctionAddress\": "
                     << (assignment.rhsTakesFunctionAddress ? "true" : "false") << ",\n";
                 writeIndent(out, indent + 4);
+                out << "\"lhsIsGlobal\": "
+                    << (assignment.lhsIsGlobal ? "true" : "false") << ",\n";
+                writeIndent(out, indent + 4);
                 out << "\"location\": ";
                 writeLocation(out, assignment.location, indent + 4);
                 out << "\n";
                 writeIndent(out, indent + 2);
                 out << "}";
                 if (i + 1U < assignments.size())
+                {
+                    out << ",";
+                }
+                out << "\n";
+            }
+            writeIndent(out, indent);
+        }
+        out << "]";
+    }
+
+    /**
+     * @brief Emit struct member mapping records.
+     */
+    void writeStructMemberMappings(
+        std::ostream &out,
+        const std::vector<StructMemberMapping> &mappings,
+        int indent)
+    {
+        out << "[";
+        if (!mappings.empty())
+        {
+            out << "\n";
+            for (std::size_t i = 0; i < mappings.size(); ++i)
+            {
+                const StructMemberMapping &mapping = mappings[i];
+                writeIndent(out, indent + 2);
+                out << "{\n";
+                writeIndent(out, indent + 4);
+                out << "\"structVariable\": ";
+                writeString(out, mapping.structVariable);
+                out << ",\n";
+                writeIndent(out, indent + 4);
+                out << "\"memberName\": ";
+                writeString(out, mapping.memberName);
+                out << ",\n";
+                writeIndent(out, indent + 4);
+                out << "\"functionName\": ";
+                writeString(out, mapping.functionName);
+                out << ",\n";
+                writeIndent(out, indent + 4);
+                out << "\"location\": ";
+                writeLocation(out, mapping.location, indent + 4);
+                out << "\n";
+                writeIndent(out, indent + 2);
+                out << "}";
+                if (i + 1U < mappings.size())
                 {
                     out << ",";
                 }
@@ -348,6 +397,11 @@ namespace
         writeIndent(out, indent + 4);
         out << "\"pointerAssignments\": ";
         writePointerAssignments(out, function.attributes.pointerAssignments, indent + 4);
+        out << ",\n";
+
+        writeIndent(out, indent + 4);
+        out << "\"structMemberMappings\": ";
+        writeStructMemberMappings(out, function.attributes.structMemberMappings, indent + 4);
         out << "\n";
 
         writeIndent(out, indent + 2);

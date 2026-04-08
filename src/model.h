@@ -44,6 +44,18 @@ struct PointerAssignmentRecord
     std::string rhsExpression;
     std::string assignedFunction;
     bool rhsTakesFunctionAddress = false;
+    bool lhsIsGlobal = false;
+    SourceLocationRecord location;
+};
+
+/**
+ * @brief Struct member to function mapping (e.g., "MyStruct.member" -> "functionName").
+ */
+struct StructMemberMapping
+{
+    std::string structVariable;
+    std::string memberName;
+    std::string functionName;
     SourceLocationRecord location;
 };
 
@@ -65,6 +77,7 @@ struct FunctionAttributes
     bool callsStateChange = false;
     std::vector<CallSiteRecord> callSites;
     std::vector<PointerAssignmentRecord> pointerAssignments;
+    std::vector<StructMemberMapping> structMemberMappings;
     std::set<std::string> addressTakenFunctions;
     std::vector<std::set<std::string>> stateChangeParameterValues;
 };

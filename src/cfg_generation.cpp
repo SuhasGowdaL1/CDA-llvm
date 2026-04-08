@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -542,6 +543,76 @@ namespace
         return "";
     }
 
+    /**
+     * @brief Collect all function symbols referenced anywhere in an expression.
+     */
+    void collectFunctionSymbols(const clang::Expr *expr, std::set<std::string> &symbols)
+    {
+        if (expr == nullptr)
+        {
+            return;
+        }
+
+        const std::string symbol = ::extractFunctionSymbol(expr);
+        if (!symbol.empty())
+        {
+            symbols.insert(symbol);
+        }
+
+        for (const clang::Stmt *child : expr->children())
+        {
+            const auto *childExpr = llvm::dyn_cast_or_null<clang::Expr>(child);
+            if (childExpr != nullptr)
+            {
+                collectFunctionSymbols(childExpr, symbols);
+            }
+        }
+    }
+
+    /**
+     * @brief Parse a struct access expression like "s.f" or "s->f".
+     */
+    std::pair<std::string, std::string> parseStructAccessText(std::string text)
+    {
+        for (std::size_t pos = text.find("->"); pos != std::string::npos; pos = text.find("->", pos + 1U))
+        {
+            text.replace(pos, 2U, ".");
+        }
+
+        std::string normalized;
+        normalized.reserve(text.size());
+        int bracketDepth = 0;
+        for (char ch : text)
+        {
+            if (ch == '[')
+            {
+                ++bracketDepth;
+                continue;
+            }
+            if (ch == ']')
+            {
+                if (bracketDepth > 0)
+                {
+                    --bracketDepth;
+                }
+                continue;
+            }
+            if (bracketDepth == 0)
+            {
+                normalized.push_back(ch);
+            }
+        }
+
+        normalized = trimCopy(normalized);
+        const std::size_t dotIndex = normalized.find('.');
+        if (dotIndex == std::string::npos || dotIndex == 0U)
+        {
+            return {"", ""};
+        }
+
+        return {trimCopy(normalized.substr(0, dotIndex)), trimCopy(normalized.substr(dotIndex + 1U))};
+    }
+
     std::uint64_t fnv1a64(const std::string &text)
     {
         std::uint64_t hash = 1469598103934665603ULL;
@@ -680,6 +751,15 @@ namespace
             assignment.assignedFunction = ::extractFunctionSymbol(binaryOperator->getRHS());
             assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
 
+            const clang::Expr *lhsExpr = binaryOperator->getLHS()->IgnoreParenImpCasts();
+            if (const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(lhsExpr))
+            {
+                if (const auto *varDecl = llvm::dyn_cast<clang::VarDecl>(declRef->getDecl()))
+                {
+                    assignment.lhsIsGlobal = varDecl->hasGlobalStorage();
+                }
+            }
+
             if (!assignment.assignedFunction.empty() &&
                 blacklistedFunctions_.find(assignment.assignedFunction) != blacklistedFunctions_.end())
             {
@@ -693,6 +773,29 @@ namespace
             if (assignment.rhsTakesFunctionAddress)
             {
                 addressTakenFunctions_.insert(assignment.assignedFunction);
+            }
+
+            const std::pair<std::string, std::string> lhsAccess = parseStructAccessText(assignment.lhsExpression);
+            if (!lhsAccess.first.empty() && !lhsAccess.second.empty())
+            {
+                std::set<std::string> functionSymbols;
+                collectFunctionSymbols(binaryOperator->getRHS(), functionSymbols);
+                for (const std::string &functionSymbol : functionSymbols)
+                {
+                    if (blacklistedFunctions_.find(functionSymbol) != blacklistedFunctions_.end())
+                    {
+                        continue;
+                    }
+
+                    StructMemberMapping mapping;
+                    mapping.structVariable = lhsAccess.first;
+                    mapping.memberName = lhsAccess.second;
+                    mapping.functionName = functionSymbol;
+                    mapping.location = buildSourceLocationRecord(location, sourceManager);
+
+                    structMemberMappings_.push_back(std::move(mapping));
+                    addressTakenFunctions_.insert(functionSymbol);
+                }
             }
 
             const std::string key =
@@ -725,6 +828,7 @@ namespace
             assignment.rhsExpression = extractExpressionText(varDecl->getInit());
             assignment.assignedFunction = ::extractFunctionSymbol(varDecl->getInit());
             assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
+            assignment.lhsIsGlobal = varDecl->hasGlobalStorage();
 
             if (!assignment.assignedFunction.empty() &&
                 blacklistedFunctions_.find(assignment.assignedFunction) != blacklistedFunctions_.end())
@@ -753,7 +857,96 @@ namespace
                 pointerAssignments_.push_back(std::move(assignment));
             }
 
+            // Track struct member initializations using the local variable name.
+            trackStructMemberMappings(varDecl->getNameAsString(), varDecl->getInit());
+
             return true;
+        }
+
+        /**
+         * @brief Track struct member to function mappings from InitListExpr.
+         */
+        void trackStructMemberMappings(const std::string &varName, const clang::Expr *initExpr)
+        {
+            if (initExpr == nullptr)
+            {
+                return;
+            }
+
+            std::function<void(const clang::Expr *, const std::string &)> visitInit;
+            visitInit = [&](const clang::Expr *expr, const std::string &memberPath)
+            {
+                if (expr == nullptr)
+                {
+                    return;
+                }
+
+                const clang::Expr *stripped = expr->IgnoreParenImpCasts()->IgnoreImplicit();
+
+                const std::string functionName = ::extractFunctionSymbol(stripped);
+                if (!functionName.empty() && !memberPath.empty() &&
+                    blacklistedFunctions_.find(functionName) == blacklistedFunctions_.end())
+                {
+                    StructMemberMapping mapping;
+                    mapping.structVariable = varName;
+                    mapping.memberName = memberPath;
+                    mapping.functionName = functionName;
+                    mapping.location = buildSourceLocationRecord(
+                        context_.getSourceManager().getSpellingLoc(stripped->getExprLoc()),
+                        context_.getSourceManager());
+
+                    structMemberMappings_.push_back(std::move(mapping));
+                    addressTakenFunctions_.insert(functionName);
+                    return;
+                }
+
+                const auto *designated = llvm::dyn_cast<clang::DesignatedInitExpr>(stripped);
+                if (designated != nullptr)
+                {
+                    visitInit(designated->getInit(), memberPath);
+                    return;
+                }
+
+                const auto *initList = llvm::dyn_cast<clang::InitListExpr>(stripped);
+                if (initList == nullptr)
+                {
+                    return;
+                }
+
+                const auto *recordType = llvm::dyn_cast<clang::RecordType>(initList->getType().getCanonicalType());
+                if (recordType != nullptr)
+                {
+                    std::vector<std::string> fieldNames;
+                    for (const auto *field : recordType->getDecl()->fields())
+                    {
+                        fieldNames.push_back(field->getNameAsString());
+                    }
+
+                    for (unsigned i = 0; i < initList->getNumInits(); ++i)
+                    {
+                        const clang::Expr *child = initList->getInit(i);
+                        if (child == nullptr)
+                        {
+                            continue;
+                        }
+
+                        std::string childPath = memberPath;
+                        if (i < fieldNames.size())
+                        {
+                            childPath = memberPath.empty() ? fieldNames[i] : (memberPath + "." + fieldNames[i]);
+                        }
+                        visitInit(child, childPath);
+                    }
+                    return;
+                }
+
+                for (unsigned i = 0; i < initList->getNumInits(); ++i)
+                {
+                    visitInit(initList->getInit(i), memberPath);
+                }
+            };
+
+            visitInit(initExpr, "");
         }
 
         const std::vector<CallSiteRecord> &callSites() const
@@ -764,6 +957,11 @@ namespace
         const std::vector<PointerAssignmentRecord> &pointerAssignments() const
         {
             return pointerAssignments_;
+        }
+
+        const std::vector<StructMemberMapping> &structMemberMappings() const
+        {
+            return structMemberMappings_;
         }
 
         const std::set<std::string> &addressTakenFunctions() const
@@ -829,6 +1027,7 @@ namespace
         const std::set<std::string> &blacklistedFunctions_;
         std::vector<CallSiteRecord> callSites_;
         std::vector<PointerAssignmentRecord> pointerAssignments_;
+        std::vector<StructMemberMapping> structMemberMappings_;
         std::set<std::string> addressTakenFunctions_;
         std::unordered_set<std::string> seenCallSites_;
         std::unordered_set<std::string> seenAssignments_;
@@ -1078,6 +1277,12 @@ namespace
                 callVisitor.pointerAssignments().begin(),
                 callVisitor.pointerAssignments().end());
 
+            function.attributes.structMemberMappings = globalStructMemberMappings_;
+            function.attributes.structMemberMappings.insert(
+                function.attributes.structMemberMappings.end(),
+                callVisitor.structMemberMappings().begin(),
+                callVisitor.structMemberMappings().end());
+
             function.attributes.addressTakenFunctions = globalAddressTakenFunctions_;
             function.attributes.addressTakenFunctions.insert(
                 callVisitor.addressTakenFunctions().begin(),
@@ -1094,6 +1299,92 @@ namespace
         }
 
     private:
+        /**
+         * @brief Track struct member to function mappings from global InitListExpr.
+         */
+        void trackGlobalStructMemberMappings(const std::string &varName, const clang::InitListExpr *initListExpr)
+        {
+            if (initListExpr == nullptr)
+            {
+                return;
+            }
+
+            std::function<void(const clang::Expr *, const std::string &)> visitInit;
+            visitInit = [&](const clang::Expr *expr, const std::string &memberPath)
+            {
+                if (expr == nullptr)
+                {
+                    return;
+                }
+
+                const clang::Expr *stripped = expr->IgnoreParenImpCasts()->IgnoreImplicit();
+
+                const std::string functionName = ::extractFunctionSymbol(stripped);
+                if (!functionName.empty() && !memberPath.empty() &&
+                    state_.blacklistedFunctions.find(functionName) == state_.blacklistedFunctions.end())
+                {
+                    StructMemberMapping mapping;
+                    mapping.structVariable = varName;
+                    mapping.memberName = memberPath;
+                    mapping.functionName = functionName;
+                    mapping.location = buildSourceLocationRecord(
+                        state_.context->getSourceManager().getSpellingLoc(stripped->getExprLoc()),
+                        state_.context->getSourceManager());
+
+                    globalStructMemberMappings_.push_back(std::move(mapping));
+                    globalAddressTakenFunctions_.insert(functionName);
+                    return;
+                }
+
+                const auto *designated = llvm::dyn_cast<clang::DesignatedInitExpr>(stripped);
+                if (designated != nullptr)
+                {
+                    visitInit(designated->getInit(), memberPath);
+                    return;
+                }
+
+                const auto *initList = llvm::dyn_cast<clang::InitListExpr>(stripped);
+                if (initList == nullptr)
+                {
+                    return;
+                }
+
+                const auto *recordType = llvm::dyn_cast<clang::RecordType>(initList->getType().getCanonicalType());
+                if (recordType != nullptr)
+                {
+                    std::vector<std::string> fieldNames;
+                    for (const auto *field : recordType->getDecl()->fields())
+                    {
+                        fieldNames.push_back(field->getNameAsString());
+                    }
+
+                    for (unsigned i = 0; i < initList->getNumInits(); ++i)
+                    {
+                        const clang::Expr *child = initList->getInit(i);
+                        if (child == nullptr)
+                        {
+                            continue;
+                        }
+
+                        std::string childPath = memberPath;
+                        if (i < fieldNames.size())
+                        {
+                            childPath = memberPath.empty() ? fieldNames[i] : (memberPath + "." + fieldNames[i]);
+                        }
+                        visitInit(child, childPath);
+                    }
+                    return;
+                }
+
+                for (unsigned i = 0; i < initList->getNumInits(); ++i)
+                {
+                    visitInit(initList->getInit(i), memberPath);
+                }
+            };
+
+            visitInit(initListExpr, "");
+        }
+
         /**
          * @brief Gather file-scope pointer facts once and reuse for all functions.
          */
@@ -1134,6 +1425,9 @@ namespace
                 const auto *initList = llvm::dyn_cast<clang::InitListExpr>(strippedInitializer);
                 if (initList != nullptr)
                 {
+                    // Track struct member mappings from global initializers
+                    trackGlobalStructMemberMappings(varDecl->getQualifiedNameAsString(), initList);
+
                     for (unsigned i = 0; i < initList->getNumInits(); ++i)
                     {
                         const clang::Expr *initExpr = initList->getInit(i);
@@ -1149,6 +1443,7 @@ namespace
                         assignment.rhsExpression = extractExpressionText(*state_.context, initExpr);
                         assignment.assignedFunction = assignedFunction;
                         assignment.rhsTakesFunctionAddress = true;
+                        assignment.lhsIsGlobal = true;
                         assignment.location = buildSourceLocationRecord(location, sourceManager);
 
                         const std::string key =
@@ -1180,6 +1475,7 @@ namespace
                 assignment.rhsExpression = extractExpressionText(*state_.context, initializer);
                 assignment.assignedFunction = assignedFunction;
                 assignment.rhsTakesFunctionAddress = true;
+                assignment.lhsIsGlobal = true;
                 assignment.location = buildSourceLocationRecord(location, sourceManager);
 
                 const std::string key =
@@ -1201,6 +1497,7 @@ namespace
         CollectorState &state_;
         bool globalFactsCollected_ = false;
         std::vector<PointerAssignmentRecord> globalPointerAssignments_;
+        std::vector<StructMemberMapping> globalStructMemberMappings_;
         std::set<std::string> globalAddressTakenFunctions_;
     };
 

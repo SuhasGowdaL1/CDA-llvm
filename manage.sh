@@ -28,6 +28,7 @@ cleanup_docker_containers() {
   for name in "${ACTIVE_CONTAINER_NAMES[@]}"; do
     if [[ -n "$name" ]]; then
       docker stop "$name" >/dev/null 2>&1 || true
+      docker rm -f "$name" >/dev/null 2>&1 || true
     fi
   done
   ACTIVE_CONTAINER_NAMES=()
@@ -90,6 +91,7 @@ run_docker_build() {
 run_in_docker() {
   local cmd="$1"
   local container_name
+  local container_id
   local logger_pid
   local wait_code
   local exit_code
@@ -97,13 +99,17 @@ run_in_docker() {
   container_name="$(new_container_name)"
   ACTIVE_CONTAINER_NAMES+=("$container_name")
 
-  docker run --rm -d \
+  container_id="$(docker run -d \
     --name "$container_name" \
     --user "$(id -u):$(id -g)" \
     -v "$ROOT_DIR:/work" \
     -w /work \
     "$IMAGE_NAME" \
-    -lc "$cmd"
+    -lc "$cmd")"
+  if [[ -z "$container_id" ]]; then
+    echo "failed to start docker container" >&2
+    return 1
+  fi
 
   docker logs -f "$container_name" &
   logger_pid=$!
@@ -116,6 +122,8 @@ run_in_docker() {
 
   kill "$logger_pid" >/dev/null 2>&1 || true
   wait "$logger_pid" 2>/dev/null || true
+
+  docker rm -f "$container_name" >/dev/null 2>&1 || true
 
   # Remove from active list once container has exited.
   local remaining=()

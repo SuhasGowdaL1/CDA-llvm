@@ -15,6 +15,7 @@
 #include <optional>
 #include <set>
 #include <string>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -49,6 +50,15 @@ namespace
         std::string rhsExpression;
         std::string assignedFunction;
         bool rhsTakesFunctionAddress = false;
+        bool lhsIsGlobal = false;
+        SourceLocation location;
+    };
+
+    struct StructMemberMapping
+    {
+        std::string structVariable;
+        std::string memberName;
+        std::string functionName;
         SourceLocation location;
     };
 
@@ -59,6 +69,7 @@ namespace
         std::set<std::string> addressTakenFunctions;
         std::vector<CallSite> callSites;
         std::vector<PointerAssignment> pointerAssignments;
+        std::vector<StructMemberMapping> structMemberMappings;
         struct BlockFact
         {
             std::uint32_t id = 0;
@@ -603,9 +614,42 @@ namespace
                     {
                         assignment.rhsTakesFunctionAddress = *value;
                     }
+                    if (const std::optional<bool> value = assignmentObject->getBoolean("lhsIsGlobal"))
+                    {
+                        assignment.lhsIsGlobal = *value;
+                    }
                     assignment.location = parseLocation(assignmentObject->getObject("location"));
 
                     facts.pointerAssignments.push_back(std::move(assignment));
+                }
+            }
+
+            if (const llvm::json::Array *mappings = attributes->getArray("structMemberMappings"))
+            {
+                for (const llvm::json::Value &mappingValue : *mappings)
+                {
+                    const llvm::json::Object *mappingObject = mappingValue.getAsObject();
+                    if (mappingObject == nullptr)
+                    {
+                        continue;
+                    }
+
+                    StructMemberMapping mapping;
+                    if (const std::optional<llvm::StringRef> value = mappingObject->getString("structVariable"))
+                    {
+                        mapping.structVariable = value->str();
+                    }
+                    if (const std::optional<llvm::StringRef> value = mappingObject->getString("memberName"))
+                    {
+                        mapping.memberName = value->str();
+                    }
+                    if (const std::optional<llvm::StringRef> value = mappingObject->getString("functionName"))
+                    {
+                        mapping.functionName = value->str();
+                    }
+                    mapping.location = parseLocation(mappingObject->getObject("location"));
+
+                    facts.structMemberMappings.push_back(std::move(mapping));
                 }
             }
 
@@ -714,6 +758,19 @@ namespace
             return targets;
         }
 
+        if (assignment.rhsExpression.find('&') != std::string::npos)
+        {
+            const std::vector<std::string> identifiers = extractIdentifiers(assignment.rhsExpression);
+            for (const std::string &identifier : identifiers)
+            {
+                if (knownFunctions.find(identifier) == knownFunctions.end())
+                {
+                    targets.insert(identifier);
+                    break;
+                }
+            }
+        }
+
         const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
         if (!rhsSlot.empty())
         {
@@ -748,14 +805,149 @@ namespace
     }
 
     /**
+     * @brief Collect conservative program-wide slot->function targets from assignments.
+     */
+    std::unordered_map<std::string, std::set<std::string>> collectProgramWidePointerTargets(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions)
+    {
+        std::unordered_map<std::string, std::set<std::string>> targetsBySlot;
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const PointerAssignment &assignment : function.pointerAssignments)
+            {
+                if (!assignment.lhsIsGlobal)
+                {
+                    continue;
+                }
+
+                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
+                if (lhsSlot.empty())
+                {
+                    continue;
+                }
+
+                std::set<std::string> targets;
+                if (!assignment.assignedFunction.empty() &&
+                    knownFunctions.find(assignment.assignedFunction) != knownFunctions.end())
+                {
+                    targets.insert(assignment.assignedFunction);
+                }
+                else
+                {
+                    for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
+                    {
+                        if (knownFunctions.find(identifier) != knownFunctions.end())
+                        {
+                            targets.insert(identifier);
+                        }
+                    }
+                }
+
+                if (!targets.empty())
+                {
+                    std::set<std::string> &slotTargets = targetsBySlot[lhsSlot];
+                    slotTargets.insert(targets.begin(), targets.end());
+                }
+            }
+        }
+
+        return targetsBySlot;
+    }
+
+    /**
      * @brief Resolve indirect call targets under current bindings.
      */
     std::set<std::string> resolveIndirectTargets(
         const CallSite &callSite,
         const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &pointsTo)
+        const std::unordered_map<std::string, std::set<std::string>> &pointsTo,
+        const std::vector<StructMemberMapping> &structMappings)
     {
         std::set<std::string> targets;
+
+        auto removeArrayIndices = [](const std::string &text)
+        {
+            std::string out;
+            out.reserve(text.size());
+            int bracketDepth = 0;
+            for (char ch : text)
+            {
+                if (ch == '[')
+                {
+                    ++bracketDepth;
+                    continue;
+                }
+                if (ch == ']')
+                {
+                    if (bracketDepth > 0)
+                    {
+                        --bracketDepth;
+                    }
+                    continue;
+                }
+                if (bracketDepth == 0)
+                {
+                    out.push_back(ch);
+                }
+            }
+            return out;
+        };
+
+        auto trimWhitespace = [](const std::string &text)
+        {
+            std::size_t begin = 0;
+            while (begin < text.size() && std::isspace(static_cast<unsigned char>(text[begin])) != 0)
+            {
+                ++begin;
+            }
+            std::size_t end = text.size();
+            while (end > begin && std::isspace(static_cast<unsigned char>(text[end - 1U])) != 0)
+            {
+                --end;
+            }
+            return text.substr(begin, end - begin);
+        };
+
+        // Try to resolve struct member access (e.g., "global_ops.opA")
+        std::string normalizedCallee = callSite.calleeExpression;
+        for (std::size_t pos = normalizedCallee.find("->"); pos != std::string::npos; pos = normalizedCallee.find("->", pos + 1U))
+        {
+            normalizedCallee.replace(pos, 2U, ".");
+        }
+        normalizedCallee = removeArrayIndices(normalizedCallee);
+        normalizedCallee = trimWhitespace(normalizedCallee);
+
+        const std::size_t dotIndex = normalizedCallee.find('.');
+        if (dotIndex != std::string::npos && dotIndex > 0)
+        {
+            const std::string structVar = normalizedCallee.substr(0, dotIndex);
+            const std::string memberName = normalizedCallee.substr(dotIndex + 1U);
+
+            for (const StructMemberMapping &mapping : structMappings)
+            {
+                if (mapping.structVariable == structVar && mapping.memberName == memberName)
+                {
+                    targets.insert(mapping.functionName);
+                }
+            }
+
+            const auto aliasIt = pointsTo.find(structVar);
+            if (aliasIt != pointsTo.end())
+            {
+                for (const std::string &aliasBase : aliasIt->second)
+                {
+                    for (const StructMemberMapping &mapping : structMappings)
+                    {
+                        if (mapping.structVariable == aliasBase && mapping.memberName == memberName)
+                        {
+                            targets.insert(mapping.functionName);
+                        }
+                    }
+                }
+            }
+        }
 
         if (!callSite.throughIdentifier.empty())
         {
@@ -787,7 +979,39 @@ namespace
             }
         }
 
-        return targets;
+        std::set<std::string> resolvedFunctions;
+        std::deque<std::string> pending(targets.begin(), targets.end());
+        std::unordered_set<std::string> seenAliases;
+
+        while (!pending.empty())
+        {
+            const std::string value = pending.front();
+            pending.pop_front();
+
+            if (knownFunctions.find(value) != knownFunctions.end())
+            {
+                resolvedFunctions.insert(value);
+                continue;
+            }
+
+            if (!seenAliases.insert(value).second)
+            {
+                continue;
+            }
+
+            const auto it = pointsTo.find(value);
+            if (it == pointsTo.end())
+            {
+                continue;
+            }
+
+            for (const std::string &next : it->second)
+            {
+                pending.push_back(next);
+            }
+        }
+
+        return resolvedFunctions;
     }
 
     /**
@@ -879,16 +1103,87 @@ namespace
     }
 
     /**
+     * @brief Collect wrapper dispatch targets from direct call sites to wrapper-style functions.
+     */
+    std::unordered_map<std::string, std::set<std::string>> collectWrapperDispatchTargets(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions,
+        const std::unordered_map<std::string, ParameterDispatchInfo> &dispatchFunctions)
+    {
+        std::unordered_map<std::string, std::set<std::string>> wrapperTargets;
+        const std::unordered_map<std::string, std::set<std::string>> emptyBindings;
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (callSite.directCallee.empty())
+                {
+                    continue;
+                }
+
+                if (dispatchFunctions.find(callSite.directCallee) == dispatchFunctions.end())
+                {
+                    continue;
+                }
+
+                std::set<std::string> &targets = wrapperTargets[callSite.directCallee];
+                for (const std::string &argumentExpression : callSite.argumentExpressions)
+                {
+                    const std::set<std::string> resolved = resolveExpressionTargets(argumentExpression, knownFunctions, emptyBindings);
+                    targets.insert(resolved.begin(), resolved.end());
+                }
+            }
+        }
+
+        return wrapperTargets;
+    }
+
+    /**
      * @brief Collect slots that are expected to hold function targets.
      */
     std::set<std::string> collectPointerSlots(const FunctionFacts &function)
     {
         std::set<std::string> slots;
 
+        auto removeArrayIndices = [](const std::string &text)
+        {
+            std::string out;
+            out.reserve(text.size());
+            int bracketDepth = 0;
+            for (char ch : text)
+            {
+                if (ch == '[')
+                {
+                    ++bracketDepth;
+                    continue;
+                }
+                if (ch == ']')
+                {
+                    if (bracketDepth > 0)
+                    {
+                        --bracketDepth;
+                    }
+                    continue;
+                }
+                if (bracketDepth == 0)
+                {
+                    out.push_back(ch);
+                }
+            }
+            return out;
+        };
+
         for (const PointerAssignment &assignment : function.pointerAssignments)
         {
             const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-            if (!lhsSlot.empty())
+            if (lhsSlot.empty())
+            {
+                continue;
+            }
+
+            if (!assignment.assignedFunction.empty() || assignment.rhsTakesFunctionAddress ||
+                assignment.rhsExpression.find('&') != std::string::npos)
             {
                 slots.insert(lhsSlot);
             }
@@ -911,6 +1206,22 @@ namespace
                 if (!calleeSlot.empty())
                 {
                     slots.insert(calleeSlot);
+                }
+
+                std::string normalized = callSite.calleeExpression;
+                for (std::size_t pos = normalized.find("->"); pos != std::string::npos; pos = normalized.find("->", pos + 1U))
+                {
+                    normalized.replace(pos, 2U, ".");
+                }
+                normalized = removeArrayIndices(normalized);
+                const std::size_t dotIndex = normalized.find('.');
+                if (dotIndex != std::string::npos && dotIndex > 0)
+                {
+                    const std::string baseSlot = canonicalSlot(normalized.substr(0, dotIndex));
+                    if (!baseSlot.empty())
+                    {
+                        slots.insert(baseSlot);
+                    }
                 }
             }
         }
@@ -935,6 +1246,18 @@ namespace
             return values;
         }
 
+        if (expression.find('&') != std::string::npos)
+        {
+            for (const std::string &identifier : extractIdentifiers(expression))
+            {
+                if (knownFunctions.find(identifier) == knownFunctions.end())
+                {
+                    values.insert(identifier);
+                    return values;
+                }
+            }
+        }
+
         const std::string slot = canonicalSlot(expression);
         if (!slot.empty())
         {
@@ -955,6 +1278,17 @@ namespace
             if (knownFunctions.find(identifier) != knownFunctions.end())
             {
                 values.insert(identifier);
+            }
+        }
+
+        if (values.empty())
+        {
+            for (const std::string &identifier : extractIdentifiers(expression))
+            {
+                if (knownFunctions.find(identifier) == knownFunctions.end())
+                {
+                    values.insert(identifier);
+                }
             }
         }
 
@@ -1071,6 +1405,184 @@ namespace
     }
 
     /**
+     * @brief Collect struct member mappings that flow out of returned local structs.
+     */
+    std::unordered_map<std::string, std::vector<StructMemberMapping>> collectReturnedStructMemberMappingsByFunction(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions)
+    {
+        std::unordered_map<std::string, std::vector<StructMemberMapping>> result;
+
+        auto normalizeStructAccess = [](const std::string &expression)
+        {
+            std::string normalized = expression;
+            for (std::size_t pos = normalized.find("->"); pos != std::string::npos; pos = normalized.find("->", pos + 1U))
+            {
+                normalized.replace(pos, 2U, ".");
+            }
+
+            std::string stripped;
+            stripped.reserve(normalized.size());
+            int bracketDepth = 0;
+            for (char ch : normalized)
+            {
+                if (ch == '[')
+                {
+                    ++bracketDepth;
+                    continue;
+                }
+                if (ch == ']')
+                {
+                    if (bracketDepth > 0)
+                    {
+                        --bracketDepth;
+                    }
+                    continue;
+                }
+                if (bracketDepth == 0)
+                {
+                    stripped.push_back(ch);
+                }
+            }
+
+            return trimLine(stripped);
+        };
+
+        auto parseStructAccess = [&](const std::string &expression) -> std::pair<std::string, std::string>
+        {
+            const std::string normalized = normalizeStructAccess(expression);
+            const std::size_t dotIndex = normalized.find('.');
+            if (dotIndex == std::string::npos || dotIndex == 0U)
+            {
+                return {"", ""};
+            }
+
+            return {normalized.substr(0, dotIndex), normalized.substr(dotIndex + 1U)};
+        };
+
+        for (const FunctionFacts &function : functions)
+        {
+            std::unordered_map<std::string, std::vector<StructMemberMapping>> mappingsByVariable;
+            std::unordered_set<std::string> seen;
+
+            auto addMapping = [&](const std::string &structVariable, const std::string &memberName, const std::string &functionName)
+            {
+                const std::string key = structVariable + "#" + memberName + "#" + functionName;
+                if (!seen.insert(key).second)
+                {
+                    return;
+                }
+
+                StructMemberMapping mapping;
+                mapping.structVariable = structVariable;
+                mapping.memberName = memberName;
+                mapping.functionName = functionName;
+                mappingsByVariable[structVariable].push_back(std::move(mapping));
+            };
+
+            for (const StructMemberMapping &mapping : function.structMemberMappings)
+            {
+                addMapping(mapping.structVariable, mapping.memberName, mapping.functionName);
+            }
+
+            bool changed = true;
+            const PointsToMap emptyBindings;
+            while (changed)
+            {
+                changed = false;
+
+                for (const PointerAssignment &assignment : function.pointerAssignments)
+                {
+                    const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
+                    if (lhsSlot.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::pair<std::string, std::string> lhsAccess = parseStructAccess(assignment.lhsExpression);
+                    if (!lhsAccess.first.empty() && !lhsAccess.second.empty())
+                    {
+                        const std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, emptyBindings);
+                        for (const std::string &target : targets)
+                        {
+                            const std::size_t before = seen.size();
+                            addMapping(lhsAccess.first, lhsAccess.second, target);
+                            if (seen.size() != before)
+                            {
+                                changed = true;
+                            }
+                        }
+                    }
+
+                    const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
+                    if (rhsSlot.empty() || rhsSlot == lhsSlot)
+                    {
+                        continue;
+                    }
+
+                    const auto rhsIt = mappingsByVariable.find(rhsSlot);
+                    if (rhsIt == mappingsByVariable.end())
+                    {
+                        continue;
+                    }
+
+                    for (const StructMemberMapping &mapping : rhsIt->second)
+                    {
+                        const std::size_t before = seen.size();
+                        addMapping(lhsSlot, mapping.memberName, mapping.functionName);
+                        if (seen.size() != before)
+                        {
+                            changed = true;
+                        }
+                    }
+                }
+            }
+
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &rawLine : block.lines)
+                {
+                    const std::string line = trimLine(rawLine);
+                    if (line.rfind("return ", 0) != 0)
+                    {
+                        continue;
+                    }
+
+                    std::string returned = trimLine(line.substr(7U));
+                    if (!returned.empty() && returned.back() == ';')
+                    {
+                        returned.pop_back();
+                        returned = trimLine(returned);
+                    }
+
+                    const std::string returnedSlot = canonicalSlot(returned);
+                    if (returnedSlot.empty())
+                    {
+                        continue;
+                    }
+
+                    const auto mappingsIt = mappingsByVariable.find(returnedSlot);
+                    if (mappingsIt == mappingsByVariable.end())
+                    {
+                        continue;
+                    }
+
+                    for (const StructMemberMapping &mapping : mappingsIt->second)
+                    {
+                        const std::string key = mapping.structVariable + "#" + mapping.memberName + "#" + mapping.functionName;
+                        if (seen.insert(key).second)
+                        {
+                            result[function.name].push_back(mapping);
+                        }
+                    }
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /**
      * @brief Legacy linear analyzer (retained for debugging/reference).
      */
     void analyzeFunction(
@@ -1142,7 +1654,7 @@ namespace
                 continue;
             }
 
-            const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, pointsTo);
+            const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, pointsTo, function.structMemberMappings);
             std::set<std::string> filteredTargets;
             for (const std::string &target : targets)
             {
@@ -1380,14 +1892,19 @@ namespace
         const std::vector<FunctionFacts> &functions,
         const std::set<std::string> &knownFunctions,
         const std::set<std::string> &blacklistedFunctions,
+        const std::unordered_map<std::string, std::set<std::string>> &wrapperDispatchTargets,
         std::vector<CallEdge> &resolvedEdges,
         std::vector<CallEdge> &unresolvedIndirect)
     {
         std::unordered_map<std::string, const FunctionFacts *> functionMap;
         std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
         std::unordered_map<std::string, std::set<std::string>> pointerSlotsByFunction;
+        const std::unordered_map<std::string, std::set<std::string>> programWidePointerTargets =
+            collectProgramWidePointerTargets(functions, knownFunctions);
         const std::unordered_map<std::string, std::set<std::string>> returnTargetsByFunction =
             collectReturnTargetsByFunction(functions, knownFunctions);
+        const std::unordered_map<std::string, std::vector<StructMemberMapping>> returnedStructMemberMappingsByFunction =
+            collectReturnedStructMemberMappingsByFunction(functions, knownFunctions);
         // Precompute per-function metadata used during traversal.
         for (const FunctionFacts &function : functions)
         {
@@ -1438,6 +1955,27 @@ namespace
 
             const std::set<std::string> pointerSlots = pointerSlotsByFunction[function.name];
             const std::vector<std::string> &parameterSlots = parameterSlotsByFunction[function.name];
+            const bool suppressUnresolvedLogging = job.seededPointsTo.empty() && !parameterSlots.empty();
+            std::vector<StructMemberMapping> activeStructMemberMappings = function.structMemberMappings;
+            std::unordered_set<std::string> seenStructMemberMappings;
+            for (const StructMemberMapping &mapping : activeStructMemberMappings)
+            {
+                seenStructMemberMappings.insert(mapping.structVariable + "#" + mapping.memberName + "#" + mapping.functionName);
+            }
+
+            auto appendStructMemberMappings = [&](const std::string &structVariable, const std::vector<StructMemberMapping> &sourceMappings)
+            {
+                for (const StructMemberMapping &mapping : sourceMappings)
+                {
+                    StructMemberMapping propagated = mapping;
+                    propagated.structVariable = structVariable;
+                    const std::string key = propagated.structVariable + "#" + propagated.memberName + "#" + propagated.functionName;
+                    if (seenStructMemberMappings.insert(key).second)
+                    {
+                        activeStructMemberMappings.push_back(std::move(propagated));
+                    }
+                }
+            };
 
             struct BlockState
             {
@@ -1642,7 +2180,7 @@ namespace
                                 break;
                             }
 
-                            const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, bindings);
+                            const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, bindings, activeStructMemberMappings);
                             std::set<std::string> filteredTargets;
                             for (const std::string &target : targets)
                             {
@@ -1651,6 +2189,57 @@ namespace
                                     filteredTargets.insert(target);
                                 }
                             }
+
+                            if (filteredTargets.empty())
+                            {
+                                const auto wrapperIt = wrapperDispatchTargets.find(function.name);
+                                if (wrapperIt != wrapperDispatchTargets.end())
+                                {
+                                    for (const std::string &target : wrapperIt->second)
+                                    {
+                                        if (!isBlacklistedFunction(target, blacklistedFunctions))
+                                        {
+                                            filteredTargets.insert(target);
+                                        }
+                                    }
+                                }
+                            }
+
+                            if (filteredTargets.empty())
+                            {
+                                if (!callSite.throughIdentifier.empty())
+                                {
+                                    const std::string throughSlot = canonicalSlot(callSite.throughIdentifier);
+                                    const auto it = programWidePointerTargets.find(throughSlot);
+                                    if (it != programWidePointerTargets.end())
+                                    {
+                                        for (const std::string &target : it->second)
+                                        {
+                                            if (!isBlacklistedFunction(target, blacklistedFunctions))
+                                            {
+                                                filteredTargets.insert(target);
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if (filteredTargets.empty())
+                                {
+                                    const std::string calleeSlot = canonicalSlot(callSite.calleeExpression);
+                                    const auto it = programWidePointerTargets.find(calleeSlot);
+                                    if (it != programWidePointerTargets.end())
+                                    {
+                                        for (const std::string &target : it->second)
+                                        {
+                                            if (!isBlacklistedFunction(target, blacklistedFunctions))
+                                            {
+                                                filteredTargets.insert(target);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
                             // Branch: unresolved indirect call under current bindings.
                             if (filteredTargets.empty())
                             {
@@ -1661,7 +2250,10 @@ namespace
                                 edge.calleeExpression = callSite.calleeExpression;
                                 edge.throughIdentifier = callSite.throughIdentifier;
                                 unresolvedIndirect.push_back(std::move(edge));
-                                logUnresolvedCall(unresolvedIndirect.back());
+                                if (!suppressUnresolvedLogging)
+                                {
+                                    logUnresolvedCall(unresolvedIndirect.back());
+                                }
                                 break;
                             }
 
@@ -1730,6 +2322,33 @@ namespace
                         if (!callReturns.empty())
                         {
                             values = std::move(callReturns);
+                        }
+
+                        for (const std::string &callee : rhsCallees)
+                        {
+                            const auto structIt = returnedStructMemberMappingsByFunction.find(callee);
+                            if (structIt != returnedStructMemberMappingsByFunction.end())
+                            {
+                                appendStructMemberMappings(lhsSlot, structIt->second);
+                            }
+                        }
+                    }
+
+                    const std::string rhsSlot = canonicalSlot(rhs);
+                    if (!rhsSlot.empty() && rhsSlot != lhsSlot)
+                    {
+                        std::vector<StructMemberMapping> copiedMappings;
+                        for (const StructMemberMapping &mapping : activeStructMemberMappings)
+                        {
+                            if (mapping.structVariable == rhsSlot)
+                            {
+                                copiedMappings.push_back(mapping);
+                            }
+                        }
+
+                        if (!copiedMappings.empty())
+                        {
+                            appendStructMemberMappings(lhsSlot, copiedMappings);
                         }
                     }
                     // Ignore assignments that resolve to no usable values.
@@ -1892,9 +2511,33 @@ bool generateCallGraphFromAnalysisJson(
         return false;
     }
 
+    const std::unordered_map<std::string, ParameterDispatchInfo> dispatchFunctions =
+        detectParameterDispatchFunctions(functions);
+    const std::unordered_map<std::string, std::set<std::string>> wrapperDispatchTargets =
+        collectWrapperDispatchTargets(functions, knownFunctions, dispatchFunctions);
+
     std::vector<CallEdge> resolvedEdges;
     std::vector<CallEdge> unresolvedIndirect;
-    runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
+
+    // Collect all struct member mappings from all functions and make them globally available
+    std::vector<StructMemberMapping> allStructMemberMappings;
+    for (const FunctionFacts &function : functions)
+    {
+        allStructMemberMappings.insert(
+            allStructMemberMappings.end(),
+            function.structMemberMappings.begin(),
+            function.structMemberMappings.end());
+    }
+    // Add collected mappings to each function so they're available during resolution
+    for (FunctionFacts &function : functions)
+    {
+        function.structMemberMappings.insert(
+            function.structMemberMappings.end(),
+            allStructMemberMappings.begin(),
+            allStructMemberMappings.end());
+    }
+
+    runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, wrapperDispatchTargets, resolvedEdges, unresolvedIndirect);
 
     std::set<CollapsedEdge> collapsedEdges;
     for (const CallEdge &edge : resolvedEdges)
