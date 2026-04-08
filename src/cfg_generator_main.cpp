@@ -9,7 +9,6 @@
 #include <set>
 #include <vector>
 
-#include "clang/Tooling/CommonOptionsParser.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -65,6 +64,12 @@ namespace
         llvm::cl::desc("Text file with exact function names to skip"),
         llvm::cl::value_desc("file"),
         llvm::cl::init(""),
+        llvm::cl::cat(kCategory));
+
+    llvm::cl::list<std::string> kSources(
+        llvm::cl::Positional,
+        llvm::cl::desc("Source files to analyze"),
+        llvm::cl::OneOrMore,
         llvm::cl::cat(kCategory));
 
     bool loadCompileArgsFile(const std::string &filePath, std::vector<std::string> &compileArgs, std::string &error)
@@ -140,12 +145,8 @@ namespace
  */
 int main(int argc, const char **argv)
 {
-    auto parser = clang::tooling::CommonOptionsParser::create(argc, argv, kCategory);
-    if (!parser)
-    {
-        llvm::errs() << parser.takeError();
-        return 2;
-    }
+    llvm::cl::HideUnrelatedOptions(kCategory);
+    llvm::cl::ParseCommandLineOptions(argc, argv, "Generate CFG analysis JSON\n");
 
     std::vector<std::string> compileArgs;
     compileArgs.push_back("-I.");
@@ -175,7 +176,7 @@ int main(int argc, const char **argv)
     CfgBundle bundle;
     std::string error;
     if (!generateCfgBundle(
-            parser.get().getSourcePathList(),
+            std::vector<std::string>(kSources.begin(), kSources.end()),
             compileArgs,
             kFunctionFilter,
             blacklistedFunctions,

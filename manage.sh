@@ -153,10 +153,27 @@ generate_cfg() {
   fi
 
   local inputs=()
+  local expanded_inputs=()
   if [[ ${#CFG_INPUTS[@]} -gt 0 ]]; then
     inputs=("${CFG_INPUTS[@]}")
   else
     inputs=("$CFG_INPUT")
+  fi
+
+  for input in "${inputs[@]}"; do
+    if [[ -d "$input" ]]; then
+      while IFS= read -r -d '' file; do
+        expanded_inputs+=("$file")
+      done < <(find "$input" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) -print0)
+      continue
+    fi
+
+    expanded_inputs+=("$input")
+  done
+
+  if [[ ${#expanded_inputs[@]} -eq 0 ]]; then
+    echo "error: no source files found from configured inputs" >&2
+    exit 1
   fi
 
   for include_dir in "${CFG_INCLUDE_DIRS[@]}"; do
@@ -171,7 +188,7 @@ generate_cfg() {
     cmd="$cmd --blacklist-file $(printf '%q' "$BLACKLIST_FILE")"
   fi
 
-  for input in "${inputs[@]}"; do
+  for input in "${expanded_inputs[@]}"; do
     cmd="$cmd $(printf '%q' "$input")"
   done
 
