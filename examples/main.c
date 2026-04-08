@@ -1,26 +1,13 @@
-typedef int (*fptr)(int);
+#include <stdio.h>
+#include "vdm.h"
 
-typedef struct
+int test(int port, int i, int x)
 {
-    fptr f;
-} S;
-
-int A(int x) { return x + 1; }
-int B(int x) { return x + 2; }
-
-S arr[2];
-
-void init(int x)
-{
-    arr[0].f = A;
-    arr[1].f = B;
-
-    if (x > 5)
-        arr[0].f = B; // overwrite
+    return aVdm(port)[i].vdmHandler(x); // 🔥 TARGET PATTERN
 }
 
-int test(int x)
+int main()
 {
-    init(x);
-    return arr[x % 2].f(x);
+    test(0, 1, 5);
+    return 0;
 }

@@ -947,6 +947,19 @@ namespace
                     }
                 }
             }
+
+            if (targets.empty() &&
+                (structVar.find('(') != std::string::npos || structVar.find(')') != std::string::npos ||
+                 structVar.find('[') != std::string::npos || structVar.find(']') != std::string::npos))
+            {
+                for (const StructMemberMapping &mapping : structMappings)
+                {
+                    if (mapping.memberName == memberName)
+                    {
+                        targets.insert(mapping.functionName);
+                    }
+                }
+            }
         }
 
         if (!callSite.throughIdentifier.empty())
@@ -2018,6 +2031,35 @@ namespace
                 }
             };
 
+            auto emitDirectCall = [&](const CallSite &callSite)
+            {
+                if (callSite.directCallee.empty())
+                {
+                    return;
+                }
+
+                if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
+                {
+                    return;
+                }
+
+                CallEdge edge;
+                edge.caller = function.name;
+                edge.callee = callSite.directCallee;
+                edge.kind = "direct";
+                edge.location = callSite.location;
+                edge.calleeExpression = callSite.calleeExpression;
+                edge.throughIdentifier = callSite.throughIdentifier;
+                resolvedEdges.push_back(std::move(edge));
+
+                enqueueCallee(callSite, initialBindings, callSite.directCallee);
+            };
+
+            for (const CallSite &callSite : function.callSites)
+            {
+                emitDirectCall(callSite);
+            }
+
             // Match a serialized block line to a parsed callsite record.
             auto lineMatchesCallSite = [&](const std::string &line, const CallSite &callSite)
             {
@@ -2162,21 +2204,6 @@ namespace
                             // Branch: direct call, emit direct edge and enqueue callee.
                             if (!callSite.directCallee.empty())
                             {
-                                if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
-                                {
-                                    break;
-                                }
-
-                                CallEdge edge;
-                                edge.caller = function.name;
-                                edge.callee = callSite.directCallee;
-                                edge.kind = "direct";
-                                edge.location = callSite.location;
-                                edge.calleeExpression = callSite.calleeExpression;
-                                edge.throughIdentifier = callSite.throughIdentifier;
-                                resolvedEdges.push_back(std::move(edge));
-
-                                enqueueCallee(callSite, bindings, callSite.directCallee);
                                 break;
                             }
 
