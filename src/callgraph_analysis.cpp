@@ -434,6 +434,22 @@ namespace
         return blacklistedFunctions.find(functionName) != blacklistedFunctions.end();
     }
 
+    void logFunctionProcessed(const std::string &functionName, const PointsToMap &seededPointsTo)
+    {
+        llvm::errs() << "[callgraph] processing function=" << functionName
+                     << " seed-bindings=" << seededPointsTo.size() << "\n";
+    }
+
+    void logUnresolvedCall(const CallEdge &edge)
+    {
+        llvm::errs() << "[callgraph] unresolved indirect call"
+                     << " caller=" << edge.caller
+                     << " calleeExpr=" << edge.calleeExpression
+                     << " through=" << edge.throughIdentifier
+                     << " at " << edge.location.file << ":" << edge.location.line << ":" << edge.location.column
+                     << "\n";
+    }
+
     /**
      * @brief Parse all function facts from cfg-analysis JSON.
      */
@@ -1145,6 +1161,7 @@ namespace
                 edge.calleeExpression = callSite.calleeExpression;
                 edge.throughIdentifier = callSite.throughIdentifier;
                 unresolvedIndirect.push_back(std::move(edge));
+                logUnresolvedCall(unresolvedIndirect.back());
                 continue;
             }
 
@@ -1394,6 +1411,8 @@ namespace
             ContextJob job = std::move(worklist.front());
             worklist.pop_front();
 
+            logFunctionProcessed(job.functionName, job.seededPointsTo);
+
             const auto functionIt = functionMap.find(job.functionName);
             // Skip stale jobs if the function cannot be found.
             if (functionIt == functionMap.end())
@@ -1642,6 +1661,7 @@ namespace
                                 edge.calleeExpression = callSite.calleeExpression;
                                 edge.throughIdentifier = callSite.throughIdentifier;
                                 unresolvedIndirect.push_back(std::move(edge));
+                                logUnresolvedCall(unresolvedIndirect.back());
                                 break;
                             }
 
