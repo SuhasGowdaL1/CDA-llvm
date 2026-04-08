@@ -1,26 +1,27 @@
-#include "vdm.h"
+#include "types.h"
 
-/* Handlers */
-int H0(int x) { return x + 10; }
-int H1(int x) { return x + 20; }
-int H2(int x) { return x + 30; }
+/* Target functions */
+int F0(int x) { return x + 10; }
+int F1(int x) { return x + 20; }
+int F2(int x) { return x + 30; }
 
-/* Tables for different ports */
-static const VdmEntry port0[] = {
-    {0, H0},
-    {1, H1},
-    {2, H2}};
+/* Array 'a' */
+const AEntry a[3] = {
+    {0, F0},
+    {1, F1},
+    {2, F2}};
 
-static const VdmEntry port1[] = {
-    {0, H1},
-    {1, H2},
-    {2, H0}};
-
-/* Return table based on port */
-const VdmEntry *getVdmTable(int port)
+/* Return struct with index */
+BEntry getB(int x)
 {
-    if (port == 0)
-        return port0;
+    BEntry b;
+
+    if (x % 3 == 0)
+        b.d = 0;
+    else if (x % 3 == 1)
+        b.d = 1;
     else
-        return port1;
+        b.d = 2;
+
+    return b;
 }

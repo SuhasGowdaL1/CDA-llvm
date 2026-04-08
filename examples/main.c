@@ -1,19 +1,17 @@
 #include <stdio.h>
-#include "vdm.h"
+#include "types.h"
 
-int test(int port, int i, int x)
+/* External array */
+extern const AEntry a[3];
+
+int test(int c, int x)
 {
-
-    return aVdm(port)[i].vdmHandler(x); // 🔥 TARGET PATTERN
+    return a[b(c).d]
+        .e(x); // 🔥 EXACT PATTERN
 }
-int test2(int port, int i, int x)
-{
-    const VdmEntry *entry = &aVdm(port)[i];
 
-    return entry->vdmHandler(x); // same pattern via pointer
-}
 int main()
 {
-    test(0, 1, 5);
+    test(2, 5);
     return 0;
 }

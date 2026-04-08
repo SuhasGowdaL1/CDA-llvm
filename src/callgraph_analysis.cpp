@@ -946,6 +946,20 @@ namespace
             return text.substr(begin, end - begin);
         };
 
+        auto removeAllWhitespace = [](const std::string &text)
+        {
+            std::string out;
+            out.reserve(text.size());
+            for (char ch : text)
+            {
+                if (std::isspace(static_cast<unsigned char>(ch)) == 0)
+                {
+                    out.push_back(ch);
+                }
+            }
+            return out;
+        };
+
         // Try to resolve struct member access (e.g., "global_ops.opA")
         std::string normalizedCallee = callSite.calleeExpression;
         for (std::size_t pos = normalizedCallee.find("->"); pos != std::string::npos; pos = normalizedCallee.find("->", pos + 1U))
@@ -954,6 +968,7 @@ namespace
         }
         normalizedCallee = removeArrayIndices(normalizedCallee);
         normalizedCallee = trimWhitespace(normalizedCallee);
+        normalizedCallee = removeAllWhitespace(normalizedCallee);
 
         const std::size_t dotIndex = normalizedCallee.find('.');
         if (dotIndex != std::string::npos && dotIndex > 0)
