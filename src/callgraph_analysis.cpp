@@ -60,6 +60,7 @@ namespace
         std::string memberName;
         std::string functionName;
         SourceLocation location;
+        bool programWideSeed = false;
     };
 
     struct FunctionFacts
@@ -774,6 +775,11 @@ namespace
         const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
         if (!rhsSlot.empty())
         {
+            if (knownFunctions.find(rhsSlot) == knownFunctions.end() && !isIntegerBinding(rhsSlot))
+            {
+                targets.insert(rhsSlot);
+            }
+
             const auto existing = pointsTo.find(rhsSlot);
             if (existing != pointsTo.end())
             {
@@ -812,48 +818,441 @@ namespace
         const std::set<std::string> &knownFunctions)
     {
         std::unordered_map<std::string, std::set<std::string>> targetsBySlot;
+        std::set<std::string> globalSlots;
 
+        std::vector<const PointerAssignment *> globalAssignments;
         for (const FunctionFacts &function : functions)
         {
             for (const PointerAssignment &assignment : function.pointerAssignments)
             {
-                if (!assignment.lhsIsGlobal)
-                {
-                    continue;
-                }
-
                 const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
                 if (lhsSlot.empty())
                 {
                     continue;
                 }
 
-                std::set<std::string> targets;
-                if (!assignment.assignedFunction.empty() &&
-                    knownFunctions.find(assignment.assignedFunction) != knownFunctions.end())
+                globalSlots.insert(lhsSlot);
+                globalAssignments.push_back(&assignment);
+            }
+        }
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+
+            for (const PointerAssignment *assignmentPtr : globalAssignments)
+            {
+                const PointerAssignment &assignment = *assignmentPtr;
+                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
+                if (lhsSlot.empty())
                 {
-                    targets.insert(assignment.assignedFunction);
+                    continue;
                 }
-                else
+
+                std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, targetsBySlot);
+
+                const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
+                if (!rhsSlot.empty())
                 {
-                    for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
+                    const auto rhsIt = targetsBySlot.find(rhsSlot);
+                    if (rhsIt != targetsBySlot.end())
                     {
-                        if (knownFunctions.find(identifier) != knownFunctions.end())
-                        {
-                            targets.insert(identifier);
-                        }
+                        targets.insert(rhsIt->second.begin(), rhsIt->second.end());
                     }
                 }
 
-                if (!targets.empty())
+                if (targets.empty())
                 {
-                    std::set<std::string> &slotTargets = targetsBySlot[lhsSlot];
-                    slotTargets.insert(targets.begin(), targets.end());
+                    continue;
+                }
+
+                std::set<std::string> &slotTargets = targetsBySlot[lhsSlot];
+                const std::size_t before = slotTargets.size();
+                slotTargets.insert(targets.begin(), targets.end());
+                if (slotTargets.size() != before)
+                {
+                    changed = true;
+                }
+            }
+
+            for (const FunctionFacts &function : functions)
+            {
+                for (const CallSite &callSite : function.callSites)
+                {
+                    if (callSite.directCallee != "memcpy" &&
+                        callSite.directCallee != "memmove" &&
+                        callSite.directCallee != "__builtin_memcpy" &&
+                        callSite.directCallee != "__builtin_memmove")
+                    {
+                        continue;
+                    }
+
+                    if (callSite.argumentExpressions.size() < 2U)
+                    {
+                        continue;
+                    }
+
+                    const std::string dstSlot = canonicalSlot(callSite.argumentExpressions[0]);
+                    const std::string srcSlot = canonicalSlot(callSite.argumentExpressions[1]);
+                    if (dstSlot.empty() || globalSlots.find(dstSlot) == globalSlots.end())
+                    {
+                        continue;
+                    }
+
+                    std::set<std::string> copiedTargets;
+                    if (!srcSlot.empty())
+                    {
+                        const auto srcIt = targetsBySlot.find(srcSlot);
+                        if (srcIt != targetsBySlot.end())
+                        {
+                            copiedTargets.insert(srcIt->second.begin(), srcIt->second.end());
+                        }
+                    }
+
+                    if (copiedTargets.empty())
+                    {
+                        for (const std::string &identifier : extractIdentifiers(callSite.argumentExpressions[1]))
+                        {
+                            if (knownFunctions.find(identifier) != knownFunctions.end())
+                            {
+                                copiedTargets.insert(identifier);
+                            }
+                        }
+                    }
+
+                    if (copiedTargets.empty())
+                    {
+                        continue;
+                    }
+
+                    std::set<std::string> &dstTargets = targetsBySlot[dstSlot];
+                    const std::size_t before = dstTargets.size();
+                    dstTargets.insert(copiedTargets.begin(), copiedTargets.end());
+                    if (dstTargets.size() != before)
+                    {
+                        changed = true;
+                    }
                 }
             }
         }
 
         return targetsBySlot;
+    }
+
+    /**
+     * @brief Parse memcpy/memmove destination and source slots from a CFG line.
+     */
+    std::optional<std::pair<std::string, std::string>> parseMemcpyArgsFromLine(const std::string &rawLine)
+    {
+        std::string line = trimLine(rawLine);
+        if (!line.empty() && line.back() == ';')
+        {
+            line.pop_back();
+            line = trimLine(line);
+        }
+
+        auto startsWith = [&](const std::string &prefix)
+        {
+            return line.rfind(prefix, 0U) == 0U;
+        };
+
+        if (!startsWith("memcpy(") &&
+            !startsWith("memmove(") &&
+            !startsWith("__builtin_memcpy(") &&
+            !startsWith("__builtin_memmove("))
+        {
+            return std::nullopt;
+        }
+
+        const std::size_t openParen = line.find('(');
+        const std::size_t closeParen = line.rfind(')');
+        if (openParen == std::string::npos || closeParen == std::string::npos || closeParen <= openParen + 1U)
+        {
+            return std::nullopt;
+        }
+
+        const std::string argsText = line.substr(openParen + 1U, closeParen - openParen - 1U);
+        std::vector<std::string> args;
+        std::string current;
+        int parenDepth = 0;
+        for (char ch : argsText)
+        {
+            if (ch == '(')
+            {
+                ++parenDepth;
+            }
+            else if (ch == ')')
+            {
+                if (parenDepth > 0)
+                {
+                    --parenDepth;
+                }
+            }
+
+            if (ch == ',' && parenDepth == 0)
+            {
+                args.push_back(trimLine(current));
+                current.clear();
+                continue;
+            }
+
+            current.push_back(ch);
+        }
+        if (!current.empty())
+        {
+            args.push_back(trimLine(current));
+        }
+
+        if (args.size() < 2U)
+        {
+            return std::nullopt;
+        }
+
+        if (args[0].empty() || args[1].empty())
+        {
+            return std::nullopt;
+        }
+
+        return std::make_pair(args[0], args[1]);
+    }
+
+    std::vector<std::string> collectParameterSlots(
+        const FunctionFacts &function,
+        const std::set<std::string> &knownFunctions);
+
+    /**
+     * @brief Collect struct-member targets copied from local structs into global storage.
+     */
+    std::vector<StructMemberMapping> collectProgramWideStructMemberMappings(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions)
+    {
+        std::vector<StructMemberMapping> result;
+        std::unordered_set<std::string> seen;
+
+        auto normalizeAccessExpression = [](std::string expression)
+        {
+            expression = trimLine(expression);
+            while (!expression.empty() && (expression.front() == '&' || expression.front() == '*'))
+            {
+                expression.erase(expression.begin());
+                expression = trimLine(expression);
+            }
+
+            for (std::size_t pos = expression.find("->"); pos != std::string::npos; pos = expression.find("->", pos + 1U))
+            {
+                expression.replace(pos, 2U, ".");
+            }
+
+            std::string stripped;
+            stripped.reserve(expression.size());
+            int bracketDepth = 0;
+            for (char ch : expression)
+            {
+                if (ch == '[')
+                {
+                    ++bracketDepth;
+                    continue;
+                }
+                if (ch == ']')
+                {
+                    if (bracketDepth > 0)
+                    {
+                        --bracketDepth;
+                    }
+                    continue;
+                }
+                if (std::isspace(static_cast<unsigned char>(ch)) == 0 && bracketDepth == 0)
+                {
+                    stripped.push_back(ch);
+                }
+            }
+
+            return stripped;
+        };
+
+        auto splitStructAccess = [&](const std::string &expression) -> std::pair<std::string, std::string>
+        {
+            const std::string normalized = normalizeAccessExpression(expression);
+            const std::size_t dot = normalized.find('.');
+            if (dot == std::string::npos || dot == 0U)
+            {
+                return {canonicalSlot(normalized), ""};
+            }
+
+            return {normalized.substr(0, dot), normalized.substr(dot + 1U)};
+        };
+
+        std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
+        for (const FunctionFacts &function : functions)
+        {
+            parameterSlotsByFunction[function.name] = collectParameterSlots(function, knownFunctions);
+        }
+
+        std::unordered_map<std::string, std::vector<StructMemberMapping>> incomingParameterMappings;
+        std::unordered_map<std::string, const FunctionFacts *> functionMap;
+        for (const FunctionFacts &function : functions)
+        {
+            functionMap[function.name] = &function;
+        }
+
+        for (const FunctionFacts &caller : functions)
+        {
+            for (const CallSite &callSite : caller.callSites)
+            {
+                if (callSite.directCallee.empty())
+                {
+                    continue;
+                }
+
+                const auto calleeIt = functionMap.find(callSite.directCallee);
+                if (calleeIt == functionMap.end())
+                {
+                    continue;
+                }
+
+                const std::vector<std::string> &params = parameterSlotsByFunction[callSite.directCallee];
+                const std::size_t limit = std::min(params.size(), callSite.argumentExpressions.size());
+                if (limit == 0U)
+                {
+                    continue;
+                }
+
+                std::unordered_map<std::string, std::vector<StructMemberMapping>> callerMappingsByVar;
+                for (const StructMemberMapping &mapping : caller.structMemberMappings)
+                {
+                    callerMappingsByVar[mapping.structVariable].push_back(mapping);
+                }
+
+                for (std::size_t i = 0; i < limit; ++i)
+                {
+                    const std::string &param = params[i];
+                    const std::string argSlot = canonicalSlot(callSite.argumentExpressions[i]);
+                    if (argSlot.empty())
+                    {
+                        continue;
+                    }
+
+                    const auto argMappingsIt = callerMappingsByVar.find(argSlot);
+                    if (argMappingsIt == callerMappingsByVar.end())
+                    {
+                        continue;
+                    }
+
+                    for (const StructMemberMapping &mapping : argMappingsIt->second)
+                    {
+                        StructMemberMapping propagated = mapping;
+                        propagated.structVariable = param;
+                        incomingParameterMappings[callSite.directCallee].push_back(std::move(propagated));
+                    }
+                }
+            }
+        }
+
+        for (const FunctionFacts &function : functions)
+        {
+            std::unordered_set<std::string> localStructVars;
+            std::unordered_map<std::string, std::vector<StructMemberMapping>> mappingsByVariable;
+            for (const StructMemberMapping &mapping : function.structMemberMappings)
+            {
+                localStructVars.insert(mapping.structVariable);
+                mappingsByVariable[mapping.structVariable].push_back(mapping);
+            }
+
+            const auto incomingIt = incomingParameterMappings.find(function.name);
+            if (incomingIt != incomingParameterMappings.end())
+            {
+                for (const StructMemberMapping &mapping : incomingIt->second)
+                {
+                    localStructVars.insert(mapping.structVariable);
+                    mappingsByVariable[mapping.structVariable].push_back(mapping);
+                }
+            }
+
+            if (localStructVars.empty())
+            {
+                continue;
+            }
+
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &line : block.lines)
+                {
+                    const std::optional<std::pair<std::string, std::string>> copy = parseMemcpyArgsFromLine(line);
+                    if (!copy.has_value())
+                    {
+                        continue;
+                    }
+
+                    const std::pair<std::string, std::string> dstAccess = splitStructAccess(copy->first);
+                    const std::pair<std::string, std::string> srcAccess = splitStructAccess(copy->second);
+                    const std::string &dstSlot = dstAccess.first;
+                    const std::string &dstPrefix = dstAccess.second;
+                    const std::string &srcSlot = srcAccess.first;
+                    if (localStructVars.find(srcSlot) == localStructVars.end())
+                    {
+                        continue;
+                    }
+                    if (localStructVars.find(dstSlot) != localStructVars.end())
+                    {
+                        continue;
+                    }
+
+                    const auto srcIt = mappingsByVariable.find(srcSlot);
+                    if (srcIt == mappingsByVariable.end())
+                    {
+                        continue;
+                    }
+
+                    std::unordered_map<std::string, std::uint64_t> latestStampByGroup;
+                    for (const StructMemberMapping &mapping : srcIt->second)
+                    {
+                        const std::size_t groupDot = mapping.memberName.rfind('.');
+                        const std::string group =
+                            groupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, groupDot + 1U);
+                        const std::string localGroupKey = mapping.structVariable + "#" + group;
+                        const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
+                                                    static_cast<std::uint64_t>(mapping.location.column);
+                        const auto latestIt = latestStampByGroup.find(localGroupKey);
+                        if (latestIt == latestStampByGroup.end() || stamp >= latestIt->second)
+                        {
+                            latestStampByGroup[localGroupKey] = stamp;
+                        }
+                    }
+
+                    for (const StructMemberMapping &mapping : srcIt->second)
+                    {
+                        const std::size_t groupDot = mapping.memberName.rfind('.');
+                        const std::string group =
+                            groupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, groupDot + 1U);
+                        const std::string localGroupKey = mapping.structVariable + "#" + group;
+                        const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
+                                                    static_cast<std::uint64_t>(mapping.location.column);
+                        const auto latestIt = latestStampByGroup.find(localGroupKey);
+                        if (latestIt != latestStampByGroup.end() && stamp != latestIt->second)
+                        {
+                            continue;
+                        }
+
+                        StructMemberMapping propagated = mapping;
+                        propagated.structVariable = dstSlot;
+                        if (!dstPrefix.empty())
+                        {
+                            propagated.memberName = dstPrefix + "." + propagated.memberName;
+                        }
+                        propagated.programWideSeed = true;
+                        const std::string key = propagated.structVariable + "#" + propagated.memberName + "#" + propagated.functionName;
+                        if (seen.insert(key).second)
+                        {
+                            result.push_back(std::move(propagated));
+                        }
+                    }
+                }
+            }
+        }
+
+        return result;
     }
 
     /**
@@ -866,6 +1265,64 @@ namespace
         const std::vector<StructMemberMapping> &structMappings)
     {
         std::set<std::string> targets;
+
+        auto memberGroupKey = [&](const StructMemberMapping &mapping)
+        {
+            std::string groupBase = mapping.structVariable;
+            const auto pointeeIt = pointsTo.find(mapping.structVariable);
+            if (pointeeIt != pointsTo.end() && pointeeIt->second.size() == 1U)
+            {
+                const std::string &candidate = *pointeeIt->second.begin();
+                if (!candidate.empty() &&
+                    !isIntegerBinding(candidate) &&
+                    knownFunctions.find(candidate) == knownFunctions.end())
+                {
+                    groupBase = candidate;
+                }
+            }
+
+            const std::size_t dotIndex = mapping.memberName.rfind('.');
+            const std::string group = dotIndex == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, dotIndex + 1U);
+            return groupBase + "#" + group;
+        };
+
+        std::vector<const StructMemberMapping *> activeMappings;
+        activeMappings.reserve(structMappings.size());
+
+        std::unordered_map<std::string, std::uint64_t> latestStampByGroup;
+        for (const StructMemberMapping &mapping : structMappings)
+        {
+            if (mapping.programWideSeed)
+            {
+                continue;
+            }
+
+            const std::string key = memberGroupKey(mapping);
+            const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
+                                        static_cast<std::uint64_t>(mapping.location.column);
+            const auto it = latestStampByGroup.find(key);
+            if (it == latestStampByGroup.end() || stamp >= it->second)
+            {
+                latestStampByGroup[key] = stamp;
+            }
+        }
+
+        for (const StructMemberMapping &mapping : structMappings)
+        {
+            if (!mapping.programWideSeed)
+            {
+                const std::string key = memberGroupKey(mapping);
+                const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
+                                            static_cast<std::uint64_t>(mapping.location.column);
+                const auto it = latestStampByGroup.find(key);
+                if (it != latestStampByGroup.end() && stamp != it->second)
+                {
+                    continue;
+                }
+            }
+
+            activeMappings.push_back(&mapping);
+        }
 
         auto resolveAliasSlots = [&](const std::string &slot)
         {
@@ -975,10 +1432,50 @@ namespace
         {
             const std::string structVar = normalizedCallee.substr(0, dotIndex);
             const std::string memberName = normalizedCallee.substr(dotIndex + 1U);
+            const std::size_t nestedDot = memberName.rfind('.');
+            const std::string leafMemberName =
+                nestedDot == std::string::npos ? memberName : memberName.substr(nestedDot + 1U);
 
-            for (const StructMemberMapping &mapping : structMappings)
+            auto isSimpleIdentifier = [](const std::string &text)
             {
-                if (mapping.structVariable == structVar && mapping.memberName == memberName)
+                if (text.empty())
+                {
+                    return false;
+                }
+
+                const unsigned char first = static_cast<unsigned char>(text[0]);
+                if (std::isalpha(first) == 0 && text[0] != '_')
+                {
+                    return false;
+                }
+
+                for (std::size_t i = 1; i < text.size(); ++i)
+                {
+                    const unsigned char ch = static_cast<unsigned char>(text[i]);
+                    if (std::isalnum(ch) == 0 && text[i] != '_')
+                    {
+                        return false;
+                    }
+                }
+
+                return true;
+            };
+
+            auto mappingMatchesMember = [&](const StructMemberMapping &mapping)
+            {
+                const std::size_t mappingNestedDot = mapping.memberName.rfind('.');
+                const std::string mappingLeafMemberName =
+                    mappingNestedDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(mappingNestedDot + 1U);
+
+                return mapping.memberName == memberName ||
+                       mapping.memberName == leafMemberName ||
+                       mappingLeafMemberName == memberName;
+            };
+
+            for (const StructMemberMapping *mappingPtr : activeMappings)
+            {
+                const StructMemberMapping &mapping = *mappingPtr;
+                if (mapping.structVariable == structVar && mappingMatchesMember(mapping))
                 {
                     targets.insert(mapping.functionName);
                 }
@@ -986,8 +1483,10 @@ namespace
 
             const std::set<std::string> aliasSlots = resolveAliasSlots(structVar);
             bool aliasChainLooksIndirect = false;
+            std::set<std::string> aliasPointeeTargets;
             if (!aliasSlots.empty())
             {
+                aliasPointeeTargets.insert(aliasSlots.begin(), aliasSlots.end());
                 for (const std::string &aliasBase : aliasSlots)
                 {
                     if (knownFunctions.find(aliasBase) == knownFunctions.end())
@@ -995,9 +1494,41 @@ namespace
                         aliasChainLooksIndirect = true;
                     }
 
+                    for (const StructMemberMapping *mappingPtr : activeMappings)
+                    {
+                        const StructMemberMapping &mapping = *mappingPtr;
+                        if (mapping.structVariable == aliasBase && mappingMatchesMember(mapping))
+                        {
+                            targets.insert(mapping.functionName);
+                        }
+                    }
+                }
+
+                for (const auto &entry : pointsTo)
+                {
+                    if (entry.first == structVar)
+                    {
+                        continue;
+                    }
+
+                    bool sharesPointee = false;
+                    for (const std::string &value : entry.second)
+                    {
+                        if (aliasPointeeTargets.find(value) != aliasPointeeTargets.end())
+                        {
+                            sharesPointee = true;
+                            break;
+                        }
+                    }
+
+                    if (!sharesPointee)
+                    {
+                        continue;
+                    }
+
                     for (const StructMemberMapping &mapping : structMappings)
                     {
-                        if (mapping.structVariable == aliasBase && mapping.memberName == memberName)
+                        if (mapping.structVariable == entry.first && mappingMatchesMember(mapping))
                         {
                             targets.insert(mapping.functionName);
                         }
@@ -1005,11 +1536,12 @@ namespace
                 }
             }
 
-            if (targets.empty() && aliasChainLooksIndirect)
+            if (targets.empty() && aliasChainLooksIndirect && !isSimpleIdentifier(structVar))
             {
-                for (const StructMemberMapping &mapping : structMappings)
+                for (const StructMemberMapping *mappingPtr : activeMappings)
                 {
-                    if (mapping.memberName == memberName)
+                    const StructMemberMapping &mapping = *mappingPtr;
+                    if (mappingMatchesMember(mapping))
                     {
                         targets.insert(mapping.functionName);
                     }
@@ -1020,9 +1552,23 @@ namespace
                 (structVar.find('(') != std::string::npos || structVar.find(')') != std::string::npos ||
                  structVar.find('[') != std::string::npos || structVar.find(']') != std::string::npos))
             {
-                for (const StructMemberMapping &mapping : structMappings)
+                for (const StructMemberMapping *mappingPtr : activeMappings)
                 {
-                    if (mapping.memberName == memberName)
+                    const StructMemberMapping &mapping = *mappingPtr;
+                    if (mappingMatchesMember(mapping))
+                    {
+                        targets.insert(mapping.functionName);
+                    }
+                }
+            }
+
+            if (targets.empty() && !isSimpleIdentifier(structVar))
+            {
+                // Conservative fallback: if only the member name is known, use any mapping with same member.
+                for (const StructMemberMapping *mappingPtr : activeMappings)
+                {
+                    const StructMemberMapping &mapping = *mappingPtr;
+                    if (mappingMatchesMember(mapping))
                     {
                         targets.insert(mapping.functionName);
                     }
@@ -1757,7 +2303,6 @@ namespace
                 logUnresolvedCall(unresolvedIndirect.back());
                 continue;
             }
-
             for (const std::string &callee : filteredTargets)
             {
                 CallEdge edge;
@@ -1982,6 +2527,8 @@ namespace
         std::unordered_map<std::string, std::set<std::string>> pointerSlotsByFunction;
         const std::unordered_map<std::string, std::set<std::string>> programWidePointerTargets =
             collectProgramWidePointerTargets(functions, knownFunctions);
+        const std::vector<StructMemberMapping> programWideStructMemberMappings =
+            collectProgramWideStructMemberMappings(functions, knownFunctions);
         const std::unordered_map<std::string, std::set<std::string>> returnTargetsByFunction =
             collectReturnTargetsByFunction(functions, knownFunctions);
         const std::unordered_map<std::string, std::vector<StructMemberMapping>> returnedStructMemberMappingsByFunction =
@@ -2036,24 +2583,331 @@ namespace
 
             const std::set<std::string> pointerSlots = pointerSlotsByFunction[function.name];
             const std::vector<std::string> &parameterSlots = parameterSlotsByFunction[function.name];
-            const bool suppressUnresolvedLogging = job.seededPointsTo.empty() && !parameterSlots.empty();
+            auto makeStructMemberMappingKey = [](const StructMemberMapping &mapping)
+            {
+                return mapping.structVariable + "#" + mapping.memberName + "#" + mapping.functionName + "@" +
+                       std::to_string(mapping.location.line) + ":" + std::to_string(mapping.location.column);
+            };
+
+            auto buildStructMappingsKey = [&](const std::vector<StructMemberMapping> &mappings)
+            {
+                std::vector<std::string> keys;
+                keys.reserve(mappings.size());
+                for (const StructMemberMapping &mapping : mappings)
+                {
+                    keys.push_back(makeStructMemberMappingKey(mapping));
+                }
+                std::sort(keys.begin(), keys.end());
+
+                std::string key;
+                for (const std::string &mappingKey : keys)
+                {
+                    key += mappingKey;
+                    key += ";";
+                }
+                return key;
+            };
+
             std::vector<StructMemberMapping> activeStructMemberMappings = function.structMemberMappings;
+            activeStructMemberMappings.insert(
+                activeStructMemberMappings.end(),
+                programWideStructMemberMappings.begin(),
+                programWideStructMemberMappings.end());
             std::unordered_set<std::string> seenStructMemberMappings;
             for (const StructMemberMapping &mapping : activeStructMemberMappings)
             {
-                seenStructMemberMappings.insert(mapping.structVariable + "#" + mapping.memberName + "#" + mapping.functionName);
+                seenStructMemberMappings.insert(makeStructMemberMappingKey(mapping));
             }
 
-            auto appendStructMemberMappings = [&](const std::string &structVariable, const std::vector<StructMemberMapping> &sourceMappings)
+            auto appendStructMemberMappings = [&](std::vector<StructMemberMapping> &structMemberMappings,
+                                                  std::unordered_set<std::string> &seenMappings,
+                                                  const std::string &structVariable,
+                                                  const std::vector<StructMemberMapping> &sourceMappings)
             {
                 for (const StructMemberMapping &mapping : sourceMappings)
                 {
                     StructMemberMapping propagated = mapping;
                     propagated.structVariable = structVariable;
-                    const std::string key = propagated.structVariable + "#" + propagated.memberName + "#" + propagated.functionName;
-                    if (seenStructMemberMappings.insert(key).second)
+                    const std::string key = makeStructMemberMappingKey(propagated);
+                    if (seenMappings.insert(key).second)
                     {
-                        activeStructMemberMappings.push_back(std::move(propagated));
+                        structMemberMappings.push_back(std::move(propagated));
+                    }
+                }
+            };
+
+            auto collectOverwriteSlots = [&](const std::string &slot, const PointsToMap &currentBindings)
+            {
+                std::unordered_set<std::string> overwriteSlots;
+                overwriteSlots.insert(slot);
+
+                const auto slotIt = currentBindings.find(slot);
+                if (slotIt == currentBindings.end())
+                {
+                    return overwriteSlots;
+                }
+
+                for (const auto &entry : currentBindings)
+                {
+                    if (entry.first == slot)
+                    {
+                        continue;
+                    }
+
+                    bool sharesPointee = false;
+                    for (const std::string &value : entry.second)
+                    {
+                        if (slotIt->second.find(value) != slotIt->second.end())
+                        {
+                            sharesPointee = true;
+                            break;
+                        }
+                    }
+
+                    if (sharesPointee)
+                    {
+                        overwriteSlots.insert(entry.first);
+                    }
+                }
+
+                return overwriteSlots;
+            };
+
+            auto normalizeStructAccess = [&](std::string text)
+            {
+                for (std::size_t pos = text.find("->"); pos != std::string::npos; pos = text.find("->", pos + 1U))
+                {
+                    text.replace(pos, 2U, ".");
+                }
+
+                std::string stripped;
+                stripped.reserve(text.size());
+                int bracketDepth = 0;
+                for (char ch : text)
+                {
+                    if (ch == '[')
+                    {
+                        ++bracketDepth;
+                        continue;
+                    }
+                    if (ch == ']')
+                    {
+                        if (bracketDepth > 0)
+                        {
+                            --bracketDepth;
+                        }
+                        continue;
+                    }
+                    if (bracketDepth == 0)
+                    {
+                        stripped.push_back(ch);
+                    }
+                }
+
+                return stripped;
+            };
+
+            auto parseStructAccess = [&](const std::string &expression) -> std::pair<std::string, std::string>
+            {
+                const std::string normalized = trimLine(normalizeStructAccess(expression));
+                const std::size_t dotIndex = normalized.find('.');
+                if (dotIndex == std::string::npos || dotIndex == 0U)
+                {
+                    return {"", ""};
+                }
+
+                return {normalized.substr(0, dotIndex), normalized.substr(dotIndex + 1U)};
+            };
+
+            auto pruneOverwrittenStructMemberMappings = [&](std::vector<StructMemberMapping> &structMemberMappings,
+                                                            std::unordered_set<std::string> &seenMappings,
+                                                            const std::string &lhsExpression,
+                                                            const PointsToMap &currentBindings)
+            {
+                const std::pair<std::string, std::string> lhsAccess = parseStructAccess(lhsExpression);
+                if (lhsAccess.first.empty() || lhsAccess.second.empty())
+                {
+                    return;
+                }
+
+                std::string memberPrefix = lhsAccess.second;
+                const std::size_t prefixDot = memberPrefix.rfind('.');
+                if (prefixDot != std::string::npos)
+                {
+                    memberPrefix = memberPrefix.substr(0, prefixDot + 1U);
+                }
+
+                const std::unordered_set<std::string> overwriteSlots = collectOverwriteSlots(lhsAccess.first, currentBindings);
+                for (auto it = structMemberMappings.begin(); it != structMemberMappings.end();)
+                {
+                    const bool slotMatches = overwriteSlots.find(it->structVariable) != overwriteSlots.end();
+                    const bool memberMatches =
+                        (prefixDot == std::string::npos) ? (it->memberName == lhsAccess.second) : (it->memberName.rfind(memberPrefix, 0U) == 0U);
+                    if (slotMatches && memberMatches)
+                    {
+                        seenMappings.erase(makeStructMemberMappingKey(*it));
+                        it = structMemberMappings.erase(it);
+                        continue;
+                    }
+
+                    ++it;
+                }
+            };
+
+            auto pruneOverwrittenStructMemberGroup = [&](std::vector<StructMemberMapping> &structMemberMappings,
+                                                         std::unordered_set<std::string> &seenMappings,
+                                                         const std::string &structSlot,
+                                                         const std::string &memberName,
+                                                         const PointsToMap &currentBindings)
+            {
+                std::string memberPrefix = memberName;
+                const std::size_t prefixDot = memberPrefix.rfind('.');
+                if (prefixDot != std::string::npos)
+                {
+                    memberPrefix = memberPrefix.substr(0, prefixDot + 1U);
+                }
+
+                const std::unordered_set<std::string> overwriteSlots = collectOverwriteSlots(structSlot, currentBindings);
+                for (auto it = structMemberMappings.begin(); it != structMemberMappings.end();)
+                {
+                    const bool slotMatches = overwriteSlots.find(it->structVariable) != overwriteSlots.end();
+                    const bool memberMatches =
+                        (prefixDot == std::string::npos) ? (it->memberName == memberName) : (it->memberName.rfind(memberPrefix, 0U) == 0U);
+                    if (slotMatches && memberMatches)
+                    {
+                        seenMappings.erase(makeStructMemberMappingKey(*it));
+                        it = structMemberMappings.erase(it);
+                        continue;
+                    }
+                    ++it;
+                }
+            };
+
+            auto propagateCalleeStructMemberMappings = [&](const CallSite &callSite,
+                                                           const std::string &calleeName,
+                                                           const PointsToMap &currentBindings,
+                                                           std::vector<StructMemberMapping> &structMemberMappings,
+                                                           std::unordered_set<std::string> &seenMappings)
+            {
+                const auto calleeIt = functionMap.find(calleeName);
+                if (calleeIt == functionMap.end())
+                {
+                    return;
+                }
+
+                const std::vector<std::string> &calleeParameters = parameterSlotsByFunction[calleeName];
+                const std::set<std::string> &calleePointerSlots = pointerSlotsByFunction[calleeName];
+                const std::size_t limit = std::min(calleeParameters.size(), callSite.argumentExpressions.size());
+
+                std::unordered_map<std::string, std::string> parameterToArgumentSlot;
+                for (std::size_t index = 0; index < limit; ++index)
+                {
+                    const std::string &parameter = calleeParameters[index];
+                    const std::string &argumentExpression = callSite.argumentExpressions[index];
+                    const std::string argumentSlot = canonicalSlot(argumentExpression);
+                    if (argumentSlot.empty())
+                    {
+                        continue;
+                    }
+
+                    if (argumentExpression.find('&') != std::string::npos ||
+                        calleePointerSlots.find(parameter) != calleePointerSlots.end())
+                    {
+                        parameterToArgumentSlot[parameter] = argumentSlot;
+                    }
+                }
+
+                if (parameterToArgumentSlot.empty())
+                {
+                    std::vector<std::string> argumentSlots;
+                    for (const std::string &argumentExpression : callSite.argumentExpressions)
+                    {
+                        if (argumentExpression.find('&') == std::string::npos)
+                        {
+                            continue;
+                        }
+
+                        const std::string slot = canonicalSlot(argumentExpression);
+                        if (!slot.empty())
+                        {
+                            argumentSlots.push_back(slot);
+                        }
+                    }
+
+                    std::vector<std::string> mappingVariables;
+                    std::unordered_set<std::string> seenMappingVariables;
+                    for (const StructMemberMapping &mapping : calleeIt->second->structMemberMappings)
+                    {
+                        if (seenMappingVariables.insert(mapping.structVariable).second)
+                        {
+                            mappingVariables.push_back(mapping.structVariable);
+                        }
+                    }
+
+                    const std::size_t fallbackLimit = std::min(mappingVariables.size(), argumentSlots.size());
+                    for (std::size_t i = 0; i < fallbackLimit; ++i)
+                    {
+                        parameterToArgumentSlot[mappingVariables[i]] = argumentSlots[i];
+                    }
+                }
+
+                if (parameterToArgumentSlot.empty())
+                {
+                    return;
+                }
+
+                std::unordered_set<std::string> prunedGroups;
+
+                std::unordered_map<std::string, std::uint64_t> latestStampByLocalGroup;
+                for (const StructMemberMapping &mapping : calleeIt->second->structMemberMappings)
+                {
+                    const std::size_t groupDot = mapping.memberName.rfind('.');
+                    const std::string group = groupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, groupDot + 1U);
+                    const std::string localGroupKey = mapping.structVariable + "#" + group;
+                    const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
+                                                static_cast<std::uint64_t>(mapping.location.column);
+                    const auto it = latestStampByLocalGroup.find(localGroupKey);
+                    if (it == latestStampByLocalGroup.end() || stamp >= it->second)
+                    {
+                        latestStampByLocalGroup[localGroupKey] = stamp;
+                    }
+                }
+
+                for (const StructMemberMapping &mapping : calleeIt->second->structMemberMappings)
+                {
+                    const auto targetIt = parameterToArgumentSlot.find(mapping.structVariable);
+                    if (targetIt == parameterToArgumentSlot.end())
+                    {
+                        continue;
+                    }
+
+                    const std::size_t localGroupDot = mapping.memberName.rfind('.');
+                    const std::string localGroup = localGroupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, localGroupDot + 1U);
+                    const std::string localGroupKey = mapping.structVariable + "#" + localGroup;
+                    const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
+                                                static_cast<std::uint64_t>(mapping.location.column);
+                    const auto latestIt = latestStampByLocalGroup.find(localGroupKey);
+                    if (latestIt != latestStampByLocalGroup.end() && stamp != latestIt->second)
+                    {
+                        continue;
+                    }
+
+                    const std::size_t groupDot = mapping.memberName.rfind('.');
+                    const std::string group = groupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, groupDot + 1U);
+                    const std::string pruneKey = targetIt->second + "#" + group;
+                    if (prunedGroups.insert(pruneKey).second)
+                    {
+                        pruneOverwrittenStructMemberGroup(structMemberMappings, seenMappings, targetIt->second, mapping.memberName, currentBindings);
+                    }
+
+                    StructMemberMapping propagated = mapping;
+                    propagated.structVariable = targetIt->second;
+                    propagated.location = callSite.location;
+
+                    const std::string key = makeStructMemberMappingKey(propagated);
+                    if (seenMappings.insert(key).second)
+                    {
+                        structMemberMappings.push_back(std::move(propagated));
                     }
                 }
             };
@@ -2062,17 +2916,18 @@ namespace
             {
                 std::uint32_t blockId = 0;
                 PointsToMap bindings;
+                std::vector<StructMemberMapping> structMemberMappings;
             };
 
             std::deque<BlockState> blockWorklist;
             std::unordered_set<std::string> seenBlockStates;
             PointsToMap initialBindings = std::move(job.seededPointsTo);
             seedBindingsFromAssignments(function, knownFunctions, initialBindings);
-            blockWorklist.push_back(BlockState{function.entryBlockId, std::move(initialBindings)});
+            blockWorklist.push_back(BlockState{function.entryBlockId, std::move(initialBindings), activeStructMemberMappings});
 
-            auto makeStateKey = [&](std::uint32_t blockId, const PointsToMap &bindings)
+            auto makeStateKey = [&](std::uint32_t blockId, const PointsToMap &bindings, const std::vector<StructMemberMapping> &structMemberMappings)
             {
-                return std::to_string(blockId) + "|" + buildContextKey(function.name, bindings);
+                return std::to_string(blockId) + "|" + buildContextKey(function.name, bindings) + "|" + buildStructMappingsKey(structMemberMappings);
             };
 
             // Enqueue a callee analysis context seeded from this callsite.
@@ -2147,7 +3002,38 @@ namespace
                     return trimmedLine.find(callSite.throughIdentifier + "(") != std::string::npos;
                 }
 
-                return trimmedLine.find(callSite.calleeExpression + "(") != std::string::npos;
+                if (trimmedLine.find(callSite.calleeExpression + "(") != std::string::npos)
+                {
+                    return true;
+                }
+
+                if (callSite.calleeExpression.find('?') != std::string::npos)
+                {
+                    const std::size_t dotPos = callSite.calleeExpression.rfind('.');
+                    const std::size_t arrowPos = callSite.calleeExpression.rfind("->");
+                    if (dotPos != std::string::npos)
+                    {
+                        const std::string member = callSite.calleeExpression.substr(dotPos + 1U);
+                        if (!member.empty() &&
+                            (trimmedLine.find("." + member + "(") != std::string::npos ||
+                             trimmedLine.find("->" + member + "(") != std::string::npos))
+                        {
+                            return true;
+                        }
+                    }
+                    if (arrowPos != std::string::npos)
+                    {
+                        const std::string member = callSite.calleeExpression.substr(arrowPos + 2U);
+                        if (!member.empty() &&
+                            (trimmedLine.find("." + member + "(") != std::string::npos ||
+                             trimmedLine.find("->" + member + "(") != std::string::npos))
+                        {
+                            return true;
+                        }
+                    }
+                }
+
+                return false;
             };
 
             // Lightweight evaluator retained for diagnostics and future branch pruning.
@@ -2240,7 +3126,7 @@ namespace
                 }
 
                 const FunctionFacts::BlockFact &block = *currentBlockIt->second;
-                const std::string stateKey = makeStateKey(block.id, state.bindings);
+                const std::string stateKey = makeStateKey(block.id, state.bindings, state.structMemberMappings);
                 // Worklist dedup per (block, bindings) state prevents infinite loops.
                 if (!seenBlockStates.insert(stateKey).second)
                 {
@@ -2248,6 +3134,12 @@ namespace
                 }
 
                 PointsToMap bindings = std::move(state.bindings);
+                std::vector<StructMemberMapping> activeStructMemberMappings = std::move(state.structMemberMappings);
+                std::unordered_set<std::string> seenStructMemberMappings;
+                for (const StructMemberMapping &mapping : activeStructMemberMappings)
+                {
+                    seenStructMemberMappings.insert(makeStructMemberMappingKey(mapping));
+                }
 
                 for (const std::string &rawLine : block.lines)
                 {
@@ -2272,6 +3164,7 @@ namespace
                             // Branch: direct call, emit direct edge and enqueue callee.
                             if (!callSite.directCallee.empty())
                             {
+                                propagateCalleeStructMemberMappings(callSite, callSite.directCallee, bindings, activeStructMemberMappings, seenStructMemberMappings);
                                 break;
                             }
 
@@ -2345,10 +3238,7 @@ namespace
                                 edge.calleeExpression = callSite.calleeExpression;
                                 edge.throughIdentifier = callSite.throughIdentifier;
                                 unresolvedIndirect.push_back(std::move(edge));
-                                if (!suppressUnresolvedLogging)
-                                {
-                                    logUnresolvedCall(unresolvedIndirect.back());
-                                }
+                                logUnresolvedCall(unresolvedIndirect.back());
                                 break;
                             }
 
@@ -2424,12 +3314,22 @@ namespace
                             const auto structIt = returnedStructMemberMappingsByFunction.find(callee);
                             if (structIt != returnedStructMemberMappingsByFunction.end())
                             {
-                                appendStructMemberMappings(lhsSlot, structIt->second);
+                                pruneOverwrittenStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhs, bindings);
+                                appendStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhsSlot, structIt->second);
                             }
                         }
                     }
 
                     const std::string rhsSlot = canonicalSlot(rhs);
+                    if (!rhsSlot.empty())
+                    {
+                        const auto globalTargetsIt = programWidePointerTargets.find(rhsSlot);
+                        if (globalTargetsIt != programWidePointerTargets.end())
+                        {
+                            values.insert(globalTargetsIt->second.begin(), globalTargetsIt->second.end());
+                        }
+                    }
+
                     if (!rhsSlot.empty() && rhsSlot != lhsSlot)
                     {
                         std::vector<StructMemberMapping> copiedMappings;
@@ -2443,7 +3343,8 @@ namespace
 
                         if (!copiedMappings.empty())
                         {
-                            appendStructMemberMappings(lhsSlot, copiedMappings);
+                            pruneOverwrittenStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhs, bindings);
+                            appendStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhsSlot, copiedMappings);
                         }
                     }
                     // Ignore assignments that resolve to no usable values.
@@ -2455,7 +3356,18 @@ namespace
                     std::set<std::string> &slotValues = bindings[lhsSlot];
                     // Strong update: reassignment overwrites prior slot values on this path.
                     slotValues.clear();
-                    const bool isPointerSlot = pointerSlots.find(lhsSlot) != pointerSlots.end();
+                    bool hasNonIntegerValue = false;
+                    for (const std::string &value : values)
+                    {
+                        if (!isIntegerBinding(value))
+                        {
+                            hasNonIntegerValue = true;
+                            break;
+                        }
+                    }
+
+                    const bool isPointerSlot =
+                        pointerSlots.find(lhsSlot) != pointerSlots.end() || hasNonIntegerValue;
                     for (const std::string &value : values)
                     {
                         if (isPointerSlot)
@@ -2478,7 +3390,7 @@ namespace
                 // Propagate current state to all CFG successors.
                 for (std::uint32_t successor : block.successors)
                 {
-                    blockWorklist.push_back(BlockState{successor, bindings});
+                    blockWorklist.push_back(BlockState{successor, bindings, activeStructMemberMappings});
                 }
             }
         }
@@ -2614,24 +3526,6 @@ bool generateCallGraphFromAnalysisJson(
     std::vector<CallEdge> resolvedEdges;
     std::vector<CallEdge> unresolvedIndirect;
 
-    // Collect all struct member mappings from all functions and make them globally available
-    std::vector<StructMemberMapping> allStructMemberMappings;
-    for (const FunctionFacts &function : functions)
-    {
-        allStructMemberMappings.insert(
-            allStructMemberMappings.end(),
-            function.structMemberMappings.begin(),
-            function.structMemberMappings.end());
-    }
-    // Add collected mappings to each function so they're available during resolution
-    for (FunctionFacts &function : functions)
-    {
-        function.structMemberMappings.insert(
-            function.structMemberMappings.end(),
-            allStructMemberMappings.begin(),
-            allStructMemberMappings.end());
-    }
-
     runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, wrapperDispatchTargets, resolvedEdges, unresolvedIndirect);
 
     std::set<CollapsedEdge> collapsedEdges;
@@ -2742,6 +3636,18 @@ bool generateCallGraphFromAnalysisJson(
     summary["contextNodeCount"] = static_cast<std::int64_t>(contextNodeCount);
     summary["contextEdgeCount"] = static_cast<std::int64_t>(contextEdgeCount);
     rootOut["summary"] = std::move(summary);
+
+    llvm::json::Array unresolvedCallsJson;
+    for (const CallEdge &edge : unresolvedIndirect)
+    {
+        llvm::json::Object unresolvedJson;
+        unresolvedJson["caller"] = edge.caller;
+        unresolvedJson["calleeExpression"] = edge.calleeExpression;
+        unresolvedJson["throughIdentifier"] = edge.throughIdentifier;
+        unresolvedJson["location"] = locationToJson(edge.location);
+        unresolvedCallsJson.push_back(std::move(unresolvedJson));
+    }
+    rootOut["unresolvedIndirectCalls"] = std::move(unresolvedCallsJson);
 
     llvm::json::Object collapsed;
     llvm::json::Array collapsedNodes;

@@ -147,6 +147,14 @@ namespace
         bool isDeclaration = false;
     };
 
+    struct ConditionalIndexCallInfo
+    {
+        std::string trueLine;
+        std::string falseLine;
+        std::string trueExpression;
+        std::string falseExpression;
+    };
+
     /**
      * @brief Parse a conditional assignment statement into normalized parts.
      */
@@ -224,6 +232,115 @@ namespace
     }
 
     /**
+     * @brief Parse a call line that contains a conditional array index.
+     */
+    bool parseConditionalIndexCallLine(const std::string &line, ConditionalIndexCallInfo &info)
+    {
+        const std::string trimmed = trimCopy(line);
+        if (trimmed.find('(') == std::string::npos)
+        {
+            return false;
+        }
+
+        std::size_t indexStart = std::string::npos;
+        std::size_t indexEnd = std::string::npos;
+        std::string indexExpression;
+
+        int depth = 0;
+        for (std::size_t i = 0; i < trimmed.size(); ++i)
+        {
+            const char ch = trimmed[i];
+            if (ch == '[')
+            {
+                if (depth == 0)
+                {
+                    indexStart = i;
+                }
+                ++depth;
+                continue;
+            }
+
+            if (ch == ']')
+            {
+                if (depth > 0)
+                {
+                    --depth;
+                }
+                if (depth == 0 && indexStart != std::string::npos)
+                {
+                    const std::string candidate = trimmed.substr(indexStart + 1U, i - (indexStart + 1U));
+                    const std::size_t questionIndex = findTopLevelChar(candidate, '?');
+                    if (questionIndex == std::string::npos)
+                    {
+                        indexStart = std::string::npos;
+                        continue;
+                    }
+
+                    const std::size_t colonIndex = findTopLevelChar(candidate, ':', questionIndex + 1U);
+                    if (colonIndex == std::string::npos)
+                    {
+                        indexStart = std::string::npos;
+                        continue;
+                    }
+
+                    indexEnd = i;
+                    indexExpression = candidate;
+                    break;
+                }
+            }
+        }
+
+        if (indexStart == std::string::npos || indexEnd == std::string::npos || indexExpression.empty())
+        {
+            const std::size_t questionIndexRaw = trimmed.find('?');
+            if (questionIndexRaw == std::string::npos)
+            {
+                return false;
+            }
+
+            const std::size_t colonIndexRaw = trimmed.find(':', questionIndexRaw + 1U);
+            if (colonIndexRaw == std::string::npos)
+            {
+                return false;
+            }
+
+            const std::size_t leftBracketRaw = trimmed.rfind('[', questionIndexRaw);
+            const std::size_t rightBracketRaw = trimmed.find(']', colonIndexRaw + 1U);
+            if (leftBracketRaw == std::string::npos || rightBracketRaw == std::string::npos || leftBracketRaw >= rightBracketRaw)
+            {
+                return false;
+            }
+
+            indexStart = leftBracketRaw;
+            indexEnd = rightBracketRaw;
+            indexExpression = trimmed.substr(indexStart + 1U, indexEnd - (indexStart + 1U));
+        }
+
+        const std::size_t questionIndex = findTopLevelChar(indexExpression, '?');
+        const std::size_t colonIndex = findTopLevelChar(indexExpression, ':', questionIndex + 1U);
+        if (questionIndex == std::string::npos || colonIndex == std::string::npos)
+        {
+            return false;
+        }
+
+        const std::string trueExpression = trimCopy(indexExpression.substr(questionIndex + 1U, colonIndex - (questionIndex + 1U)));
+        const std::string falseExpression = trimCopy(indexExpression.substr(colonIndex + 1U));
+        if (trueExpression.empty() || falseExpression.empty())
+        {
+            return false;
+        }
+
+        const std::string prefix = trimmed.substr(0, indexStart + 1U);
+        const std::string suffix = trimmed.substr(indexEnd);
+
+        info.trueLine = prefix + trueExpression + suffix;
+        info.falseLine = prefix + falseExpression + suffix;
+        info.trueExpression = trueExpression;
+        info.falseExpression = falseExpression;
+        return true;
+    }
+
+    /**
      * @brief Duplicate conditional store effects into predecessor blocks.
      */
     void applyConditionalStoreDuplication(SerializedFunction &function)
@@ -271,6 +388,21 @@ namespace
             }
         };
 
+        auto addLineInPredecessor = [&](std::uint32_t predecessorId, const std::string &line)
+        {
+            const auto blockIt = blockIndexById.find(predecessorId);
+            if (blockIt == blockIndexById.end())
+            {
+                return;
+            }
+
+            SerializedBlock &pred = function.blocks[blockIt->second];
+            if (std::find(pred.lines.begin(), pred.lines.end(), line) == pred.lines.end())
+            {
+                pred.lines.push_back(line);
+            }
+        };
+
         for (SerializedBlock &block : function.blocks)
         {
             std::vector<std::string> updatedLines;
@@ -281,7 +413,90 @@ namespace
                 ConditionalStoreInfo storeInfo;
                 if (!parseConditionalStoreLine(line, storeInfo))
                 {
-                    updatedLines.push_back(line);
+                    ConditionalIndexCallInfo indexCallInfo;
+                    if (!parseConditionalIndexCallLine(line, indexCallInfo))
+                    {
+                        updatedLines.push_back(line);
+                        continue;
+                    }
+
+                    const auto predsIt = predecessors.find(block.id);
+                    if (predsIt == predecessors.end() || predsIt->second.size() != 2U)
+                    {
+                        updatedLines.push_back(line);
+                        continue;
+                    }
+
+                    std::vector<std::uint32_t> predIds = predsIt->second;
+                    std::sort(predIds.begin(), predIds.end());
+
+                    std::unordered_map<std::uint32_t, std::string> callByPred;
+                    std::unordered_set<std::uint32_t> usedPreds;
+
+                    auto matchCallToPred = [&](const std::string &indexExpr, const std::string &callLine)
+                    {
+                        const std::string token = "[" + trimCopy(indexExpr) + "]";
+                        for (std::uint32_t predId : predIds)
+                        {
+                            if (usedPreds.find(predId) != usedPreds.end())
+                            {
+                                continue;
+                            }
+
+                            const auto predBlockIt = blockIndexById.find(predId);
+                            if (predBlockIt == blockIndexById.end())
+                            {
+                                continue;
+                            }
+
+                            const SerializedBlock &predBlock = function.blocks[predBlockIt->second];
+                            for (const std::string &predLine : predBlock.lines)
+                            {
+                                if (trimCopy(predLine).find(token) != std::string::npos)
+                                {
+                                    callByPred[predId] = callLine;
+                                    usedPreds.insert(predId);
+                                    return;
+                                }
+                            }
+                        }
+                    };
+
+                    matchCallToPred(indexCallInfo.trueExpression, indexCallInfo.trueLine);
+                    matchCallToPred(indexCallInfo.falseExpression, indexCallInfo.falseLine);
+
+                    std::vector<std::string> remainingCalls;
+                    if (std::find_if(callByPred.begin(), callByPred.end(),
+                                     [&](const auto &entry)
+                                     { return entry.second == indexCallInfo.trueLine; }) == callByPred.end())
+                    {
+                        remainingCalls.push_back(indexCallInfo.trueLine);
+                    }
+                    if (std::find_if(callByPred.begin(), callByPred.end(),
+                                     [&](const auto &entry)
+                                     { return entry.second == indexCallInfo.falseLine; }) == callByPred.end())
+                    {
+                        remainingCalls.push_back(indexCallInfo.falseLine);
+                    }
+
+                    std::size_t fallbackIndex = 0;
+                    for (std::uint32_t predId : predIds)
+                    {
+                        if (usedPreds.find(predId) != usedPreds.end())
+                        {
+                            continue;
+                        }
+                        if (fallbackIndex < remainingCalls.size())
+                        {
+                            callByPred[predId] = remainingCalls[fallbackIndex++];
+                        }
+                    }
+
+                    for (const auto &entry : callByPred)
+                    {
+                        addLineInPredecessor(entry.first, entry.second);
+                    }
+
                     continue;
                 }
 
@@ -428,6 +643,108 @@ namespace
             merged.insert(merged.end(), insertions.begin(), insertions.end());
             merged.insert(merged.end(), block.lines.begin(), block.lines.end());
             block.lines.swap(merged);
+        }
+    }
+
+    /**
+     * @brief Remove presentation-only noise and collapse trivial passthrough blocks.
+     */
+    void cleanupCfgPresentation(SerializedFunction &function)
+    {
+        auto isLiteralOnlyLine = [](const std::string &line)
+        {
+            const std::string trimmed = trimCopy(line);
+            if (trimmed.empty())
+            {
+                return false;
+            }
+
+            for (char ch : trimmed)
+            {
+                if (std::isdigit(static_cast<unsigned char>(ch)) == 0)
+                {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        for (SerializedBlock &block : function.blocks)
+        {
+            std::vector<std::string> filtered;
+            filtered.reserve(block.lines.size());
+            for (const std::string &line : block.lines)
+            {
+                if (!isLiteralOnlyLine(line))
+                {
+                    filtered.push_back(line);
+                }
+            }
+            block.lines.swap(filtered);
+        }
+
+        bool changed = true;
+        while (changed)
+        {
+            changed = false;
+
+            std::unordered_map<std::uint32_t, std::size_t> blockIndexById;
+            for (std::size_t i = 0; i < function.blocks.size(); ++i)
+            {
+                blockIndexById[function.blocks[i].id] = i;
+            }
+
+            for (std::size_t i = 0; i < function.blocks.size(); ++i)
+            {
+                const SerializedBlock &block = function.blocks[i];
+                if (block.id == function.exitBlockId)
+                {
+                    continue;
+                }
+                if (!block.lines.empty() || block.successors.size() != 1U)
+                {
+                    continue;
+                }
+
+                const std::uint32_t passthroughId = block.id;
+                const std::uint32_t targetId = block.successors.front();
+                if (passthroughId == targetId)
+                {
+                    continue;
+                }
+
+                if (passthroughId == function.entryBlockId)
+                {
+                    function.entryBlockId = targetId;
+                }
+
+                for (SerializedBlock &pred : function.blocks)
+                {
+                    for (std::uint32_t &succ : pred.successors)
+                    {
+                        if (succ == passthroughId)
+                        {
+                            succ = targetId;
+                        }
+                    }
+
+                    std::unordered_set<std::uint32_t> seenSucc;
+                    std::vector<std::uint32_t> deduped;
+                    deduped.reserve(pred.successors.size());
+                    for (std::uint32_t succ : pred.successors)
+                    {
+                        if (seenSucc.insert(succ).second)
+                        {
+                            deduped.push_back(succ);
+                        }
+                    }
+                    pred.successors.swap(deduped);
+                }
+
+                function.blocks.erase(function.blocks.begin() + static_cast<std::ptrdiff_t>(i));
+                changed = true;
+                break;
+            }
         }
     }
 
@@ -780,6 +1097,50 @@ namespace
             {
                 std::set<std::string> functionSymbols;
                 collectFunctionSymbols(binaryOperator->getRHS(), functionSymbols);
+
+                if (functionSymbols.empty())
+                {
+                    const std::pair<std::string, std::string> rhsAccess = parseStructAccessText(assignment.rhsExpression);
+                    if (!rhsAccess.first.empty() && !rhsAccess.second.empty())
+                    {
+                        for (const StructMemberMapping &existing : structMemberMappings_)
+                        {
+                            if (existing.structVariable == rhsAccess.first && existing.memberName == rhsAccess.second)
+                            {
+                                functionSymbols.insert(existing.functionName);
+                            }
+                        }
+                    }
+                }
+
+                std::vector<std::string> lhsMemberNames;
+                lhsMemberNames.push_back(lhsAccess.second);
+
+                const clang::Expr *lhsMemberExpr = binaryOperator->getLHS()->IgnoreParenImpCasts();
+                if (const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(lhsMemberExpr))
+                {
+                    if (const auto *fieldDecl = llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
+                    {
+                        const clang::RecordDecl *owner = fieldDecl->getParent();
+                        if (owner != nullptr && owner->isUnion())
+                        {
+                            const std::size_t tailPos = lhsAccess.second.rfind('.');
+                            const std::string prefix = tailPos == std::string::npos ? "" : lhsAccess.second.substr(0, tailPos + 1U);
+
+                            std::unordered_set<std::string> seenMembers(lhsMemberNames.begin(), lhsMemberNames.end());
+                            for (const clang::FieldDecl *sibling : owner->fields())
+                            {
+                                const std::string siblingName = sibling->getNameAsString();
+                                const std::string candidate = prefix + siblingName;
+                                if (seenMembers.insert(candidate).second)
+                                {
+                                    lhsMemberNames.push_back(candidate);
+                                }
+                            }
+                        }
+                    }
+                }
+
                 for (const std::string &functionSymbol : functionSymbols)
                 {
                     if (blacklistedFunctions_.find(functionSymbol) != blacklistedFunctions_.end())
@@ -787,14 +1148,42 @@ namespace
                         continue;
                     }
 
-                    StructMemberMapping mapping;
-                    mapping.structVariable = lhsAccess.first;
-                    mapping.memberName = lhsAccess.second;
-                    mapping.functionName = functionSymbol;
-                    mapping.location = buildSourceLocationRecord(location, sourceManager);
+                    for (const std::string &lhsMemberName : lhsMemberNames)
+                    {
+                        StructMemberMapping mapping;
+                        mapping.structVariable = lhsAccess.first;
+                        mapping.memberName = lhsMemberName;
+                        mapping.functionName = functionSymbol;
+                        mapping.location = buildSourceLocationRecord(location, sourceManager);
 
-                    structMemberMappings_.push_back(std::move(mapping));
+                        structMemberMappings_.push_back(std::move(mapping));
+                    }
                     addressTakenFunctions_.insert(functionSymbol);
+                }
+
+                // If lhs base aliases a global aggregate, also map the global base member.
+                const std::string pointerTarget = resolvePointerTarget(lhsAccess.first);
+                const std::string globalBaseName = extractGlobalBaseFromPointerTarget(pointerTarget);
+                if (!globalBaseName.empty())
+                {
+                    for (const std::string &functionSymbol : functionSymbols)
+                    {
+                        if (blacklistedFunctions_.find(functionSymbol) != blacklistedFunctions_.end())
+                        {
+                            continue;
+                        }
+
+                        for (const std::string &lhsMemberName : lhsMemberNames)
+                        {
+                            StructMemberMapping globalMapping;
+                            globalMapping.structVariable = globalBaseName;
+                            globalMapping.memberName = lhsMemberName;
+                            globalMapping.functionName = functionSymbol;
+                            globalMapping.location = buildSourceLocationRecord(location, sourceManager);
+
+                            structMemberMappings_.push_back(std::move(globalMapping));
+                        }
+                    }
                 }
             }
 
@@ -1020,6 +1409,104 @@ namespace
             }
 
             return valueDecl->getQualifiedNameAsString();
+        }
+
+        /**
+         * @brief Resolve what a local pointer variable points to (e.g., a global).
+         * Returns the RHS expression if found in pointer assignments.
+         */
+        std::string resolvePointerTarget(const std::string &pointerName)
+        {
+            for (const PointerAssignmentRecord &assignment : pointerAssignments_)
+            {
+                if (assignment.lhsExpression == pointerName && !assignment.rhsExpression.empty())
+                {
+                    return assignment.rhsExpression;
+                }
+            }
+            return "";
+        }
+
+        /**
+         * @brief Check if an expression appears to point to a global.
+         */
+        bool pointsToGlobal(const std::string &expression)
+        {
+            return !extractGlobalBaseFromPointerTarget(expression).empty();
+        }
+
+        /**
+         * @brief Extract first identifier token from expression text.
+         */
+        std::string extractLeadingIdentifier(const std::string &expression)
+        {
+            const std::string text = trimCopy(expression);
+            std::size_t i = 0;
+            while (i < text.size())
+            {
+                const unsigned char ch = static_cast<unsigned char>(text[i]);
+                if (std::isalpha(ch) != 0 || text[i] == '_')
+                {
+                    break;
+                }
+                ++i;
+            }
+
+            if (i >= text.size())
+            {
+                return "";
+            }
+
+            std::size_t end = i + 1U;
+            while (end < text.size())
+            {
+                const unsigned char ch = static_cast<unsigned char>(text[end]);
+                if (std::isalnum(ch) == 0 && text[end] != '_')
+                {
+                    break;
+                }
+                ++end;
+            }
+
+            return text.substr(i, end - i);
+        }
+
+        /**
+         * @brief Resolve global base variable referenced by a pointer target expression.
+         */
+        std::string extractGlobalBaseFromPointerTarget(const std::string &pointerTarget)
+        {
+            if (pointerTarget.empty())
+            {
+                return "";
+            }
+
+            const std::string base = extractLeadingIdentifier(pointerTarget);
+            if (base.empty())
+            {
+                return "";
+            }
+
+            for (const PointerAssignmentRecord &assignment : pointerAssignments_)
+            {
+                if (!assignment.lhsIsGlobal)
+                {
+                    continue;
+                }
+
+                if (assignment.lhsExpression == base)
+                {
+                    return base;
+                }
+
+                const std::pair<std::string, std::string> access = parseStructAccessText(assignment.lhsExpression);
+                if (!access.first.empty() && access.first == base)
+                {
+                    return base;
+                }
+            }
+
+            return "";
         }
 
         clang::ASTContext &context_;
@@ -1264,6 +1751,36 @@ namespace
 
             function.blocks = rawBlocks;
             applyConditionalStoreDuplication(function);
+            cleanupCfgPresentation(function);
+
+            bool collapsedEntry = true;
+            while (collapsedEntry)
+            {
+                collapsedEntry = false;
+                for (std::size_t i = 0; i < function.blocks.size(); ++i)
+                {
+                    const SerializedBlock &block = function.blocks[i];
+                    if (block.id != function.entryBlockId)
+                    {
+                        continue;
+                    }
+                    if (!block.lines.empty() || block.successors.size() != 1U)
+                    {
+                        break;
+                    }
+
+                    const std::uint32_t nextEntry = block.successors.front();
+                    if (nextEntry == function.entryBlockId || nextEntry == function.exitBlockId)
+                    {
+                        break;
+                    }
+
+                    function.entryBlockId = nextEntry;
+                    function.blocks.erase(function.blocks.begin() + static_cast<std::ptrdiff_t>(i));
+                    collapsedEntry = true;
+                    break;
+                }
+            }
 
             CallVisitor callVisitor(*state_.context, functionName, state_.blacklistedFunctions);
             callVisitor.TraverseStmt(body);
