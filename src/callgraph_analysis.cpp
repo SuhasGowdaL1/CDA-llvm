@@ -85,22 +85,6 @@ namespace
         std::vector<BlockFact> blocks;
     };
 
-    enum class EventKind
-    {
-        kAssignment,
-        kCall
-    };
-
-    struct Event
-    {
-        EventKind kind = EventKind::kAssignment;
-        std::uint32_t line = 0;
-        std::uint32_t column = 0;
-        std::size_t index = 0;
-        const PointerAssignment *assignment = nullptr;
-        const CallSite *callSite = nullptr;
-    };
-
     struct CallEdge
     {
         std::string caller;
@@ -131,20 +115,13 @@ namespace
         }
     };
 
-    struct ParameterDispatchInfo
+    struct MemoryTransferOp
     {
-        std::set<std::string> dispatchSlots;
-        SourceLocation callLocation;
+        std::vector<std::pair<std::string, std::string>> copyPairs;
+        std::vector<std::string> clearDestinations;
     };
 
     using PointsToMap = std::unordered_map<std::string, std::set<std::string>>;
-
-    struct ContextJob
-    {
-        std::string functionName;
-        PointsToMap seededPointsTo;
-        std::vector<StructMemberMapping> seededStructMemberMappings;
-    };
 
     /**
      * @brief Parse a plain signed integer literal.
@@ -440,6 +417,290 @@ namespace
             return "";
         }
         return identifiers.back();
+    }
+
+    /**
+     * @brief Extract memory slot preserving field and array selectors.
+     */
+    std::string canonicalMemorySlot(const std::string &expression)
+    {
+        std::string normalized = trimLine(expression);
+        if (normalized.empty())
+        {
+            return "";
+        }
+
+        while (!normalized.empty() && (normalized.front() == '&' || normalized.front() == '*'))
+        {
+            normalized.erase(normalized.begin());
+            normalized = trimLine(normalized);
+        }
+
+        for (std::size_t pos = normalized.find("->"); pos != std::string::npos; pos = normalized.find("->", pos + 1U))
+        {
+            normalized.replace(pos, 2U, ".");
+        }
+
+        std::string compact;
+        compact.reserve(normalized.size());
+        for (char ch : normalized)
+        {
+            if (std::isspace(static_cast<unsigned char>(ch)) == 0)
+            {
+                compact.push_back(ch);
+            }
+        }
+
+        normalized.swap(compact);
+        if (normalized.empty())
+        {
+            return "";
+        }
+
+        std::size_t index = 0;
+        if (!(std::isalpha(static_cast<unsigned char>(normalized[index])) != 0 || normalized[index] == '_'))
+        {
+            return "";
+        }
+
+        std::string slot;
+        while (index < normalized.size())
+        {
+            const unsigned char ch = static_cast<unsigned char>(normalized[index]);
+            if (std::isalnum(ch) == 0 && normalized[index] != '_')
+            {
+                break;
+            }
+            slot.push_back(normalized[index]);
+            ++index;
+        }
+
+        while (index < normalized.size())
+        {
+            if (normalized[index] == '.')
+            {
+                ++index;
+                const std::size_t memberStart = index;
+                while (index < normalized.size())
+                {
+                    const unsigned char ch = static_cast<unsigned char>(normalized[index]);
+                    if (std::isalnum(ch) == 0 && normalized[index] != '_')
+                    {
+                        break;
+                    }
+                    ++index;
+                }
+
+                if (memberStart == index)
+                {
+                    break;
+                }
+
+                slot.push_back('.');
+                slot.append(normalized.substr(memberStart, index - memberStart));
+                continue;
+            }
+
+            if (normalized[index] == '[')
+            {
+                std::size_t end = index + 1U;
+                int depth = 1;
+                while (end < normalized.size() && depth > 0)
+                {
+                    if (normalized[end] == '[')
+                    {
+                        ++depth;
+                    }
+                    else if (normalized[end] == ']')
+                    {
+                        --depth;
+                    }
+                    ++end;
+                }
+
+                if (depth != 0)
+                {
+                    break;
+                }
+
+                const std::size_t contentBegin = index + 1U;
+                const std::size_t contentLength = (end - 1U) - contentBegin;
+                std::string indexToken = trimLine(normalized.substr(contentBegin, contentLength));
+                bool numericIndex = !indexToken.empty();
+                if (numericIndex)
+                {
+                    for (char tokenCh : indexToken)
+                    {
+                        if (std::isdigit(static_cast<unsigned char>(tokenCh)) == 0)
+                        {
+                            numericIndex = false;
+                            break;
+                        }
+                    }
+                }
+
+                slot.push_back('[');
+                slot.append(numericIndex ? indexToken : "*");
+                slot.push_back(']');
+                index = end;
+                continue;
+            }
+
+            break;
+        }
+
+        return slot;
+    }
+
+    std::string memorySlotRoot(const std::string &slot)
+    {
+        std::string key = trimLine(slot);
+        const std::size_t scopePos = key.rfind("::");
+        if (scopePos != std::string::npos)
+        {
+            key = key.substr(scopePos + 2U);
+        }
+
+        const std::size_t dotPos = key.find('.');
+        const std::size_t bracketPos = key.find('[');
+        std::size_t end = std::string::npos;
+        if (dotPos != std::string::npos)
+        {
+            end = dotPos;
+        }
+        if (bracketPos != std::string::npos)
+        {
+            end = (end == std::string::npos) ? bracketPos : std::min(end, bracketPos);
+        }
+
+        if (end != std::string::npos)
+        {
+            key = key.substr(0, end);
+        }
+
+        return trimLine(key);
+    }
+
+    std::vector<std::string> expandMemorySlotAliases(const std::string &slot)
+    {
+        std::vector<std::string> aliases;
+        std::unordered_set<std::string> seen;
+
+        const std::string trimmed = trimLine(slot);
+        if (trimmed.empty())
+        {
+            return aliases;
+        }
+
+        if (seen.insert(trimmed).second)
+        {
+            aliases.push_back(trimmed);
+        }
+
+        std::size_t open = trimmed.find('[');
+        if (open != std::string::npos)
+        {
+            std::size_t close = trimmed.find(']', open + 1U);
+            if (close != std::string::npos)
+            {
+                const std::string token = trimmed.substr(open + 1U, close - open - 1U);
+                if (token != "*")
+                {
+                    std::string wildcard = trimmed;
+                    wildcard.replace(open + 1U, close - open - 1U, "*");
+                    if (seen.insert(wildcard).second)
+                    {
+                        aliases.push_back(wildcard);
+                    }
+                }
+            }
+        }
+
+        const std::string root = memorySlotRoot(trimmed);
+        if (!root.empty() && seen.insert(root).second)
+        {
+            aliases.push_back(root);
+        }
+
+        return aliases;
+    }
+
+    std::vector<std::string> collectMemorySlotPrefixes(const std::string &slot)
+    {
+        std::vector<std::string> prefixes;
+        std::unordered_set<std::string> seen;
+
+        const std::string trimmed = trimLine(slot);
+        if (trimmed.empty())
+        {
+            return prefixes;
+        }
+
+        std::function<void(std::size_t)> addPrefix = [&](std::size_t length)
+        {
+            if (length == 0U || length > trimmed.size())
+            {
+                return;
+            }
+
+            const std::string prefix = trimmed.substr(0U, length);
+            if (!prefix.empty() && seen.insert(prefix).second)
+            {
+                prefixes.push_back(prefix);
+            }
+        };
+
+        for (std::size_t index = 0; index < trimmed.size(); ++index)
+        {
+            if (trimmed[index] == '.')
+            {
+                addPrefix(index);
+                continue;
+            }
+
+            if (trimmed[index] != '[')
+            {
+                continue;
+            }
+
+            addPrefix(index);
+
+            std::size_t end = index + 1U;
+            int depth = 1;
+            while (end < trimmed.size() && depth > 0)
+            {
+                if (trimmed[end] == '[')
+                {
+                    ++depth;
+                }
+                else if (trimmed[end] == ']')
+                {
+                    --depth;
+                }
+                ++end;
+            }
+
+            if (depth != 0)
+            {
+                break;
+            }
+
+            addPrefix(end);
+            index = end - 1U;
+        }
+
+        addPrefix(trimmed.size());
+        return prefixes;
+    }
+
+    std::string memorySlotFromExpression(const std::string &expression)
+    {
+        const std::string memorySlot = canonicalMemorySlot(expression);
+        if (!memorySlot.empty())
+        {
+            return memorySlot;
+        }
+        return canonicalSlot(expression);
     }
 
     /**
@@ -945,56 +1206,6 @@ namespace
     }
 
     /**
-     * @brief Build deterministic event ordering from source locations.
-     */
-    std::vector<Event> buildEvents(const FunctionFacts &function)
-    {
-        std::vector<Event> events;
-        events.reserve(function.pointerAssignments.size() + function.callSites.size());
-
-        std::size_t index = 0;
-        for (const PointerAssignment &assignment : function.pointerAssignments)
-        {
-            Event event;
-            event.kind = EventKind::kAssignment;
-            event.line = assignment.location.line;
-            event.column = assignment.location.column;
-            event.index = index++;
-            event.assignment = &assignment;
-            events.push_back(event);
-        }
-
-        for (const CallSite &callSite : function.callSites)
-        {
-            Event event;
-            event.kind = EventKind::kCall;
-            event.line = callSite.location.line;
-            event.column = callSite.location.column;
-            event.index = index++;
-            event.callSite = &callSite;
-            events.push_back(event);
-        }
-
-        std::sort(events.begin(), events.end(), [](const Event &lhs, const Event &rhs)
-                  {
-            if (lhs.line != rhs.line)
-            {
-                return lhs.line < rhs.line;
-            }
-            if (lhs.column != rhs.column)
-            {
-                return lhs.column < rhs.column;
-            }
-            if (lhs.kind != rhs.kind)
-            {
-                return lhs.kind == EventKind::kAssignment;
-            }
-            return lhs.index < rhs.index; });
-
-        return events;
-    }
-
-    /**
      * @brief Resolve assignment RHS targets under current points-to map.
      */
     std::set<std::string> resolveAssignmentTargets(
@@ -1150,6 +1361,8 @@ namespace
     std::vector<std::string> parseCallArgumentExpressions(const std::string &rawExpression);
 
     std::optional<std::pair<std::string, std::string>> parseMemcpyArgsFromLine(const std::string &rawLine);
+
+    std::optional<MemoryTransferOp> parseMemoryTransferOpFromLine(const std::string &rawLine);
 
     /**
      * @brief Resolve callee return tokens through the current caller bindings and call arguments.
@@ -2080,6 +2293,96 @@ namespace
         return args;
     }
 
+    /**
+     * @brief Parse returned expression from a CFG line like `return expr;`.
+     */
+    std::optional<std::string> parseReturnExpressionFromLine(const std::string &rawLine)
+    {
+        std::string line = trimLine(rawLine);
+        if (line.rfind("return", 0U) != 0U)
+        {
+            return std::nullopt;
+        }
+
+        if (line.size() > 6U)
+        {
+            const unsigned char next = static_cast<unsigned char>(line[6U]);
+            if (std::isspace(next) == 0)
+            {
+                return std::nullopt;
+            }
+        }
+
+        line = trimLine(line.substr(6U));
+        if (!line.empty() && line.back() == ';')
+        {
+            line.pop_back();
+            line = trimLine(line);
+        }
+
+        if (line.empty())
+        {
+            return std::nullopt;
+        }
+
+        return line;
+    }
+
+    /**
+     * @brief Parse known memory transfer/clear operations from one CFG line.
+     */
+    std::optional<MemoryTransferOp> parseMemoryTransferOpFromLine(const std::string &rawLine)
+    {
+        const std::string callee = extractCallCalleeIdentifier(rawLine);
+        if (callee.empty())
+        {
+            return std::nullopt;
+        }
+
+        const std::vector<std::string> args = parseCallArgumentExpressions(rawLine);
+        if (args.empty())
+        {
+            return std::nullopt;
+        }
+
+        MemoryTransferOp op;
+
+        if ((callee == "memcpy" || callee == "memmove" ||
+             callee == "__builtin_memcpy" || callee == "__builtin_memmove" ||
+             callee == "mempcpy" || callee == "__builtin_mempcpy") &&
+            args.size() >= 2U)
+        {
+            op.copyPairs.push_back({args[1], args[0]});
+        }
+        else if (callee == "bcopy" && args.size() >= 2U)
+        {
+            op.copyPairs.push_back({args[0], args[1]});
+        }
+        else if ((callee == "strcpy" || callee == "stpcpy" || callee == "strncpy" ||
+                  callee == "strlcpy" || callee == "wcscpy" || callee == "wmemcpy" ||
+                  callee == "wmemmove") &&
+                 args.size() >= 2U)
+        {
+            op.copyPairs.push_back({args[1], args[0]});
+        }
+        else if ((callee == "strcat" || callee == "strncat") && args.size() >= 2U)
+        {
+            op.copyPairs.push_back({args[1], args[0]});
+        }
+        else if ((callee == "memset" || callee == "bzero" || callee == "explicit_bzero" ||
+                  callee == "__builtin_memset") &&
+                 args.size() >= 1U)
+        {
+            op.clearDestinations.push_back(args[0]);
+        }
+        else
+        {
+            return std::nullopt;
+        }
+
+        return op;
+    }
+
     std::vector<std::string> collectParameterSlots(
         const FunctionFacts &function,
         const std::set<std::string> &knownFunctions);
@@ -2193,7 +2496,7 @@ namespace
                 for (std::size_t i = 0; i < limit; ++i)
                 {
                     const std::string &param = params[i];
-                    const std::string argSlot = canonicalSlot(callSite.argumentExpressions[i]);
+                    const std::string argSlot = memorySlotFromExpression(callSite.argumentExpressions[i]);
                     if (argSlot.empty())
                     {
                         continue;
@@ -2721,100 +3024,6 @@ namespace
         }
 
         return resolveTransitiveTargets(seeds, knownFunctions, pointsTo, false);
-    }
-
-    /**
-     * @brief Detect wrapper-style parameter dispatch functions.
-     */
-    std::unordered_map<std::string, ParameterDispatchInfo> detectParameterDispatchFunctions(
-        const std::vector<FunctionFacts> &functions)
-    {
-        std::unordered_map<std::string, ParameterDispatchInfo> result;
-
-        for (const FunctionFacts &function : functions)
-        {
-            std::unordered_set<std::string> assignedSlots;
-            for (const PointerAssignment &assignment : function.pointerAssignments)
-            {
-                const std::string slot = canonicalSlot(assignment.lhsExpression);
-                if (!slot.empty())
-                {
-                    assignedSlots.insert(slot);
-                }
-            }
-
-            ParameterDispatchInfo info;
-            for (const CallSite &callSite : function.callSites)
-            {
-                if (!callSite.directCallee.empty())
-                {
-                    continue;
-                }
-
-                std::string slot;
-                if (!callSite.throughIdentifier.empty())
-                {
-                    slot = canonicalSlot(callSite.throughIdentifier);
-                }
-                if (slot.empty())
-                {
-                    slot = canonicalSlot(callSite.calleeExpression);
-                }
-
-                if (!slot.empty() && assignedSlots.find(slot) == assignedSlots.end())
-                {
-                    info.dispatchSlots.insert(slot);
-                    if (info.callLocation.file.empty())
-                    {
-                        info.callLocation = callSite.location;
-                    }
-                }
-            }
-
-            if (!info.dispatchSlots.empty())
-            {
-                result[function.name] = std::move(info);
-            }
-        }
-
-        return result;
-    }
-
-    /**
-     * @brief Collect wrapper dispatch targets from direct call sites to wrapper-style functions.
-     */
-    std::unordered_map<std::string, std::set<std::string>> collectWrapperDispatchTargets(
-        const std::vector<FunctionFacts> &functions,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, ParameterDispatchInfo> &dispatchFunctions)
-    {
-        std::unordered_map<std::string, std::set<std::string>> wrapperTargets;
-        const std::unordered_map<std::string, std::set<std::string>> emptyBindings;
-
-        for (const FunctionFacts &function : functions)
-        {
-            for (const CallSite &callSite : function.callSites)
-            {
-                if (callSite.directCallee.empty())
-                {
-                    continue;
-                }
-
-                if (dispatchFunctions.find(callSite.directCallee) == dispatchFunctions.end())
-                {
-                    continue;
-                }
-
-                std::set<std::string> &targets = wrapperTargets[callSite.directCallee];
-                for (const std::string &argumentExpression : callSite.argumentExpressions)
-                {
-                    const std::set<std::string> resolved = resolveExpressionTargets(argumentExpression, knownFunctions, emptyBindings);
-                    targets.insert(resolved.begin(), resolved.end());
-                }
-            }
-        }
-
-        return wrapperTargets;
     }
 
     /**
@@ -3473,114 +3682,6 @@ namespace
     }
 
     /**
-     * @brief Legacy linear analyzer (retained for debugging/reference).
-     */
-    void analyzeFunction(
-        const FunctionFacts &function,
-        const std::set<std::string> &knownFunctions,
-        const std::set<std::string> &blacklistedFunctions,
-        const std::unordered_map<std::string, ParameterDispatchInfo> &parameterDispatchFunctions,
-        std::unordered_map<std::string, std::set<std::string>> &wrapperDispatchTargets,
-        std::vector<CallEdge> &resolvedEdges,
-        std::vector<CallEdge> &unresolvedIndirect)
-    {
-        std::unordered_map<std::string, std::set<std::string>> pointsTo;
-
-        for (const Event &event : buildEvents(function))
-        {
-            if (event.kind == EventKind::kAssignment)
-            {
-                const PointerAssignment &assignment = *event.assignment;
-                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-                if (lhsSlot.empty())
-                {
-                    continue;
-                }
-
-                const std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, pointsTo);
-                if (targets.empty())
-                {
-                    continue;
-                }
-
-                std::set<std::string> &slotTargets = pointsTo[lhsSlot];
-                slotTargets.insert(targets.begin(), targets.end());
-                continue;
-            }
-
-            const CallSite &callSite = *event.callSite;
-            if (!callSite.directCallee.empty())
-            {
-                if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
-                {
-                    continue;
-                }
-
-                CallEdge edge;
-                edge.caller = function.name;
-                edge.callee = callSite.directCallee;
-                edge.kind = "direct";
-                edge.location = callSite.location;
-                edge.calleeExpression = callSite.calleeExpression;
-                edge.throughIdentifier = callSite.throughIdentifier;
-                resolvedEdges.push_back(std::move(edge));
-
-                if (parameterDispatchFunctions.find(callSite.directCallee) != parameterDispatchFunctions.end())
-                {
-                    std::set<std::string> argumentTargetsUnion;
-                    for (const std::string &argumentExpression : callSite.argumentExpressions)
-                    {
-                        const std::set<std::string> argumentTargets =
-                            resolveExpressionTargets(argumentExpression, knownFunctions, pointsTo);
-                        argumentTargetsUnion.insert(argumentTargets.begin(), argumentTargets.end());
-                    }
-
-                    if (!argumentTargetsUnion.empty())
-                    {
-                        std::set<std::string> &wrapperTargets = wrapperDispatchTargets[callSite.directCallee];
-                        wrapperTargets.insert(argumentTargetsUnion.begin(), argumentTargetsUnion.end());
-                    }
-                }
-                continue;
-            }
-
-            const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, pointsTo, function.structMemberMappings);
-            std::set<std::string> filteredTargets;
-            for (const std::string &target : targets)
-            {
-                if (!isBlacklistedFunction(target, blacklistedFunctions))
-                {
-                    filteredTargets.insert(target);
-                }
-            }
-
-            if (filteredTargets.empty())
-            {
-                CallEdge edge;
-                edge.caller = function.name;
-                edge.kind = "indirect";
-                edge.location = callSite.location;
-                edge.calleeExpression = callSite.calleeExpression;
-                edge.throughIdentifier = callSite.throughIdentifier;
-                unresolvedIndirect.push_back(std::move(edge));
-                logUnresolvedCall(unresolvedIndirect.back());
-                continue;
-            }
-            for (const std::string &callee : filteredTargets)
-            {
-                CallEdge edge;
-                edge.caller = function.name;
-                edge.callee = callee;
-                edge.kind = "indirect";
-                edge.location = callSite.location;
-                edge.calleeExpression = callSite.calleeExpression;
-                edge.throughIdentifier = callSite.throughIdentifier;
-                resolvedEdges.push_back(std::move(edge));
-            }
-        }
-    }
-
-    /**
      * @brief Infer parameter-like slots that should be seeded from call arguments.
      */
     std::vector<std::string> collectParameterSlots(
@@ -3683,71 +3784,6 @@ namespace
     }
 
     /**
-     * @brief Build a deterministic key for one struct-member mapping.
-     */
-    std::string makeStructMemberMappingKey(const StructMemberMapping &mapping)
-    {
-        return mapping.structVariable + "#" + mapping.memberName + "#" + mapping.functionName + "@" +
-               std::to_string(mapping.location.line) + ":" + std::to_string(mapping.location.column);
-    }
-
-    /**
-     * @brief Build a deterministic key for a set of struct-member mappings.
-     */
-    std::string buildStructMemberMappingsKey(const std::vector<StructMemberMapping> &mappings)
-    {
-        std::vector<std::string> keys;
-        keys.reserve(mappings.size());
-        for (const StructMemberMapping &mapping : mappings)
-        {
-            keys.push_back(makeStructMemberMappingKey(mapping));
-        }
-        std::sort(keys.begin(), keys.end());
-
-        std::string key;
-        for (const std::string &mappingKey : keys)
-        {
-            key += mappingKey;
-            key += ";";
-        }
-        return key;
-    }
-
-    /**
-     * @brief Build stable context key for worklist deduplication.
-     */
-    std::string buildContextKey(const std::string &functionName, const PointsToMap &pointsTo)
-    {
-        std::vector<std::pair<std::string, std::vector<std::string>>> entries;
-        entries.reserve(pointsTo.size());
-
-        for (const std::pair<const std::string, std::set<std::string>> &entry : pointsTo)
-        {
-            std::vector<std::string> targets(entry.second.begin(), entry.second.end());
-            std::sort(targets.begin(), targets.end());
-            entries.emplace_back(entry.first, std::move(targets));
-        }
-
-        std::sort(entries.begin(), entries.end(), [](const std::pair<std::string, std::vector<std::string>> &lhs, const std::pair<std::string, std::vector<std::string>> &rhs)
-                  { return lhs.first < rhs.first; });
-
-        std::string key = functionName;
-        key += "|";
-        for (const std::pair<std::string, std::vector<std::string>> &entry : entries)
-        {
-            key += entry.first;
-            key += "=";
-            for (const std::string &target : entry.second)
-            {
-                key += target;
-                key += ",";
-            }
-            key += ";";
-        }
-        return key;
-    }
-
-    /**
      * @brief Build callee seed bindings from caller argument expressions.
      */
     PointsToMap buildSeedBindings(
@@ -3807,1133 +3843,1591 @@ namespace
     }
 
     /**
+     * @brief Run a PAG/constraint based fixed-point pointer analysis and resolve calls from points-to.
+     */
+    void runPagConstraintAnalysis(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions,
+        const std::set<std::string> &blacklistedFunctions,
+        std::vector<CallEdge> &resolvedEdges,
+        std::vector<CallEdge> &unresolvedIndirect)
+    {
+        std::unordered_map<std::string, const FunctionFacts *> functionMap;
+        std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
+        std::unordered_map<std::string, std::unordered_set<std::string>> parameterSlotSetByFunction;
+        std::unordered_set<std::string> globalSlots;
+        std::unordered_set<std::string> globalRoots;
+
+        for (const FunctionFacts &function : functions)
+        {
+            functionMap[function.name] = &function;
+            parameterSlotsByFunction[function.name] = collectParameterSlots(function, knownFunctions);
+            parameterSlotSetByFunction[function.name] =
+                std::unordered_set<std::string>(parameterSlotsByFunction[function.name].begin(), parameterSlotsByFunction[function.name].end());
+
+            for (const PointerAssignment &assignment : function.pointerAssignments)
+            {
+                if (!assignment.lhsIsGlobal)
+                {
+                    continue;
+                }
+
+                const std::string lhsSlot = memorySlotFromExpression(assignment.lhsExpression);
+                if (!lhsSlot.empty())
+                {
+                    globalSlots.insert(lhsSlot);
+                    globalRoots.insert(memorySlotRoot(lhsSlot));
+                }
+            }
+        }
+
+        std::function<std::string(const std::string &)> normalizeGlobalKey =
+            [](const std::string &slot)
+        {
+            std::string key = slot;
+            const std::size_t scopePos = key.rfind("::");
+            if (scopePos != std::string::npos)
+            {
+                key = key.substr(scopePos + 2U);
+            }
+            return trimLine(key);
+        };
+
+        std::function<std::string(const std::string &, const std::string &)> memoryNode =
+            [&](const std::string &functionName, const std::string &slot)
+        {
+            if (slot.empty())
+            {
+                return std::string();
+            }
+
+            const std::string globalKey = normalizeGlobalKey(slot);
+            const std::string root = memorySlotRoot(globalKey);
+            if (globalRoots.find(root) != globalRoots.end() || globalSlots.find(globalKey) != globalSlots.end())
+            {
+                return "g::" + globalKey;
+            }
+
+            return functionName + "::" + globalKey;
+        };
+
+        std::function<std::string(const std::string &)> returnNode =
+            [](const std::string &functionName)
+        {
+            return "ret::" + functionName;
+        };
+
+        std::function<bool(const std::string &)> isLikelyPointerIdentifier =
+            [&](const std::string &identifier)
+        {
+            static const std::unordered_set<std::string> kIgnoredTokens = {
+                "const", "volatile", "restrict", "signed", "unsigned", "short", "long",
+                "int", "char", "float", "double", "void", "struct", "union", "enum", "sizeof",
+                "return", "if", "else", "for", "while", "switch", "case", "default", "goto",
+                "break", "continue", "static", "extern", "register", "inline", "typedef"};
+
+            if (identifier.empty())
+            {
+                return false;
+            }
+
+            if (kIgnoredTokens.find(identifier) != kIgnoredTokens.end())
+            {
+                return false;
+            }
+
+            if (knownFunctions.find(identifier) != knownFunctions.end())
+            {
+                return false;
+            }
+
+            return true;
+        };
+
+        std::function<std::vector<std::string>(const std::string &)> collectExpressionSlots =
+            [&](const std::string &expression)
+        {
+            std::vector<std::string> slots;
+            std::unordered_set<std::string> seen;
+
+            const std::string canonical = canonicalMemorySlot(expression);
+            if (!canonical.empty() && isLikelyPointerIdentifier(canonical) && seen.insert(canonical).second)
+            {
+                slots.push_back(canonical);
+            }
+
+            const std::string fallbackCanonical = canonicalSlot(expression);
+            if (!fallbackCanonical.empty() && isLikelyPointerIdentifier(fallbackCanonical) && seen.insert(fallbackCanonical).second)
+            {
+                slots.push_back(fallbackCanonical);
+            }
+
+            for (const std::string &identifier : extractIdentifiers(expression))
+            {
+                if (!isLikelyPointerIdentifier(identifier))
+                {
+                    continue;
+                }
+
+                if (seen.insert(identifier).second)
+                {
+                    slots.push_back(identifier);
+                }
+            }
+
+            return slots;
+        };
+
+        std::unordered_set<std::string> trackedMemorySlots;
+        std::unordered_set<std::string> addressTakenTrackedSlots;
+        std::unordered_map<std::string, std::unordered_set<std::string>> referencedFunctionsBySlot;
+        std::function<void(const std::string &, const std::string &)> recordTrackedSlot =
+            [&](const std::string &slot, const std::string &functionName)
+        {
+            const std::string normalized = normalizeGlobalKey(slot);
+            if (normalized.empty() || !isLikelyPointerIdentifier(normalized))
+            {
+                return;
+            }
+
+            for (const std::string &alias : expandMemorySlotAliases(normalized))
+            {
+                const std::string aliasKey = normalizeGlobalKey(alias);
+                if (!aliasKey.empty() && isLikelyPointerIdentifier(aliasKey))
+                {
+                    trackedMemorySlots.insert(aliasKey);
+                    if (!functionName.empty())
+                    {
+                        referencedFunctionsBySlot[aliasKey].insert(functionName);
+                    }
+                }
+            }
+        };
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const PointerAssignment &assignment : function.pointerAssignments)
+            {
+                recordTrackedSlot(memorySlotFromExpression(assignment.lhsExpression), function.name);
+                for (const std::string &slot : collectExpressionSlots(assignment.rhsExpression))
+                {
+                    recordTrackedSlot(slot, function.name);
+                }
+                if (!assignment.rhsExpression.empty() && trimLine(assignment.rhsExpression).front() == '&')
+                {
+                    const std::string takenSlot = memorySlotFromExpression(assignment.rhsExpression);
+                    if (!takenSlot.empty())
+                    {
+                        addressTakenTrackedSlots.insert(normalizeGlobalKey(takenSlot));
+                    }
+                }
+            }
+
+            for (const StructMemberMapping &mapping : function.structMemberMappings)
+            {
+                recordTrackedSlot(mapping.structVariable, function.name);
+                if (!mapping.memberName.empty())
+                {
+                    recordTrackedSlot(mapping.structVariable + "." + mapping.memberName, function.name);
+                }
+            }
+
+            for (const CallSite &callSite : function.callSites)
+            {
+                recordTrackedSlot(memorySlotFromExpression(callSite.throughIdentifier), function.name);
+                recordTrackedSlot(memorySlotFromExpression(callSite.calleeExpression), function.name);
+                for (const std::string &argumentExpression : callSite.argumentExpressions)
+                {
+                    for (const std::string &slot : collectExpressionSlots(argumentExpression))
+                    {
+                        recordTrackedSlot(slot, function.name);
+                    }
+
+                    const std::string trimmedArgument = trimLine(argumentExpression);
+                    if (!trimmedArgument.empty() && trimmedArgument.front() == '&')
+                    {
+                        const std::string takenSlot = memorySlotFromExpression(argumentExpression);
+                        if (!takenSlot.empty())
+                        {
+                            addressTakenTrackedSlots.insert(normalizeGlobalKey(takenSlot));
+                        }
+                    }
+                }
+            }
+
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &line : block.lines)
+                {
+                    const std::optional<std::string> returnExpression = parseReturnExpressionFromLine(line);
+                    if (returnExpression.has_value())
+                    {
+                        for (const std::string &slot : collectExpressionSlots(*returnExpression))
+                        {
+                            recordTrackedSlot(slot, function.name);
+                        }
+                    }
+
+                    const std::optional<MemoryTransferOp> transferOp = parseMemoryTransferOpFromLine(line);
+                    if (!transferOp.has_value())
+                    {
+                        continue;
+                    }
+
+                    for (const std::string &clearDestination : transferOp->clearDestinations)
+                    {
+                        for (const std::string &slot : collectExpressionSlots(clearDestination))
+                        {
+                            recordTrackedSlot(slot, function.name);
+                        }
+                    }
+
+                    for (const std::pair<std::string, std::string> &copyPair : transferOp->copyPairs)
+                    {
+                        for (const std::string &slot : collectExpressionSlots(copyPair.first))
+                        {
+                            recordTrackedSlot(slot, function.name);
+                        }
+                        for (const std::string &slot : collectExpressionSlots(copyPair.second))
+                        {
+                            recordTrackedSlot(slot, function.name);
+                        }
+                    }
+                }
+            }
+        }
+
+        std::unordered_map<std::string, std::vector<std::string>> descendantSlotsByAncestor;
+        for (const std::string &slot : trackedMemorySlots)
+        {
+            for (const std::string &prefix : collectMemorySlotPrefixes(slot))
+            {
+                if (prefix != slot)
+                {
+                    descendantSlotsByAncestor[prefix].push_back(slot);
+                }
+            }
+        }
+
+        std::function<std::string(const std::string &, const std::string &)> abstractMemoryObject =
+            [&](const std::string &functionName, const std::string &slot)
+        {
+            std::string key = normalizeGlobalKey(slot);
+
+            const std::string root = memorySlotRoot(key);
+            const bool isGlobal = globalRoots.find(root) != globalRoots.end() || globalSlots.find(key) != globalSlots.end();
+            const bool isParam =
+                parameterSlotSetByFunction.find(functionName) != parameterSlotSetByFunction.end() &&
+                (parameterSlotSetByFunction[functionName].find(key) != parameterSlotSetByFunction[functionName].end() ||
+                 parameterSlotSetByFunction[functionName].find(root) != parameterSlotSetByFunction[functionName].end());
+
+            std::string region;
+            if (isGlobal)
+            {
+                region = "g";
+            }
+            else if (isParam)
+            {
+                region = "p:" + functionName;
+            }
+            else
+            {
+                region = "l:" + functionName;
+            }
+
+            return "obj:" + region + ":" + key;
+        };
+
+        std::function<std::string(const std::string &, const std::string &)> addressTakenStorageNode =
+            [&](const std::string &functionName, const std::string &slot)
+        {
+            const std::string normalized = normalizeGlobalKey(slot);
+            if (normalized.empty())
+            {
+                return std::string();
+            }
+
+            const std::string root = memorySlotRoot(normalized);
+            if (addressTakenTrackedSlots.find(normalized) == addressTakenTrackedSlots.end() &&
+                (root.empty() || addressTakenTrackedSlots.find(root) == addressTakenTrackedSlots.end()))
+            {
+                return std::string();
+            }
+
+            return abstractMemoryObject(functionName, normalized);
+        };
+
+        std::unordered_map<std::string, std::unordered_set<std::string>> pointsTo;
+        struct DeferredLoadConstraint
+        {
+            std::string dstNode;
+            std::size_t dereferenceDepth = 1U;
+        };
+
+        struct DeferredStoreConstraint
+        {
+            std::string srcNode;
+            std::size_t dereferenceDepth = 1U;
+        };
+
+        struct DeferredStoreSeed
+        {
+            std::string target;
+            std::size_t dereferenceDepth = 1U;
+        };
+
+        std::unordered_map<std::string, std::vector<DeferredLoadConstraint>> loadsByPointer;
+        std::unordered_map<std::string, std::vector<DeferredStoreConstraint>> storesByPointer;
+        std::unordered_map<std::string, std::vector<DeferredStoreSeed>> storeSeedTargetsByPointer;
+        std::unordered_map<std::string, std::vector<std::string>> memTransferDstBySrcPtr;
+        std::unordered_map<std::string, std::vector<std::string>> memTransferSrcByDstPtr;
+        std::unordered_map<std::string, std::vector<std::string>> sparseValueFlowSucc;
+        std::unordered_map<std::string, std::vector<std::string>> sparseValueFlowPred;
+        std::unordered_set<std::string> sparseValueFlowEdgeKeys;
+        std::deque<std::string> worklist;
+        std::unordered_set<std::string> inWorklist;
+        std::unordered_set<std::string> relevantNodes;
+        std::deque<std::string> relevantQueue;
+
+        std::function<void(const std::string &)> markRelevant = [&](const std::string &node)
+        {
+            if (node.empty())
+            {
+                return;
+            }
+            if (relevantNodes.insert(node).second)
+            {
+                relevantQueue.push_back(node);
+            }
+        };
+
+        std::function<void()> saturateRelevantNodes = [&]()
+        {
+            while (!relevantQueue.empty())
+            {
+                const std::string node = relevantQueue.front();
+                relevantQueue.pop_front();
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator predIt =
+                    sparseValueFlowPred.find(node);
+                if (predIt == sparseValueFlowPred.end())
+                {
+                    continue;
+                }
+
+                for (const std::string &pred : predIt->second)
+                {
+                    if (relevantNodes.insert(pred).second)
+                    {
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                            pointsTo.find(pred);
+                        if (ptIt != pointsTo.end() && !ptIt->second.empty() && inWorklist.insert(pred).second)
+                        {
+                            worklist.push_back(pred);
+                        }
+                        relevantQueue.push_back(pred);
+                    }
+                }
+            }
+        };
+
+        std::function<bool(const std::string &, const std::string &)> addSparseValueFlowEdge =
+            [&](const std::string &src, const std::string &dst)
+        {
+            if (src.empty() || dst.empty())
+            {
+                return false;
+            }
+
+            const std::string edgeKey = src + "->" + dst;
+            if (!sparseValueFlowEdgeKeys.insert(edgeKey).second)
+            {
+                return false;
+            }
+
+            sparseValueFlowSucc[src].push_back(dst);
+            sparseValueFlowPred[dst].push_back(src);
+
+            if (relevantNodes.find(dst) != relevantNodes.end() && relevantNodes.insert(src).second)
+            {
+                relevantQueue.push_back(src);
+                saturateRelevantNodes();
+            }
+
+            return true;
+        };
+
+        std::function<bool(const std::string &, const std::string &)> addCopyEdge =
+            [&](const std::string &src, const std::string &dst)
+        {
+            if (src.empty() || dst.empty())
+            {
+                return false;
+            }
+
+            addSparseValueFlowEdge(src, dst);
+            return true;
+        };
+
+        std::function<void(const std::string &)> queueNode = [&](const std::string &node)
+        {
+            if (node.empty())
+            {
+                return;
+            }
+            if (relevantNodes.find(node) == relevantNodes.end())
+            {
+                return;
+            }
+            if (inWorklist.insert(node).second)
+            {
+                worklist.push_back(node);
+            }
+        };
+
+        std::function<bool(const std::string &, const std::string &)> addPointsTo =
+            [&](const std::string &node, const std::string &target)
+        {
+            if (node.empty() || target.empty())
+            {
+                return false;
+            }
+
+            std::unordered_set<std::string> &targets = pointsTo[node];
+            if (!targets.insert(target).second)
+            {
+                return false;
+            }
+
+            queueNode(node);
+            return true;
+        };
+
+        std::function<void(const std::string &, const std::string &)> addAddressSeed =
+            [&](const std::string &lhsNode, const std::string &targetObject)
+        {
+            addPointsTo(lhsNode, targetObject);
+        };
+
+        std::function<std::size_t(const std::string &)> countLeadingDereferences =
+            [](const std::string &expression)
+        {
+            const std::string trimmed = trimLine(expression);
+            std::size_t depth = 0U;
+            while (depth < trimmed.size() && trimmed[depth] == '*')
+            {
+                ++depth;
+            }
+            return depth;
+        };
+
+        std::function<std::string(const std::string &)> slotFromAbstractObject =
+            [&](const std::string &target)
+        {
+            if (target.rfind("obj:", 0U) != 0U)
+            {
+                return std::string();
+            }
+
+            const std::size_t split = target.rfind(':');
+            if (split == std::string::npos || split + 1U >= target.size())
+            {
+                return std::string();
+            }
+
+            return normalizeGlobalKey(target.substr(split + 1U));
+        };
+
+        std::function<std::vector<std::string>(const std::string &, const std::string &)> collectCandidateMemoryNodes =
+            [&](const std::string &functionName, const std::string &slot)
+        {
+            std::vector<std::string> nodes;
+            std::unordered_set<std::string> seen;
+
+            const std::string normalized = normalizeGlobalKey(slot);
+            if (normalized.empty())
+            {
+                return nodes;
+            }
+
+            std::function<void(const std::string &)> addNode = [&](const std::string &node)
+            {
+                if (!node.empty() && seen.insert(node).second)
+                {
+                    nodes.push_back(node);
+                }
+            };
+
+            addNode(memoryNode(functionName, normalized));
+            addNode(addressTakenStorageNode(functionName, normalized));
+
+            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator refsIt =
+                referencedFunctionsBySlot.find(normalized);
+            const std::string root = memorySlotRoot(normalized);
+            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator rootRefsIt =
+                referencedFunctionsBySlot.find(root);
+            const bool sharedAcrossFunctions =
+                (refsIt != referencedFunctionsBySlot.end() && refsIt->second.size() > 1U) ||
+                (!root.empty() && rootRefsIt != referencedFunctionsBySlot.end() && rootRefsIt->second.size() > 1U);
+            const bool sharedAddressTakenSlot =
+                addressTakenTrackedSlots.find(normalized) != addressTakenTrackedSlots.end() ||
+                (!root.empty() && addressTakenTrackedSlots.find(root) != addressTakenTrackedSlots.end());
+            if (sharedAcrossFunctions &&
+                (normalized.find('.') != std::string::npos ||
+                 normalized.find('[') != std::string::npos ||
+                 sharedAddressTakenSlot))
+            {
+                addNode("g::" + normalized);
+            }
+
+            return nodes;
+        };
+
+        std::function<void(const std::string &, const std::string &, const std::string &)> seedSlotTarget =
+            [&](const std::string &functionName, const std::string &slot, const std::string &target)
+        {
+            for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+            {
+                addPointsTo(node, target);
+            }
+        };
+
+        std::function<void(const std::string &, const std::string &, const std::string &)> copyIntoSlot =
+            [&](const std::string &functionName, const std::string &slot, const std::string &srcNode)
+        {
+            for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+            {
+                addCopyEdge(srcNode, node);
+            }
+        };
+
+        std::function<std::vector<std::string>(const std::string &, const std::string &)> collectPointeeAccessSlots =
+            [&](const std::string &functionName, const std::string &slot)
+        {
+            std::vector<std::string> resolvedSlots;
+            std::unordered_set<std::string> seen;
+
+            const std::string normalized = normalizeGlobalKey(slot);
+            if (normalized.empty())
+            {
+                return resolvedSlots;
+            }
+
+            const std::string root = memorySlotRoot(normalized);
+            if (root.empty() || root == normalized)
+            {
+                return resolvedSlots;
+            }
+
+            const std::string node = memoryNode(functionName, root);
+            if (node.empty())
+            {
+                return resolvedSlots;
+            }
+
+            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                pointsTo.find(node);
+            if (ptIt == pointsTo.end())
+            {
+                return resolvedSlots;
+            }
+
+            const std::string suffix = normalized.substr(root.size());
+            for (const std::string &target : ptIt->second)
+            {
+                const std::string pointeeSlot = slotFromAbstractObject(target);
+                if (pointeeSlot.empty())
+                {
+                    continue;
+                }
+
+                const std::string resolvedSlot = pointeeSlot + suffix;
+                if (seen.insert(resolvedSlot).second)
+                {
+                    resolvedSlots.push_back(resolvedSlot);
+                }
+            }
+
+            return resolvedSlots;
+        };
+
+        std::function<std::set<std::string>(const std::unordered_set<std::string> &)> resolveFunctionTargetsTransitively =
+            [&](const std::unordered_set<std::string> &initialTargets)
+        {
+            std::set<std::string> resolvedFunctions;
+            std::deque<std::string> pending(initialTargets.begin(), initialTargets.end());
+            std::unordered_set<std::string> visited(initialTargets.begin(), initialTargets.end());
+
+            while (!pending.empty())
+            {
+                const std::string current = pending.front();
+                pending.pop_front();
+
+                if (current.rfind("fn:", 0U) == 0U)
+                {
+                    const std::string callee = current.substr(3U);
+                    if (knownFunctions.find(callee) != knownFunctions.end() &&
+                        !isBlacklistedFunction(callee, blacklistedFunctions))
+                    {
+                        resolvedFunctions.insert(callee);
+                    }
+                    continue;
+                }
+
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator nextIt =
+                    pointsTo.find(current);
+                if (nextIt == pointsTo.end())
+                {
+                    continue;
+                }
+
+                for (const std::string &next : nextIt->second)
+                {
+                    if (visited.insert(next).second)
+                    {
+                        pending.push_back(next);
+                    }
+                }
+            }
+
+            return resolvedFunctions;
+        };
+
+        std::function<std::unordered_set<std::string>(const std::string &, std::size_t)> resolveDereferencedObjects =
+            [&](const std::string &baseNode, std::size_t dereferenceDepth)
+        {
+            std::unordered_set<std::string> frontier;
+            if (baseNode.empty() || dereferenceDepth == 0U)
+            {
+                return frontier;
+            }
+
+            frontier.insert(baseNode);
+            for (std::size_t depth = 0; depth < dereferenceDepth; ++depth)
+            {
+                std::unordered_set<std::string> nextFrontier;
+                for (const std::string &node : frontier)
+                {
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                        pointsTo.find(node);
+                    if (ptIt == pointsTo.end())
+                    {
+                        continue;
+                    }
+
+                    nextFrontier.insert(ptIt->second.begin(), ptIt->second.end());
+                }
+
+                if (nextFrontier.empty())
+                {
+                    frontier.clear();
+                    break;
+                }
+
+                frontier = std::move(nextFrontier);
+            }
+
+            return frontier;
+        };
+
+        std::function<std::set<std::string>(const std::string &, const std::vector<std::string> &)> expandMemcpyDestinationSlots =
+            [&](const std::string &functionName, const std::vector<std::string> &initialSlots)
+        {
+            std::set<std::string> expandedSlots;
+            std::deque<std::string> pending;
+
+            std::function<void(const std::string &)> enqueueSlot = [&](const std::string &slot)
+            {
+                const std::string normalized = normalizeGlobalKey(slot);
+                if (normalized.empty() ||
+                    isIntegerBinding(normalized) ||
+                    knownFunctions.find(normalized) != knownFunctions.end() ||
+                    !isLikelyPointerIdentifier(normalized))
+                {
+                    return;
+                }
+
+                if (expandedSlots.insert(normalized).second)
+                {
+                    pending.push_back(normalized);
+                }
+            };
+
+            std::function<void(const std::string &)> enqueuePointeeAliases = [&](const std::string &slot)
+            {
+                const std::string node = memoryNode(functionName, slot);
+                if (node.empty())
+                {
+                    return;
+                }
+
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                    pointsTo.find(node);
+                if (ptIt == pointsTo.end())
+                {
+                    return;
+                }
+
+                for (const std::string &target : ptIt->second)
+                {
+                    const std::string pointeeSlot = slotFromAbstractObject(target);
+                    if (!pointeeSlot.empty())
+                    {
+                        enqueueSlot(pointeeSlot);
+                    }
+                }
+            };
+
+            for (const std::string &slot : initialSlots)
+            {
+                enqueueSlot(slot);
+            }
+
+            while (!pending.empty())
+            {
+                const std::string current = pending.front();
+                pending.pop_front();
+
+                for (const std::string &alias : expandMemorySlotAliases(current))
+                {
+                    enqueueSlot(alias);
+                }
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator descendantsIt =
+                    descendantSlotsByAncestor.find(current);
+                if (descendantsIt != descendantSlotsByAncestor.end())
+                {
+                    for (const std::string &descendant : descendantsIt->second)
+                    {
+                        enqueueSlot(descendant);
+                    }
+                }
+
+                enqueuePointeeAliases(current);
+            }
+
+            return expandedSlots;
+        };
+
+        std::function<std::vector<std::string>(const std::vector<std::string> &, const std::set<std::string> &, const std::string &)> collectMemcpySourceSlots =
+            [&](const std::vector<std::string> &initialSrcSlots,
+                const std::set<std::string> &expandedDstSlots,
+                const std::string &expandedDstSlot)
+        {
+            std::vector<std::string> resolvedSrcSlots;
+            std::unordered_set<std::string> seen;
+
+            std::function<void(const std::string &)> addSourceSlot = [&](const std::string &slot)
+            {
+                const std::string normalized = normalizeGlobalKey(slot);
+                if (normalized.empty())
+                {
+                    return;
+                }
+
+                if (seen.insert(normalized).second)
+                {
+                    resolvedSrcSlots.push_back(normalized);
+                }
+            };
+
+            for (const std::string &srcSlot : initialSrcSlots)
+            {
+                addSourceSlot(srcSlot);
+            }
+
+            for (const std::string &dstBaseSlot : expandedDstSlots)
+            {
+                const std::string normalizedDstBase = normalizeGlobalKey(dstBaseSlot);
+                if (normalizedDstBase.empty() ||
+                    expandedDstSlot == normalizedDstBase ||
+                    expandedDstSlot.rfind(normalizedDstBase, 0U) != 0U)
+                {
+                    continue;
+                }
+
+                const std::string suffix = expandedDstSlot.substr(normalizedDstBase.size());
+                if (suffix.empty())
+                {
+                    continue;
+                }
+
+                for (const std::string &srcSlot : initialSrcSlots)
+                {
+                    const std::string normalizedSrc = normalizeGlobalKey(srcSlot);
+                    const std::string mappedSrcSlot = normalizedSrc + suffix;
+                    if (trackedMemorySlots.find(mappedSrcSlot) != trackedMemorySlots.end())
+                    {
+                        addSourceSlot(mappedSrcSlot);
+                    }
+                }
+            }
+
+            return resolvedSrcSlots;
+        };
+
+        std::function<void(const FunctionFacts &, const CallSite &)> seedDirectCallArguments =
+            [&](const FunctionFacts &caller, const CallSite &callSite)
+        {
+            if (callSite.directCallee.empty())
+            {
+                return;
+            }
+
+            const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt =
+                functionMap.find(callSite.directCallee);
+            if (calleeIt == functionMap.end())
+            {
+                return;
+            }
+
+            const std::vector<std::string> &calleeParams = parameterSlotsByFunction[callSite.directCallee];
+            const std::size_t limit = std::min(calleeParams.size(), callSite.argumentExpressions.size());
+            for (std::size_t i = 0; i < limit; ++i)
+            {
+                const std::vector<std::string> dstNodes =
+                    collectCandidateMemoryNodes(callSite.directCallee, calleeParams[i]);
+                if (dstNodes.empty())
+                {
+                    continue;
+                }
+
+                const std::string argumentRaw = trimLine(callSite.argumentExpressions[i]);
+                const std::string argSlot = memorySlotFromExpression(callSite.argumentExpressions[i]);
+                const bool passesAddress =
+                    !argumentRaw.empty() &&
+                    argumentRaw.front() == '&' &&
+                    !argSlot.empty() &&
+                    knownFunctions.find(argSlot) == knownFunctions.end();
+                if (passesAddress)
+                {
+                    seedSlotTarget(callSite.directCallee, calleeParams[i], abstractMemoryObject(caller.name, argSlot));
+                }
+                else if (!argSlot.empty())
+                {
+                    const std::string srcNode = memoryNode(caller.name, argSlot);
+                    copyIntoSlot(callSite.directCallee, calleeParams[i], srcNode);
+                }
+
+                for (const std::string &identifier : extractIdentifiers(callSite.argumentExpressions[i]))
+                {
+                    if (knownFunctions.find(identifier) == knownFunctions.end())
+                    {
+                        continue;
+                    }
+
+                    seedSlotTarget(callSite.directCallee, calleeParams[i], "fn:" + identifier);
+                }
+            }
+        };
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                seedDirectCallArguments(function, callSite);
+            }
+        }
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const PointerAssignment &assignment : function.pointerAssignments)
+            {
+                const std::string lhsSlot = memorySlotFromExpression(assignment.lhsExpression);
+                const std::string lhsNode = memoryNode(function.name, lhsSlot);
+                const std::vector<std::string> rhsSlots = collectExpressionSlots(assignment.rhsExpression);
+
+                if (lhsNode.empty())
+                {
+                    continue;
+                }
+
+                const std::string lhsRaw = trimLine(assignment.lhsExpression);
+                const std::string rhsRaw = trimLine(assignment.rhsExpression);
+                const bool rhsIsLoad = !rhsRaw.empty() && rhsRaw.front() == '*';
+                const bool lhsIsStore = !lhsRaw.empty() && lhsRaw.front() == '*';
+                const std::size_t rhsDerefDepth = countLeadingDereferences(rhsRaw);
+                const std::size_t lhsDerefDepth = countLeadingDereferences(lhsRaw);
+                const bool hasPointerCast = rhsRaw.find("(") != std::string::npos && rhsRaw.find("*") != std::string::npos;
+
+                std::vector<std::string> deferredStoreSeedTargets;
+
+                const std::string rhsDirectCallee = extractCallCalleeIdentifier(rhsRaw);
+                if (!rhsDirectCallee.empty() && functionMap.find(rhsDirectCallee) != functionMap.end())
+                {
+                    if (lhsIsStore)
+                    {
+                        const std::string rhsValueNode = returnNode(rhsDirectCallee);
+                        DeferredStoreConstraint deferredStore;
+                        deferredStore.srcNode = rhsValueNode;
+                        deferredStore.dereferenceDepth = lhsDerefDepth;
+                        storesByPointer[lhsNode].push_back(deferredStore);
+                    }
+                    else
+                    {
+                        copyIntoSlot(function.name, lhsSlot, returnNode(rhsDirectCallee));
+                    }
+                    continue;
+                }
+
+                if (!assignment.assignedFunction.empty() &&
+                    knownFunctions.find(assignment.assignedFunction) != knownFunctions.end())
+                {
+                    if (lhsIsStore)
+                    {
+                        DeferredStoreSeed storeSeed;
+                        storeSeed.target = "fn:" + assignment.assignedFunction;
+                        storeSeed.dereferenceDepth = lhsDerefDepth;
+                        storeSeedTargetsByPointer[lhsNode].push_back(storeSeed);
+                        addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                    }
+                    else
+                    {
+                        seedSlotTarget(function.name, lhsSlot, "fn:" + assignment.assignedFunction);
+                    }
+                    continue;
+                }
+
+                bool seededFromFunctionAddress = false;
+                if (assignment.rhsTakesFunctionAddress || (!rhsRaw.empty() && rhsRaw.front() == '&'))
+                {
+                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                    {
+                        if (knownFunctions.find(identifier) == knownFunctions.end())
+                        {
+                            continue;
+                        }
+                        if (lhsIsStore)
+                        {
+                            deferredStoreSeedTargets.push_back("fn:" + identifier);
+                        }
+                        else
+                        {
+                            seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
+                        }
+                        seededFromFunctionAddress = true;
+                    }
+
+                    if (!seededFromFunctionAddress)
+                    {
+                        for (const std::string &candidateSlot : rhsSlots)
+                        {
+                            const std::string targetObject = abstractMemoryObject(function.name, candidateSlot);
+                            if (lhsIsStore)
+                            {
+                                deferredStoreSeedTargets.push_back(targetObject);
+                            }
+                            else
+                            {
+                                seedSlotTarget(function.name, lhsSlot, targetObject);
+                            }
+                            seededFromFunctionAddress = true;
+                        }
+                    }
+                }
+
+                if (seededFromFunctionAddress)
+                {
+                    if (lhsIsStore)
+                    {
+                        for (const std::string &target : deferredStoreSeedTargets)
+                        {
+                            DeferredStoreSeed storeSeed;
+                            storeSeed.target = target;
+                            storeSeed.dereferenceDepth = lhsDerefDepth;
+                            storeSeedTargetsByPointer[lhsNode].push_back(storeSeed);
+                        }
+                        addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                    }
+                    continue;
+                }
+
+                if (rhsRaw.find('(') == std::string::npos)
+                {
+                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                    {
+                        if (knownFunctions.find(identifier) == knownFunctions.end())
+                        {
+                            continue;
+                        }
+
+                        if (lhsIsStore)
+                        {
+                            deferredStoreSeedTargets.push_back("fn:" + identifier);
+                        }
+                        else
+                        {
+                            seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
+                        }
+                        seededFromFunctionAddress = true;
+                    }
+
+                    if (seededFromFunctionAddress)
+                    {
+                        if (lhsIsStore)
+                        {
+                            for (const std::string &target : deferredStoreSeedTargets)
+                            {
+                                DeferredStoreSeed storeSeed;
+                                storeSeed.target = target;
+                                storeSeed.dereferenceDepth = lhsDerefDepth;
+                                storeSeedTargetsByPointer[lhsNode].push_back(storeSeed);
+                            }
+                            addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                        }
+                        continue;
+                    }
+                }
+
+                // Conservative: if RHS mentions function symbols (including ternary/union-style selectors),
+                // seed them as possible pointees unless RHS is a direct call expression.
+                if (rhsDirectCallee.empty())
+                {
+                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                    {
+                        if (knownFunctions.find(identifier) == knownFunctions.end())
+                        {
+                            continue;
+                        }
+
+                        if (lhsIsStore)
+                        {
+                            deferredStoreSeedTargets.push_back("fn:" + identifier);
+                        }
+                        else
+                        {
+                            seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
+                        }
+                    }
+                }
+
+                // Conservative aggregate summary: global field slots may flow through the global base slot.
+                const std::string lhsRoot = memorySlotRoot(lhsSlot);
+                if (!lhsSlot.empty() && lhsRoot != lhsSlot && globalRoots.find(lhsRoot) != globalRoots.end())
+                {
+                    const std::string lhsBaseNode = memoryNode(function.name, lhsRoot);
+                    addCopyEdge(lhsNode, lhsBaseNode);
+                    addCopyEdge(lhsBaseNode, lhsNode);
+                }
+
+                if ((rhsIsLoad || lhsIsStore || hasPointerCast) && !lhsSlot.empty())
+                {
+                    addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                }
+
+                if (rhsIsLoad)
+                {
+                    for (const std::string &rhsSlot : rhsSlots)
+                    {
+                        const std::string rhsNode = memoryNode(function.name, rhsSlot);
+                        if (rhsNode.empty())
+                        {
+                            continue;
+                        }
+
+                        DeferredLoadConstraint deferredLoad;
+                        deferredLoad.dstNode = lhsNode;
+                        deferredLoad.dereferenceDepth = rhsDerefDepth;
+                        loadsByPointer[rhsNode].push_back(deferredLoad);
+                    }
+                    continue;
+                }
+
+                if (lhsIsStore)
+                {
+                    for (const std::string &rhsSlot : rhsSlots)
+                    {
+                        const std::string rhsNode = memoryNode(function.name, rhsSlot);
+                        if (rhsNode.empty())
+                        {
+                            continue;
+                        }
+
+                        DeferredStoreConstraint deferredStore;
+                        deferredStore.srcNode = rhsNode;
+                        deferredStore.dereferenceDepth = lhsDerefDepth;
+                        storesByPointer[lhsNode].push_back(deferredStore);
+                    }
+                    continue;
+                }
+
+                for (const std::string &rhsSlot : rhsSlots)
+                {
+                    const std::string rhsNode = memoryNode(function.name, rhsSlot);
+                    if (rhsNode.empty())
+                    {
+                        continue;
+                    }
+
+                    copyIntoSlot(function.name, lhsSlot, rhsNode);
+                }
+            }
+
+            const std::string functionReturnNode = returnNode(function.name);
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &line : block.lines)
+                {
+                    const std::optional<std::string> returnExpression = parseReturnExpressionFromLine(line);
+                    if (!returnExpression.has_value())
+                    {
+                        continue;
+                    }
+
+                    const std::string returnedRaw = trimLine(*returnExpression);
+                    if (returnedRaw.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::string returnedCallee = extractCallCalleeIdentifier(returnedRaw);
+                    if (!returnedCallee.empty() && functionMap.find(returnedCallee) != functionMap.end())
+                    {
+                        addCopyEdge(returnNode(returnedCallee), functionReturnNode);
+                    }
+
+                    for (const std::string &identifier : extractIdentifiers(returnedRaw))
+                    {
+                        if (knownFunctions.find(identifier) == knownFunctions.end())
+                        {
+                            continue;
+                        }
+
+                        if (!returnedCallee.empty() && identifier == returnedCallee)
+                        {
+                            continue;
+                        }
+
+                        addAddressSeed(functionReturnNode, "fn:" + identifier);
+                    }
+
+                    for (const std::string &returnedSlot : collectExpressionSlots(returnedRaw))
+                    {
+                        std::unordered_set<std::string> seenReturnedNodes;
+                        for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, returnedSlot))
+                        {
+                            if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
+                            {
+                                continue;
+                            }
+
+                            addCopyEdge(returnedNode, functionReturnNode);
+                        }
+
+                        for (const std::string &pointeeSlot : collectPointeeAccessSlots(function.name, returnedSlot))
+                        {
+                            for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, pointeeSlot))
+                            {
+                                if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
+                                {
+                                    continue;
+                                }
+
+                                addCopyEdge(returnedNode, functionReturnNode);
+                            }
+                        }
+                    }
+                }
+            }
+
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (callSite.directCallee.empty())
+                {
+                    continue;
+                }
+
+                seedDirectCallArguments(function, callSite);
+            }
+
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &line : block.lines)
+                {
+                    const std::optional<MemoryTransferOp> transferOp = parseMemoryTransferOpFromLine(line);
+                    if (!transferOp.has_value())
+                    {
+                        continue;
+                    }
+
+                    for (const std::string &clearDestination : transferOp->clearDestinations)
+                    {
+                        const std::vector<std::string> clearDstSlots = collectExpressionSlots(clearDestination);
+                        for (const std::string &dstSlot : clearDstSlots)
+                        {
+                            const std::string dstNode = memoryNode(function.name, dstSlot);
+                            if (dstNode.empty())
+                            {
+                                continue;
+                            }
+
+                            addAddressSeed(dstNode, abstractMemoryObject(function.name, dstSlot));
+                            markRelevant(dstNode);
+                        }
+                    }
+
+                    for (const std::pair<std::string, std::string> &copyPair : transferOp->copyPairs)
+                    {
+                        const std::vector<std::string> srcSlots = collectExpressionSlots(copyPair.first);
+                        const std::vector<std::string> dstSlots = collectExpressionSlots(copyPair.second);
+                        if (dstSlots.empty() || srcSlots.empty())
+                        {
+                            continue;
+                        }
+
+                        const std::set<std::string> allDstSlots =
+                            expandMemcpyDestinationSlots(function.name, dstSlots);
+
+                        for (const std::string &dstSlot : allDstSlots)
+                        {
+                            const std::vector<std::string> resolvedSrcSlots =
+                                collectMemcpySourceSlots(srcSlots, allDstSlots, dstSlot);
+                            const std::vector<std::string> dstNodes =
+                                collectCandidateMemoryNodes(function.name, dstSlot);
+                            for (const std::string &dstNode : dstNodes)
+                            {
+                                if (dstNode.empty())
+                                {
+                                    continue;
+                                }
+
+                                if (dstNode.rfind("g::", 0U) == 0U)
+                                {
+                                    addAddressSeed(dstNode, "obj:g:" + normalizeGlobalKey(dstSlot));
+                                }
+                                else
+                                {
+                                    addAddressSeed(dstNode, abstractMemoryObject(function.name, dstSlot));
+                                }
+                                markRelevant(dstNode);
+                                for (const std::string &srcSlot : resolvedSrcSlots)
+                                {
+                                    const std::string srcNode = memoryNode(function.name, srcSlot);
+                                    if (srcNode.empty())
+                                    {
+                                        continue;
+                                    }
+                                    addAddressSeed(srcNode, abstractMemoryObject(function.name, srcSlot));
+                                    markRelevant(srcNode);
+                                    addCopyEdge(srcNode, dstNode);
+                                    memTransferDstBySrcPtr[srcNode].push_back(dstNode);
+                                    memTransferSrcByDstPtr[dstNode].push_back(srcNode);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (!callSite.directCallee.empty())
+                {
+                    continue;
+                }
+
+                const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
+                const std::string calleeExprSlot = memorySlotFromExpression(callSite.calleeExpression);
+                if (!throughSlot.empty())
+                {
+                    for (const std::string &aliasSlot : expandMemorySlotAliases(throughSlot))
+                    {
+                        for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                        {
+                            markRelevant(probeNode);
+                        }
+                    }
+                }
+                if (!calleeExprSlot.empty())
+                {
+                    for (const std::string &aliasSlot : expandMemorySlotAliases(calleeExprSlot))
+                    {
+                        for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                        {
+                            markRelevant(probeNode);
+                        }
+                    }
+                }
+            }
+        }
+        saturateRelevantNodes();
+
+        for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : pointsTo)
+        {
+            const bool hasDeferredEffects =
+                loadsByPointer.find(entry.first) != loadsByPointer.end() ||
+                storesByPointer.find(entry.first) != storesByPointer.end() ||
+                storeSeedTargetsByPointer.find(entry.first) != storeSeedTargetsByPointer.end() ||
+                memTransferDstBySrcPtr.find(entry.first) != memTransferDstBySrcPtr.end() ||
+                memTransferSrcByDstPtr.find(entry.first) != memTransferSrcByDstPtr.end();
+            if (relevantNodes.find(entry.first) == relevantNodes.end() && !hasDeferredEffects)
+            {
+                continue;
+            }
+            if (inWorklist.insert(entry.first).second)
+            {
+                worklist.push_back(entry.first);
+            }
+        }
+
+        std::function<void(const std::string &, const std::string &)> materializeDynamicCopy =
+            [&](const std::string &src, const std::string &dst)
+        {
+            if (!addSparseValueFlowEdge(src, dst))
+            {
+                return;
+            }
+
+            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcIt = pointsTo.find(src);
+            if (srcIt == pointsTo.end())
+            {
+                return;
+            }
+
+            for (const std::string &target : srcIt->second)
+            {
+                addPointsTo(dst, target);
+            }
+        };
+
+        while (!worklist.empty())
+        {
+            const std::string node = worklist.front();
+            worklist.pop_front();
+            inWorklist.erase(node);
+
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator svfgSuccIt = sparseValueFlowSucc.find(node);
+            if (svfgSuccIt != sparseValueFlowSucc.end())
+            {
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt = pointsTo.find(node);
+                if (srcTargetsIt != pointsTo.end())
+                {
+                    for (const std::string &dst : svfgSuccIt->second)
+                    {
+                        for (const std::string &target : srcTargetsIt->second)
+                        {
+                            addPointsTo(dst, target);
+                        }
+                    }
+                }
+            }
+
+            const std::unordered_map<std::string, std::vector<DeferredLoadConstraint>>::const_iterator loadIt =
+                loadsByPointer.find(node);
+            if (loadIt != loadsByPointer.end())
+            {
+                for (const DeferredLoadConstraint &loadConstraint : loadIt->second)
+                {
+                    const std::unordered_set<std::string> loadedObjects =
+                        resolveDereferencedObjects(node, loadConstraint.dereferenceDepth);
+                    for (const std::string &objectNode : loadedObjects)
+                    {
+                        materializeDynamicCopy(objectNode, loadConstraint.dstNode);
+                    }
+                }
+            }
+
+            const std::unordered_map<std::string, std::vector<DeferredStoreConstraint>>::const_iterator storeIt =
+                storesByPointer.find(node);
+            if (storeIt != storesByPointer.end())
+            {
+                for (const DeferredStoreConstraint &storeConstraint : storeIt->second)
+                {
+                    const std::unordered_set<std::string> storedObjects =
+                        resolveDereferencedObjects(node, storeConstraint.dereferenceDepth);
+                    for (const std::string &objectNode : storedObjects)
+                    {
+                        materializeDynamicCopy(storeConstraint.srcNode, objectNode);
+                    }
+                }
+            }
+
+            const std::unordered_map<std::string, std::vector<DeferredStoreSeed>>::const_iterator storeSeedIt =
+                storeSeedTargetsByPointer.find(node);
+            if (storeSeedIt != storeSeedTargetsByPointer.end())
+            {
+                for (const DeferredStoreSeed &storeSeed : storeSeedIt->second)
+                {
+                    const std::unordered_set<std::string> storedObjects =
+                        resolveDereferencedObjects(node, storeSeed.dereferenceDepth);
+                    for (const std::string &objectNode : storedObjects)
+                    {
+                        addPointsTo(objectNode, storeSeed.target);
+                    }
+                }
+            }
+
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memDstIt =
+                memTransferDstBySrcPtr.find(node);
+            if (memDstIt != memTransferDstBySrcPtr.end())
+            {
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
+                    pointsTo.find(node);
+                if (srcTargetsIt != pointsTo.end())
+                {
+                    for (const std::string &dstPtrNode : memDstIt->second)
+                    {
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
+                            pointsTo.find(dstPtrNode);
+                        if (dstTargetsIt == pointsTo.end())
+                        {
+                            continue;
+                        }
+
+                        for (const std::string &srcObj : srcTargetsIt->second)
+                        {
+                            for (const std::string &dstObj : dstTargetsIt->second)
+                            {
+                                materializeDynamicCopy(srcObj, dstObj);
+                            }
+                        }
+                    }
+                }
+            }
+
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memSrcIt =
+                memTransferSrcByDstPtr.find(node);
+            if (memSrcIt != memTransferSrcByDstPtr.end())
+            {
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
+                    pointsTo.find(node);
+                if (dstTargetsIt != pointsTo.end())
+                {
+                    for (const std::string &srcPtrNode : memSrcIt->second)
+                    {
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
+                            pointsTo.find(srcPtrNode);
+                        if (srcTargetsIt == pointsTo.end())
+                        {
+                            continue;
+                        }
+
+                        for (const std::string &srcObj : srcTargetsIt->second)
+                        {
+                            for (const std::string &dstObj : dstTargetsIt->second)
+                            {
+                                materializeDynamicCopy(srcObj, dstObj);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (!callSite.directCallee.empty())
+                {
+                    if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
+                    {
+                        continue;
+                    }
+
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = callSite.directCallee;
+                    edge.kind = "direct";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(std::move(edge));
+                    continue;
+                }
+
+                std::set<std::string> resolvedTargets;
+                const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
+                const std::string calleeExprSlot = memorySlotFromExpression(callSite.calleeExpression);
+
+                std::vector<std::string> probeNodes;
+                std::unordered_set<std::string> seenProbeNodes;
+                if (!throughSlot.empty())
+                {
+                    for (const std::string &aliasSlot : expandMemorySlotAliases(throughSlot))
+                    {
+                        for (const std::string &probe : collectCandidateMemoryNodes(function.name, aliasSlot))
+                        {
+                            if (!probe.empty() && seenProbeNodes.insert(probe).second)
+                            {
+                                probeNodes.push_back(probe);
+                            }
+                        }
+                    }
+                }
+                if (!calleeExprSlot.empty())
+                {
+                    for (const std::string &aliasSlot : expandMemorySlotAliases(calleeExprSlot))
+                    {
+                        for (const std::string &probe : collectCandidateMemoryNodes(function.name, aliasSlot))
+                        {
+                            if (!probe.empty() && seenProbeNodes.insert(probe).second)
+                            {
+                                probeNodes.push_back(probe);
+                            }
+                        }
+                    }
+                }
+
+                for (const std::string &probeNode : probeNodes)
+                {
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt = pointsTo.find(probeNode);
+                    if (ptIt == pointsTo.end())
+                    {
+                        continue;
+                    }
+
+                    const std::set<std::string> probeTargets = resolveFunctionTargetsTransitively(ptIt->second);
+                    resolvedTargets.insert(probeTargets.begin(), probeTargets.end());
+                }
+
+                if (resolvedTargets.empty())
+                {
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = "__unknown_indirect_target__";
+                    edge.kind = "indirect-unknown";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(edge);
+
+                    CallEdge unresolvedEdge = edge;
+                    unresolvedEdge.callee.clear();
+                    unresolvedIndirect.push_back(std::move(unresolvedEdge));
+                    logUnresolvedCall(unresolvedIndirect.back());
+                    continue;
+                }
+
+                for (const std::string &callee : resolvedTargets)
+                {
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = callee;
+                    edge.kind = "indirect";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(std::move(edge));
+                }
+            }
+        }
+    }
+
+    /**
      * @brief Run flow-sensitive and context-sensitive callgraph resolution.
      */
     void runContextSensitiveAnalysis(
         const std::vector<FunctionFacts> &functions,
         const std::set<std::string> &knownFunctions,
         const std::set<std::string> &blacklistedFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &wrapperDispatchTargets,
         std::vector<CallEdge> &resolvedEdges,
         std::vector<CallEdge> &unresolvedIndirect)
     {
-        std::unordered_map<std::string, const FunctionFacts *> functionMap;
-        std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
-        std::unordered_map<std::string, std::set<std::string>> pointerSlotsByFunction;
-        const std::unordered_map<std::string, std::set<std::string>> programWidePointerTargets =
-            collectProgramWidePointerTargets(functions, knownFunctions);
-        const std::vector<StructMemberMapping> programWideStructMemberMappings =
-            collectProgramWideStructMemberMappings(functions, knownFunctions);
-        const std::unordered_map<std::string, std::set<std::string>> returnTargetsByFunction =
-            collectReturnTargetsByFunction(functions, knownFunctions);
-        const std::unordered_map<std::string, std::vector<StructMemberMapping>> returnedStructMemberMappingsByFunction =
-            collectReturnedStructMemberMappingsByFunction(functions, knownFunctions);
-        const std::unordered_map<std::string, std::set<std::string>> memcpySummaryTargetsByDstSlot =
-            collectMemcpyCopySummaryTargets(functions, knownFunctions);
-        // Precompute per-function metadata used during traversal.
-        for (const FunctionFacts &function : functions)
-        {
-            functionMap[function.name] = &function;
-            parameterSlotsByFunction[function.name] = collectParameterSlots(function, knownFunctions);
-            pointerSlotsByFunction[function.name] = collectPointerSlots(function);
-        }
-
-        std::deque<ContextJob> worklist;
-        std::unordered_set<std::string> seenContexts;
-
-        // Start from every discovered function so snippets without main are covered.
-        for (const std::pair<const std::string, const FunctionFacts *> &entry : functionMap)
-        {
-            worklist.push_back(ContextJob{entry.first, {}, {}});
-            seenContexts.insert(buildContextKey(entry.first, {}) + "|sm:");
-        }
-
-        while (!worklist.empty())
-        {
-            ContextJob job = std::move(worklist.front());
-            worklist.pop_front();
-
-            logFunctionProcessed(job.functionName, job.seededPointsTo);
-
-            const std::unordered_map<std::string, const FunctionFacts *>::const_iterator functionIt = functionMap.find(job.functionName);
-            // Skip stale jobs if the function cannot be found.
-            if (functionIt == functionMap.end())
-            {
-                continue;
-            }
-
-            const FunctionFacts &function = *functionIt->second;
-
-            const std::vector<FunctionFacts::BlockFact>::const_iterator blockIt = std::find_if(function.blocks.begin(), function.blocks.end(), [&](const FunctionFacts::BlockFact &block)
-                                                                                               { return block.id == function.entryBlockId; });
-            // Without a valid entry block we cannot evaluate this function.
-            if (blockIt == function.blocks.end())
-            {
-                continue;
-            }
-
-            std::unordered_map<std::uint32_t, const FunctionFacts::BlockFact *> blockMap;
-            for (const FunctionFacts::BlockFact &block : function.blocks)
-            {
-                blockMap[block.id] = &block;
-            }
-
-            const std::set<std::string> pointerSlots = pointerSlotsByFunction[function.name];
-            const std::vector<std::string> &parameterSlots = parameterSlotsByFunction[function.name];
-
-            std::vector<StructMemberMapping> activeStructMemberMappings = function.structMemberMappings;
-            activeStructMemberMappings.insert(
-                activeStructMemberMappings.end(),
-                job.seededStructMemberMappings.begin(),
-                job.seededStructMemberMappings.end());
-            activeStructMemberMappings.insert(
-                activeStructMemberMappings.end(),
-                programWideStructMemberMappings.begin(),
-                programWideStructMemberMappings.end());
-            std::unordered_set<std::string> seenStructMemberMappings;
-            for (const StructMemberMapping &mapping : activeStructMemberMappings)
-            {
-                seenStructMemberMappings.insert(makeStructMemberMappingKey(mapping));
-            }
-
-            std::function<void(std::vector<StructMemberMapping> &,
-                               std::unordered_set<std::string> &,
-                               const std::string &,
-                               const std::vector<StructMemberMapping> &)>
-                appendStructMemberMappings = [&](std::vector<StructMemberMapping> &structMemberMappings,
-                                                 std::unordered_set<std::string> &seenMappings,
-                                                 const std::string &structVariable,
-                                                 const std::vector<StructMemberMapping> &sourceMappings)
-            {
-                for (const StructMemberMapping &mapping : sourceMappings)
-                {
-                    StructMemberMapping propagated = mapping;
-                    propagated.structVariable = structVariable;
-                    const std::string key = makeStructMemberMappingKey(propagated);
-                    if (seenMappings.insert(key).second)
-                    {
-                        structMemberMappings.push_back(std::move(propagated));
-                    }
-                }
-            };
-
-            std::function<std::unordered_set<std::string>(const std::string &, const PointsToMap &)> collectOverwriteSlots =
-                [&](const std::string &slot, const PointsToMap &currentBindings)
-            {
-                std::unordered_set<std::string> overwriteSlots;
-                overwriteSlots.insert(slot);
-
-                const PointsToMap::const_iterator slotIt = currentBindings.find(slot);
-                if (slotIt == currentBindings.end())
-                {
-                    return overwriteSlots;
-                }
-
-                for (const std::pair<const std::string, std::set<std::string>> &entry : currentBindings)
-                {
-                    if (entry.first == slot)
-                    {
-                        continue;
-                    }
-
-                    bool sharesPointee = false;
-                    for (const std::string &value : entry.second)
-                    {
-                        if (slotIt->second.find(value) != slotIt->second.end())
-                        {
-                            sharesPointee = true;
-                            break;
-                        }
-                    }
-
-                    if (sharesPointee)
-                    {
-                        overwriteSlots.insert(entry.first);
-                    }
-                }
-
-                return overwriteSlots;
-            };
-
-            std::function<std::string(std::string)> normalizeStructAccess = [&](std::string text)
-            {
-                for (std::size_t pos = text.find("->"); pos != std::string::npos; pos = text.find("->", pos + 1U))
-                {
-                    text.replace(pos, 2U, ".");
-                }
-
-                std::string stripped;
-                stripped.reserve(text.size());
-                int bracketDepth = 0;
-                for (char ch : text)
-                {
-                    if (ch == '[')
-                    {
-                        ++bracketDepth;
-                        continue;
-                    }
-                    if (ch == ']')
-                    {
-                        if (bracketDepth > 0)
-                        {
-                            --bracketDepth;
-                        }
-                        continue;
-                    }
-                    if (bracketDepth == 0)
-                    {
-                        stripped.push_back(ch);
-                    }
-                }
-
-                return stripped;
-            };
-
-            std::function<std::pair<std::string, std::string>(const std::string &)> parseStructAccess =
-                [&](const std::string &expression) -> std::pair<std::string, std::string>
-            {
-                const std::string normalized = trimLine(normalizeStructAccess(expression));
-                const std::size_t dotIndex = normalized.find('.');
-                if (dotIndex == std::string::npos || dotIndex == 0U)
-                {
-                    return {"", ""};
-                }
-
-                return {normalized.substr(0, dotIndex), normalized.substr(dotIndex + 1U)};
-            };
-
-            std::function<void(std::vector<StructMemberMapping> &,
-                               std::unordered_set<std::string> &,
-                               const std::string &,
-                               const PointsToMap &)>
-                pruneOverwrittenStructMemberMappings = [&](std::vector<StructMemberMapping> &structMemberMappings,
-                                                           std::unordered_set<std::string> &seenMappings,
-                                                           const std::string &lhsExpression,
-                                                           const PointsToMap &currentBindings)
-            {
-                const std::pair<std::string, std::string> lhsAccess = parseStructAccess(lhsExpression);
-                if (lhsAccess.first.empty() || lhsAccess.second.empty())
-                {
-                    return;
-                }
-
-                std::string memberPrefix = lhsAccess.second;
-                const std::size_t prefixDot = memberPrefix.rfind('.');
-                if (prefixDot != std::string::npos)
-                {
-                    memberPrefix = memberPrefix.substr(0, prefixDot + 1U);
-                }
-
-                const std::unordered_set<std::string> overwriteSlots = collectOverwriteSlots(lhsAccess.first, currentBindings);
-                for (std::vector<StructMemberMapping>::iterator it = structMemberMappings.begin(); it != structMemberMappings.end();)
-                {
-                    const bool slotMatches = overwriteSlots.find(it->structVariable) != overwriteSlots.end();
-                    const bool memberMatches =
-                        (prefixDot == std::string::npos) ? (it->memberName == lhsAccess.second) : (it->memberName.rfind(memberPrefix, 0U) == 0U);
-                    if (slotMatches && memberMatches)
-                    {
-                        seenMappings.erase(makeStructMemberMappingKey(*it));
-                        it = structMemberMappings.erase(it);
-                        continue;
-                    }
-
-                    ++it;
-                }
-            };
-
-            std::function<void(std::vector<StructMemberMapping> &,
-                               std::unordered_set<std::string> &,
-                               const std::string &,
-                               const std::string &,
-                               const PointsToMap &)>
-                pruneOverwrittenStructMemberGroup = [&](std::vector<StructMemberMapping> &structMemberMappings,
-                                                        std::unordered_set<std::string> &seenMappings,
-                                                        const std::string &structSlot,
-                                                        const std::string &memberName,
-                                                        const PointsToMap &currentBindings)
-            {
-                std::string memberPrefix = memberName;
-                const std::size_t prefixDot = memberPrefix.rfind('.');
-                if (prefixDot != std::string::npos)
-                {
-                    memberPrefix = memberPrefix.substr(0, prefixDot + 1U);
-                }
-
-                const std::unordered_set<std::string> overwriteSlots = collectOverwriteSlots(structSlot, currentBindings);
-                for (std::vector<StructMemberMapping>::iterator it = structMemberMappings.begin(); it != structMemberMappings.end();)
-                {
-                    const bool slotMatches = overwriteSlots.find(it->structVariable) != overwriteSlots.end();
-                    const bool memberMatches =
-                        (prefixDot == std::string::npos) ? (it->memberName == memberName) : (it->memberName.rfind(memberPrefix, 0U) == 0U);
-                    if (slotMatches && memberMatches)
-                    {
-                        seenMappings.erase(makeStructMemberMappingKey(*it));
-                        it = structMemberMappings.erase(it);
-                        continue;
-                    }
-                    ++it;
-                }
-            };
-
-            std::function<void(const CallSite &,
-                               const std::string &,
-                               const PointsToMap &,
-                               std::vector<StructMemberMapping> &,
-                               std::unordered_set<std::string> &)>
-                propagateCalleeStructMemberMappings = [&](const CallSite &callSite,
-                                                          const std::string &calleeName,
-                                                          const PointsToMap &currentBindings,
-                                                          std::vector<StructMemberMapping> &structMemberMappings,
-                                                          std::unordered_set<std::string> &seenMappings)
-            {
-                const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt = functionMap.find(calleeName);
-                if (calleeIt == functionMap.end())
-                {
-                    return;
-                }
-
-                const std::vector<std::string> &calleeParameters = parameterSlotsByFunction[calleeName];
-                const std::set<std::string> &calleePointerSlots = pointerSlotsByFunction[calleeName];
-                const std::size_t limit = std::min(calleeParameters.size(), callSite.argumentExpressions.size());
-
-                std::unordered_map<std::string, std::string> parameterToArgumentSlot;
-                for (std::size_t index = 0; index < limit; ++index)
-                {
-                    const std::string &parameter = calleeParameters[index];
-                    const std::string &argumentExpression = callSite.argumentExpressions[index];
-                    const std::string argumentSlot = canonicalSlot(argumentExpression);
-                    if (argumentSlot.empty())
-                    {
-                        continue;
-                    }
-
-                    if (argumentExpression.find('&') != std::string::npos ||
-                        calleePointerSlots.find(parameter) != calleePointerSlots.end())
-                    {
-                        parameterToArgumentSlot[parameter] = argumentSlot;
-                    }
-                }
-
-                if (parameterToArgumentSlot.empty())
-                {
-                    std::vector<std::string> argumentSlots;
-                    for (const std::string &argumentExpression : callSite.argumentExpressions)
-                    {
-                        if (argumentExpression.find('&') == std::string::npos)
-                        {
-                            continue;
-                        }
-
-                        const std::string slot = canonicalSlot(argumentExpression);
-                        if (!slot.empty())
-                        {
-                            argumentSlots.push_back(slot);
-                        }
-                    }
-
-                    std::vector<std::string> mappingVariables;
-                    std::unordered_set<std::string> seenMappingVariables;
-                    for (const StructMemberMapping &mapping : calleeIt->second->structMemberMappings)
-                    {
-                        if (seenMappingVariables.insert(mapping.structVariable).second)
-                        {
-                            mappingVariables.push_back(mapping.structVariable);
-                        }
-                    }
-
-                    const std::size_t fallbackLimit = std::min(mappingVariables.size(), argumentSlots.size());
-                    for (std::size_t i = 0; i < fallbackLimit; ++i)
-                    {
-                        parameterToArgumentSlot[mappingVariables[i]] = argumentSlots[i];
-                    }
-                }
-
-                if (parameterToArgumentSlot.empty())
-                {
-                    return;
-                }
-
-                std::unordered_set<std::string> prunedGroups;
-
-                std::unordered_map<std::string, std::uint64_t> latestStampByLocalGroup;
-                for (const StructMemberMapping &mapping : calleeIt->second->structMemberMappings)
-                {
-                    const std::size_t groupDot = mapping.memberName.rfind('.');
-                    const std::string group = groupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, groupDot + 1U);
-                    const std::string localGroupKey = mapping.structVariable + "#" + group;
-                    const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
-                                                static_cast<std::uint64_t>(mapping.location.column);
-                    const std::unordered_map<std::string, std::uint64_t>::const_iterator it = latestStampByLocalGroup.find(localGroupKey);
-                    if (it == latestStampByLocalGroup.end() || stamp >= it->second)
-                    {
-                        latestStampByLocalGroup[localGroupKey] = stamp;
-                    }
-                }
-
-                for (const StructMemberMapping &mapping : calleeIt->second->structMemberMappings)
-                {
-                    const std::unordered_map<std::string, std::string>::const_iterator targetIt = parameterToArgumentSlot.find(mapping.structVariable);
-                    if (targetIt == parameterToArgumentSlot.end())
-                    {
-                        continue;
-                    }
-
-                    const std::size_t localGroupDot = mapping.memberName.rfind('.');
-                    const std::string localGroup = localGroupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, localGroupDot + 1U);
-                    const std::string localGroupKey = mapping.structVariable + "#" + localGroup;
-                    const std::uint64_t stamp = (static_cast<std::uint64_t>(mapping.location.line) << 32U) |
-                                                static_cast<std::uint64_t>(mapping.location.column);
-                    const std::unordered_map<std::string, std::uint64_t>::const_iterator latestIt = latestStampByLocalGroup.find(localGroupKey);
-                    if (latestIt != latestStampByLocalGroup.end() && stamp != latestIt->second)
-                    {
-                        continue;
-                    }
-
-                    const std::size_t groupDot = mapping.memberName.rfind('.');
-                    const std::string group = groupDot == std::string::npos ? mapping.memberName : mapping.memberName.substr(0, groupDot + 1U);
-                    const std::string pruneKey = targetIt->second + "#" + group;
-                    if (prunedGroups.insert(pruneKey).second)
-                    {
-                        pruneOverwrittenStructMemberGroup(structMemberMappings, seenMappings, targetIt->second, mapping.memberName, currentBindings);
-                    }
-
-                    StructMemberMapping propagated = mapping;
-                    propagated.structVariable = targetIt->second;
-                    propagated.location = callSite.location;
-
-                    const std::string key = makeStructMemberMappingKey(propagated);
-                    if (seenMappings.insert(key).second)
-                    {
-                        structMemberMappings.push_back(std::move(propagated));
-                    }
-                }
-            };
-
-            struct BlockState
-            {
-                std::uint32_t blockId = 0;
-                PointsToMap bindings;
-                std::vector<StructMemberMapping> structMemberMappings;
-            };
-
-            std::deque<BlockState> blockWorklist;
-            std::unordered_set<std::string> seenBlockStates;
-            PointsToMap initialBindings = std::move(job.seededPointsTo);
-            blockWorklist.push_back(BlockState{function.entryBlockId, std::move(initialBindings), activeStructMemberMappings});
-
-            std::function<std::string(std::uint32_t, const PointsToMap &, const std::vector<StructMemberMapping> &)> makeStateKey =
-                [&](std::uint32_t blockId, const PointsToMap &bindings, const std::vector<StructMemberMapping> &structMemberMappings)
-            {
-                return std::to_string(blockId) + "|" + buildContextKey(function.name, bindings) + "|" + buildStructMemberMappingsKey(structMemberMappings);
-            };
-
-            // Enqueue a callee analysis context seeded from this callsite.
-            std::function<void(const CallSite &, const PointsToMap &, const std::string &)> enqueueCallee =
-                [&](const CallSite &callSite, const PointsToMap &callerBindings, const std::string &calleeName)
-            {
-                const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt = functionMap.find(calleeName);
-                if (calleeIt == functionMap.end())
-                {
-                    return;
-                }
-
-                const std::vector<std::string> &calleeParameters = parameterSlotsByFunction[calleeName];
-                const std::set<std::string> &calleePointerSlots = pointerSlotsByFunction[calleeName];
-                PointsToMap seeds;
-                if (!calleeParameters.empty())
-                {
-                    seeds = buildSeedBindings(callSite, calleeParameters, calleePointerSlots, callerBindings, knownFunctions);
-                }
-
-                std::vector<StructMemberMapping> seededStructMappings;
-                std::unordered_set<std::string> seenSeedMappings;
-                const std::size_t limit = std::min(calleeParameters.size(), callSite.argumentExpressions.size());
-                for (std::size_t index = 0; index < limit; ++index)
-                {
-                    const std::string &parameter = calleeParameters[index];
-                    if (parameter.empty())
-                    {
-                        continue;
-                    }
-
-                    const std::string argumentSlot = canonicalSlot(callSite.argumentExpressions[index]);
-                    if (argumentSlot.empty())
-                    {
-                        continue;
-                    }
-
-                    std::set<std::string> candidateBases{argumentSlot};
-                    const PointsToMap::const_iterator bindingIt = callerBindings.find(argumentSlot);
-                    if (bindingIt != callerBindings.end())
-                    {
-                        candidateBases.insert(bindingIt->second.begin(), bindingIt->second.end());
-                    }
-
-                    for (const StructMemberMapping &mapping : activeStructMemberMappings)
-                    {
-                        if (candidateBases.find(mapping.structVariable) == candidateBases.end())
-                        {
-                            continue;
-                        }
-
-                        StructMemberMapping propagated = mapping;
-                        propagated.structVariable = parameter;
-                        propagated.location = callSite.location;
-
-                        const std::string memberSlot = propagated.structVariable + "." + propagated.memberName;
-                        if (!memberSlot.empty() && knownFunctions.find(propagated.functionName) != knownFunctions.end())
-                        {
-                            seeds[memberSlot].insert(propagated.functionName);
-                        }
-
-                        const std::string key = makeStructMemberMappingKey(propagated);
-                        if (seenSeedMappings.insert(key).second)
-                        {
-                            seededStructMappings.push_back(std::move(propagated));
-                        }
-                    }
-                }
-
-                const std::string key = buildContextKey(calleeName, seeds) + "|sm:" + buildStructMemberMappingsKey(seededStructMappings);
-                if (seenContexts.insert(key).second)
-                {
-                    worklist.push_back(ContextJob{calleeName, std::move(seeds), std::move(seededStructMappings)});
-                }
-            };
-
-            // Match a serialized block line to a parsed callsite record.
-            std::function<bool(const std::string &, const CallSite &)> lineMatchesCallSite =
-                [&](const std::string &line, const CallSite &callSite)
-            {
-                const std::string trimmedLine = trimLine(line);
-                if (trimmedLine.find('(') == std::string::npos)
-                {
-                    return false;
-                }
-
-                if (!callSite.directCallee.empty())
-                {
-                    return trimmedLine.find(callSite.directCallee + "(") != std::string::npos;
-                }
-
-                if (!callSite.throughIdentifier.empty())
-                {
-                    return trimmedLine.find(callSite.throughIdentifier + "(") != std::string::npos;
-                }
-
-                if (trimmedLine.find(callSite.calleeExpression + "(") != std::string::npos)
-                {
-                    return true;
-                }
-
-                if (callSite.calleeExpression.find('?') != std::string::npos)
-                {
-                    const std::size_t dotPos = callSite.calleeExpression.rfind('.');
-                    const std::size_t arrowPos = callSite.calleeExpression.rfind("->");
-                    if (dotPos != std::string::npos)
-                    {
-                        const std::string member = callSite.calleeExpression.substr(dotPos + 1U);
-                        if (!member.empty() &&
-                            (trimmedLine.find("." + member + "(") != std::string::npos ||
-                             trimmedLine.find("->" + member + "(") != std::string::npos))
-                        {
-                            return true;
-                        }
-                    }
-                    if (arrowPos != std::string::npos)
-                    {
-                        const std::string member = callSite.calleeExpression.substr(arrowPos + 2U);
-                        if (!member.empty() &&
-                            (trimmedLine.find("." + member + "(") != std::string::npos ||
-                             trimmedLine.find("->" + member + "(") != std::string::npos))
-                        {
-                            return true;
-                        }
-                    }
-                }
-
-                return false;
-            };
-
-            std::vector<const CallSite *> orderedCallSites;
-            orderedCallSites.reserve(function.callSites.size());
-            std::unordered_map<std::string, const CallSite *> callSiteById;
-            for (const CallSite &callSite : function.callSites)
-            {
-                orderedCallSites.push_back(&callSite);
-                if (!callSite.callSiteId.empty())
-                {
-                    callSiteById[callSite.callSiteId] = &callSite;
-                }
-            }
-            std::sort(orderedCallSites.begin(), orderedCallSites.end(), [](const CallSite *lhs, const CallSite *rhs)
-                      {
-                if (lhs->location.line != rhs->location.line)
-                {
-                    return lhs->location.line < rhs->location.line;
-                }
-                if (lhs->location.column != rhs->location.column)
-                {
-                    return lhs->location.column < rhs->location.column;
-                }
-                return lhs->callSiteId < rhs->callSiteId; });
-
-            std::function<std::string(const CallSite &)> makeCallSiteMatchKey = [](const CallSite &callSite)
-            {
-                if (!callSite.callSiteId.empty())
-                {
-                    return callSite.callSiteId;
-                }
-
-                return callSite.calleeExpression + "#" + callSite.directCallee + "#" +
-                       std::to_string(callSite.location.line) + ":" + std::to_string(callSite.location.column);
-            };
-
-            // Lightweight evaluator retained for diagnostics and future branch pruning.
-            std::function<std::optional<long long>(const std::string &, const PointsToMap &)> evaluateCondition =
-                [&](const std::string &expression, const PointsToMap &bindings) -> std::optional<long long>
-            {
-                const std::string trimmed = trimLine(expression);
-                long long literal = 0;
-                if (isIntegerLiteral(trimmed, literal))
-                {
-                    return literal;
-                }
-
-                const std::string slot = canonicalSlot(trimmed);
-                if (!slot.empty())
-                {
-                    const PointsToMap::const_iterator it = bindings.find(slot);
-                    if (it != bindings.end())
-                    {
-                        for (const std::string &value : it->second)
-                        {
-                            const std::optional<long long> parsed = parseIntegerBinding(value);
-                            if (parsed.has_value())
-                            {
-                                return *parsed;
-                            }
-                        }
-                    }
-                }
-
-                const std::size_t eqIndex = trimmed.find("==");
-                const std::size_t neIndex = trimmed.find("!=");
-                const std::size_t leIndex = trimmed.find("<=");
-                const std::size_t geIndex = trimmed.find(">=");
-                if (eqIndex != std::string::npos || neIndex != std::string::npos ||
-                    leIndex != std::string::npos || geIndex != std::string::npos)
-                {
-                    const std::size_t opIndex = eqIndex != std::string::npos ? eqIndex : (neIndex != std::string::npos ? neIndex : (leIndex != std::string::npos ? leIndex : geIndex));
-                    const std::string lhs = trimLine(trimmed.substr(0, opIndex));
-                    const std::string rhs = trimLine(trimmed.substr(opIndex + 2U));
-                    const std::optional<long long> lhsValue = evaluateCondition(lhs, bindings);
-                    const std::optional<long long> rhsValue = evaluateCondition(rhs, bindings);
-                    if (!lhsValue.has_value() || !rhsValue.has_value())
-                    {
-                        return std::nullopt;
-                    }
-
-                    if (eqIndex != std::string::npos)
-                    {
-                        return *lhsValue == *rhsValue ? 1LL : 0LL;
-                    }
-                    if (neIndex != std::string::npos)
-                    {
-                        return *lhsValue != *rhsValue ? 1LL : 0LL;
-                    }
-                    if (leIndex != std::string::npos)
-                    {
-                        return *lhsValue <= *rhsValue ? 1LL : 0LL;
-                    }
-                    return *lhsValue >= *rhsValue ? 1LL : 0LL;
-                }
-
-                const std::size_t modIndex = trimmed.find('%');
-                if (modIndex != std::string::npos)
-                {
-                    const std::string lhs = trimLine(trimmed.substr(0, modIndex));
-                    const std::string rhs = trimLine(trimmed.substr(modIndex + 1U));
-                    const std::optional<long long> lhsValue = evaluateCondition(lhs, bindings);
-                    const std::optional<long long> rhsValue = evaluateCondition(rhs, bindings);
-                    if (!lhsValue.has_value() || !rhsValue.has_value() || *rhsValue == 0)
-                    {
-                        return std::nullopt;
-                    }
-                    return *lhsValue % *rhsValue;
-                }
-
-                return std::nullopt;
-            };
-
-            while (!blockWorklist.empty())
-            {
-                BlockState state = std::move(blockWorklist.front());
-                blockWorklist.pop_front();
-
-                const std::unordered_map<std::uint32_t, const FunctionFacts::BlockFact *>::const_iterator currentBlockIt = blockMap.find(state.blockId);
-                // Ignore invalid CFG successor IDs.
-                if (currentBlockIt == blockMap.end())
-                {
-                    continue;
-                }
-
-                const FunctionFacts::BlockFact &block = *currentBlockIt->second;
-                const std::string stateKey = makeStateKey(block.id, state.bindings, state.structMemberMappings);
-                // Worklist dedup per (block, bindings) state prevents infinite loops.
-                if (!seenBlockStates.insert(stateKey).second)
-                {
-                    continue;
-                }
-
-                PointsToMap bindings = std::move(state.bindings);
-                std::vector<StructMemberMapping> activeStructMemberMappings = std::move(state.structMemberMappings);
-                std::unordered_set<std::string> seenStructMemberMappings;
-                for (const StructMemberMapping &mapping : activeStructMemberMappings)
-                {
-                    seenStructMemberMappings.insert(makeStructMemberMappingKey(mapping));
-                }
-                std::unordered_set<std::string> consumedCallSites;
-
-                std::function<void(const CallSite &)> processMatchedCallSite = [&](const CallSite &callSite)
-                {
-                    std::function<void(const std::set<std::string> &, std::set<std::string> &)> appendKnownNonBlacklistedTargets =
-                        [&](const std::set<std::string> &candidateTargets,
-                            std::set<std::string> &targetsOut)
-                    {
-                        for (const std::string &target : candidateTargets)
-                        {
-                            if (knownFunctions.find(target) != knownFunctions.end() &&
-                                !isBlacklistedFunction(target, blacklistedFunctions))
-                            {
-                                targetsOut.insert(target);
-                            }
-                        }
-                    };
-
-                    std::function<void(const std::string &, std::set<std::string> &)> appendTransitiveProgramWideTargetsForSlot =
-                        [&](const std::string &slot,
-                            std::set<std::string> &targetsOut)
-                    {
-                        const std::unordered_map<std::string, std::set<std::string>>::const_iterator programWideIt =
-                            programWidePointerTargets.find(slot);
-                        if (programWideIt == programWidePointerTargets.end())
-                        {
-                            return;
-                        }
-
-                        const std::set<std::string> resolvedFallbackTargets =
-                            resolveTransitiveTargets(programWideIt->second, knownFunctions, programWidePointerTargets, false);
-                        appendKnownNonBlacklistedTargets(resolvedFallbackTargets, targetsOut);
-                    };
-
-                    std::function<void(const std::string &, std::set<std::string> &)> appendMemcpySummaryTargetsForSlot =
-                        [&](const std::string &slot,
-                            std::set<std::string> &targetsOut)
-                    {
-                        const std::unordered_map<std::string, std::set<std::string>>::const_iterator summaryIt =
-                            memcpySummaryTargetsByDstSlot.find(slot);
-                        if (summaryIt == memcpySummaryTargetsByDstSlot.end())
-                        {
-                            return;
-                        }
-
-                        appendKnownNonBlacklistedTargets(summaryIt->second, targetsOut);
-                    };
-
-                    std::function<void(const std::string &, std::set<std::string> &)> appendFallbackTargetsForSlot =
-                        [&](const std::string &slot,
-                            std::set<std::string> &targetsOut)
-                    {
-                        if (slot.empty())
-                        {
-                            return;
-                        }
-
-                        appendTransitiveProgramWideTargetsForSlot(slot, targetsOut);
-                        if (targetsOut.empty())
-                        {
-                            appendMemcpySummaryTargetsForSlot(slot, targetsOut);
-                        }
-                    };
-
-                    if (!callSite.directCallee.empty())
-                    {
-                        if (!isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
-                        {
-                            CallEdge edge;
-                            edge.caller = function.name;
-                            edge.callee = callSite.directCallee;
-                            edge.kind = "direct";
-                            edge.location = callSite.location;
-                            edge.calleeExpression = callSite.calleeExpression;
-                            edge.throughIdentifier = callSite.throughIdentifier;
-                            resolvedEdges.push_back(std::move(edge));
-
-                            enqueueCallee(callSite, bindings, callSite.directCallee);
-                        }
-                        propagateCalleeStructMemberMappings(callSite, callSite.directCallee, bindings, activeStructMemberMappings, seenStructMemberMappings);
-                        return;
-                    }
-
-                    const std::set<std::string> targets = resolveIndirectTargets(callSite, knownFunctions, bindings, activeStructMemberMappings);
-                    std::set<std::string> filteredTargets;
-                    for (const std::string &target : targets)
-                    {
-                        if (knownFunctions.find(target) != knownFunctions.end() &&
-                            !isBlacklistedFunction(target, blacklistedFunctions))
-                        {
-                            filteredTargets.insert(target);
-                        }
-                    }
-
-                    if (filteredTargets.empty())
-                    {
-                        const std::unordered_map<std::string, std::set<std::string>>::const_iterator wrapperIt =
-                            wrapperDispatchTargets.find(function.name);
-                        if (wrapperIt != wrapperDispatchTargets.end())
-                        {
-                            for (const std::string &target : wrapperIt->second)
-                            {
-                                if (knownFunctions.find(target) != knownFunctions.end() &&
-                                    !isBlacklistedFunction(target, blacklistedFunctions))
-                                {
-                                    filteredTargets.insert(target);
-                                }
-                            }
-                        }
-                    }
-
-                    if (filteredTargets.empty())
-                    {
-                        appendFallbackTargetsForSlot(canonicalSlot(callSite.throughIdentifier), filteredTargets);
-                        if (filteredTargets.empty())
-                        {
-                            appendFallbackTargetsForSlot(canonicalSlot(callSite.calleeExpression), filteredTargets);
-                        }
-                    }
-
-                    if (filteredTargets.empty())
-                    {
-                        CallEdge edge;
-                        edge.caller = function.name;
-                        edge.kind = "indirect";
-                        edge.location = callSite.location;
-                        edge.calleeExpression = callSite.calleeExpression;
-                        edge.throughIdentifier = callSite.throughIdentifier;
-                        unresolvedIndirect.push_back(std::move(edge));
-                        logUnresolvedCall(unresolvedIndirect.back());
-                        return;
-                    }
-
-                    for (const std::string &callee : filteredTargets)
-                    {
-                        CallEdge edge;
-                        edge.caller = function.name;
-                        edge.callee = callee;
-                        edge.kind = "indirect";
-                        edge.location = callSite.location;
-                        edge.calleeExpression = callSite.calleeExpression;
-                        edge.throughIdentifier = callSite.throughIdentifier;
-                        resolvedEdges.push_back(std::move(edge));
-
-                        enqueueCallee(callSite, bindings, callee);
-                    }
-                };
-
-                for (std::size_t lineIndex = 0; lineIndex < block.lines.size(); ++lineIndex)
-                {
-                    const std::string &rawLine = block.lines[lineIndex];
-                    const std::string line = trimLine(rawLine);
-                    // Empty lines carry no transfer information.
-                    if (line.empty())
-                    {
-                        continue;
-                    }
-
-                    bool handledCallFromIds = false;
-                    std::vector<const CallSite *> matchedLineCallSites;
-                    if (lineIndex < block.lineCallSiteIds.size())
-                    {
-                        const std::vector<std::string> &lineCallSiteIds = block.lineCallSiteIds[lineIndex];
-                        for (const std::string &callSiteId : lineCallSiteIds)
-                        {
-                            const std::unordered_map<std::string, const CallSite *>::const_iterator it = callSiteById.find(callSiteId);
-                            if (it == callSiteById.end())
-                            {
-                                continue;
-                            }
-                            handledCallFromIds = true;
-                            consumedCallSites.insert(makeCallSiteMatchKey(*it->second));
-                            matchedLineCallSites.push_back(it->second);
-                        }
-                    }
-
-                    if (handledCallFromIds)
-                    {
-                        if (matchedLineCallSites.size() > 1U)
-                        {
-                            bool stabilized = false;
-                            while (!stabilized)
-                            {
-                                const std::size_t before = activeStructMemberMappings.size();
-                                for (const CallSite *callSite : matchedLineCallSites)
-                                {
-                                    if (callSite == nullptr || callSite->directCallee.empty())
-                                    {
-                                        continue;
-                                    }
-
-                                    propagateCalleeStructMemberMappings(
-                                        *callSite,
-                                        callSite->directCallee,
-                                        bindings,
-                                        activeStructMemberMappings,
-                                        seenStructMemberMappings);
-                                }
-
-                                stabilized = activeStructMemberMappings.size() == before;
-                            }
-                        }
-
-                        for (const CallSite *callSite : matchedLineCallSites)
-                        {
-                            if (callSite != nullptr)
-                            {
-                                processMatchedCallSite(*callSite);
-                            }
-                        }
-                    }
-
-                    // Legacy fallback for JSON produced before lineCallSiteIds existed.
-                    if (!handledCallFromIds && line.find('(') != std::string::npos)
-                    {
-                        for (const CallSite *candidate : orderedCallSites)
-                        {
-                            const std::string callSiteKey = makeCallSiteMatchKey(*candidate);
-                            if (consumedCallSites.find(callSiteKey) != consumedCallSites.end())
-                            {
-                                continue;
-                            }
-
-                            if (!lineMatchesCallSite(line, *candidate))
-                            {
-                                continue;
-                            }
-
-                            consumedCallSites.insert(callSiteKey);
-                            processMatchedCallSite(*candidate);
-                            break;
-                        }
-                    }
-
-                    const std::optional<std::pair<std::string, std::string>> memcpyArgs =
-                        parseMemcpyArgsFromLine(line);
-                    if (memcpyArgs.has_value())
-                    {
-                        const std::string dstSlot = canonicalSlot(memcpyArgs->first);
-                        const std::string srcSlot = canonicalSlot(memcpyArgs->second);
-                        if (!dstSlot.empty())
-                        {
-                            std::set<std::string> copiedValues;
-
-                            if (!srcSlot.empty())
-                            {
-                                const PointsToMap::const_iterator localIt = bindings.find(srcSlot);
-                                if (localIt != bindings.end())
-                                {
-                                    copiedValues.insert(localIt->second.begin(), localIt->second.end());
-                                }
-
-                                const std::unordered_map<std::string, std::set<std::string>>::const_iterator globalIt =
-                                    programWidePointerTargets.find(srcSlot);
-                                if (globalIt != programWidePointerTargets.end())
-                                {
-                                    copiedValues.insert(globalIt->second.begin(), globalIt->second.end());
-                                }
-                            }
-
-                            const std::set<std::string> resolvedSourceValues =
-                                resolveMixedExpressionValues(memcpyArgs->second, knownFunctions, bindings);
-                            copiedValues.insert(resolvedSourceValues.begin(), resolvedSourceValues.end());
-
-                            std::set<std::string> &dstValues = bindings[dstSlot];
-                            dstValues.clear();
-                            for (const std::string &value : copiedValues)
-                            {
-                                if (!isIntegerBinding(value))
-                                {
-                                    dstValues.insert(value);
-                                }
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Filter out non-assignment lines and comparison operators.
-                    if (line.find('=') == std::string::npos || line.find("==") != std::string::npos ||
-                        line.find("!=") != std::string::npos || line.find("<=") != std::string::npos ||
-                        line.find(">=") != std::string::npos)
-                    {
-                        continue;
-                    }
-
-                    const std::size_t equalIndex = line.find('=');
-                    // Defensive guard for malformed assignment text.
-                    if (equalIndex == std::string::npos)
-                    {
-                        continue;
-                    }
-
-                    std::string lhs = trimLine(line.substr(0, equalIndex));
-                    std::string rhs = trimLine(line.substr(equalIndex + 1U));
-                    if (!rhs.empty() && rhs.back() == ';')
-                    {
-                        rhs.pop_back();
-                        rhs = trimLine(rhs);
-                    }
-
-                    const std::string lhsSlot = canonicalSlot(lhs);
-                    // Cannot update state when no LHS slot can be identified.
-                    if (lhsSlot.empty())
-                    {
-                        continue;
-                    }
-                    std::set<std::string> values = resolveMixedExpressionValues(rhs, knownFunctions, bindings, false);
-                    const std::set<std::string> rhsCallees =
-                        resolveCallCalleeTargets(rhs, knownFunctions, bindings);
-                    if (!rhsCallees.empty())
-                    {
-                        std::set<std::string> callReturns;
-                        for (const std::string &callee : rhsCallees)
-                        {
-                            const std::unordered_map<std::string, std::set<std::string>>::const_iterator returnIt =
-                                returnTargetsByFunction.find(callee);
-                            if (returnIt != returnTargetsByFunction.end())
-                            {
-                                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator parametersIt =
-                                    parameterSlotsByFunction.find(callee);
-                                const std::unordered_map<std::string, std::set<std::string>>::const_iterator pointerSlotsIt =
-                                    pointerSlotsByFunction.find(callee);
-                                const std::vector<std::string> emptyParameterSlots;
-                                const std::set<std::string> emptyPointerSlots;
-                                const std::vector<std::string> &calleeParameters =
-                                    parametersIt != parameterSlotsByFunction.end() ? parametersIt->second : emptyParameterSlots;
-                                const std::set<std::string> &calleePointerSlots =
-                                    pointerSlotsIt != pointerSlotsByFunction.end() ? pointerSlotsIt->second : emptyPointerSlots;
-
-                                const std::set<std::string> resolvedReturns = resolveCallReturnTargets(
-                                    rhs,
-                                    callee,
-                                    bindings,
-                                    programWidePointerTargets,
-                                    activeStructMemberMappings,
-                                    calleeParameters,
-                                    calleePointerSlots,
-                                    knownFunctions,
-                                    returnTargetsByFunction);
-                                callReturns.insert(resolvedReturns.begin(), resolvedReturns.end());
-                            }
-                        }
-
-                        if (!callReturns.empty())
-                        {
-                            values = std::move(callReturns);
-                        }
-
-                        for (const std::string &callee : rhsCallees)
-                        {
-                            const std::unordered_map<std::string, std::vector<StructMemberMapping>>::const_iterator structIt =
-                                returnedStructMemberMappingsByFunction.find(callee);
-                            if (structIt != returnedStructMemberMappingsByFunction.end())
-                            {
-                                pruneOverwrittenStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhs, bindings);
-                                appendStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhsSlot, structIt->second);
-                            }
-                        }
-                    }
-
-                    const std::string rhsSlot = canonicalSlot(rhs);
-                    if (!rhsSlot.empty())
-                    {
-                        const std::unordered_map<std::string, std::set<std::string>>::const_iterator globalTargetsIt =
-                            programWidePointerTargets.find(rhsSlot);
-                        if (globalTargetsIt != programWidePointerTargets.end())
-                        {
-                            values.insert(globalTargetsIt->second.begin(), globalTargetsIt->second.end());
-                        }
-                    }
-
-                    if (!rhsSlot.empty() && rhsSlot != lhsSlot)
-                    {
-                        std::vector<StructMemberMapping> copiedMappings;
-                        for (const StructMemberMapping &mapping : activeStructMemberMappings)
-                        {
-                            if (mapping.structVariable == rhsSlot)
-                            {
-                                copiedMappings.push_back(mapping);
-                            }
-                        }
-
-                        if (!copiedMappings.empty())
-                        {
-                            pruneOverwrittenStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhs, bindings);
-                            appendStructMemberMappings(activeStructMemberMappings, seenStructMemberMappings, lhsSlot, copiedMappings);
-                        }
-                    }
-                    // Ignore assignments that resolve to no usable values.
-                    if (values.empty())
-                    {
-                        continue;
-                    }
-
-                    const std::set<std::string> destinationSlots =
-                        resolveAssignmentDestinationSlots(lhs, knownFunctions, bindings);
-
-                    for (const std::string &destinationSlot : destinationSlots)
-                    {
-                        std::set<std::string> &slotValues = bindings[destinationSlot];
-                        // Strong update: overwrite the destination slot reached by this assignment.
-                        slotValues.clear();
-                        bool hasNonIntegerValue = false;
-                        for (const std::string &value : values)
-                        {
-                            if (!isIntegerBinding(value))
-                            {
-                                hasNonIntegerValue = true;
-                                break;
-                            }
-                        }
-
-                        const bool isPointerSlot =
-                            pointerSlots.find(destinationSlot) != pointerSlots.end() || hasNonIntegerValue;
-                        for (const std::string &value : values)
-                        {
-                            if (isPointerSlot)
-                            {
-                                if (!isIntegerBinding(value))
-                                {
-                                    slotValues.insert(value);
-                                }
-                            }
-                            else
-                            {
-                                if (isIntegerBinding(value))
-                                {
-                                    slotValues.insert(value);
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Propagate current state to all CFG successors.
-                for (std::uint32_t successor : block.successors)
-                {
-                    blockWorklist.push_back(BlockState{successor, bindings, activeStructMemberMappings});
-                }
-            }
-        }
+        runPagConstraintAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
     }
 
     /**
@@ -5056,15 +5550,10 @@ bool generateCallGraphFromAnalysisJson(
         return false;
     }
 
-    const std::unordered_map<std::string, ParameterDispatchInfo> dispatchFunctions =
-        detectParameterDispatchFunctions(functions);
-    const std::unordered_map<std::string, std::set<std::string>> wrapperDispatchTargets =
-        collectWrapperDispatchTargets(functions, knownFunctions, dispatchFunctions);
-
     std::vector<CallEdge> resolvedEdges;
     std::vector<CallEdge> unresolvedIndirect;
 
-    runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, wrapperDispatchTargets, resolvedEdges, unresolvedIndirect);
+    runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
 
     std::set<CollapsedEdge> collapsedEdges;
     for (const CallEdge &edge : resolvedEdges)
