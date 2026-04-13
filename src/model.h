@@ -66,6 +66,7 @@ struct SerializedBlock
 {
     std::uint32_t id = 0;
     std::vector<std::string> lines;
+    std::vector<std::vector<std::string>> lineCallSiteIds;
     std::vector<std::uint32_t> successors;
 };
 
@@ -75,6 +76,7 @@ struct SerializedBlock
 struct FunctionAttributes
 {
     bool callsStateChange = false;
+    std::vector<std::string> parameterNames;
     std::vector<CallSiteRecord> callSites;
     std::vector<PointerAssignmentRecord> pointerAssignments;
     std::vector<StructMemberMapping> structMemberMappings;

@@ -1,4 +1,5 @@
 build-linux
 out
 docs
+tests
 *.txt

@@ -13,6 +13,7 @@ The recommended entry point is `manage.sh`.
 
 - `cfg_generator`: creates analysis JSON from source inputs.
 - `callgraph_generator`: builds collapsed/context callgraph JSON (and optional DOT) from analysis JSON.
+- `runtime_callgraph_generator`: reconstructs execution-time callgraph from runtime logs using entry/exit markers and static callgraph constraints.
 
 ## Prerequisites
 
@@ -170,3 +171,26 @@ Generated site:
 
 - `0`: success
 - `1`: runtime/IO/parsing failure
+
+## Runtime Log Callgraph
+
+Generate execution-time callgraph from logs where entrypoints emit `_entry` / `_exit` markers and other functions emit single-line events.
+
+Inputs:
+
+- `--logs`: runtime log file
+- `--entrypoints`: names of functions that use `_entry`/`_exit`
+- `--static-callgraph`: static graph JSON (typically `out/callgraph.json`) used to constrain caller candidates
+
+Example:
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work cfggen:linux-build-deps -lc \
+	"./build-linux/runtime_callgraph_generator --logs input/logs.txt --entrypoints input/entrypoints.txt --static-callgraph out/callgraph.json -o out/runtime-callgraph.json --dot-output out/runtime-callgraph.dot --top-k 8"
+```
+
+Behavior:
+
+- `singlePathDeduced=true`: best path score is strictly better than alternatives.
+- If not uniquely deduced, output still contains multiple `candidatePaths` with scores.
+- `bestPath` always provides the chosen highest-score reconstruction.

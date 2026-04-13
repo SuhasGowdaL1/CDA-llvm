@@ -28,6 +28,7 @@ struct CallGraphStats
  * @param outputJsonPath Output call graph JSON.
  * @param outputDotPath Output DOT path (empty disables DOT output).
  * @param contextDepth Bounded context depth used for context stats traversal.
+ * @param debugLoggingEnabled Enables non-error debug tracing.
  * @param stats Output summary counters.
  * @param errorMessage Populated on failure.
  * @return true on success, false on error.
@@ -38,6 +39,7 @@ bool generateCallGraphFromAnalysisJson(
     const std::string &outputDotPath,
     std::size_t contextDepth,
     const std::set<std::string> &blacklistedFunctions,
+    bool debugLoggingEnabled,
     CallGraphStats &stats,
     std::string &errorMessage);
 

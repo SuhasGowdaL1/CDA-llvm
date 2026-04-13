@@ -345,6 +345,18 @@ namespace
      */
     void applyConditionalStoreDuplication(SerializedFunction &function)
     {
+        std::function<void(SerializedBlock &)> alignBlockCallSiteIds = [](SerializedBlock &block)
+        {
+            if (block.lineCallSiteIds.size() < block.lines.size())
+            {
+                block.lineCallSiteIds.resize(block.lines.size());
+            }
+            else if (block.lineCallSiteIds.size() > block.lines.size())
+            {
+                block.lineCallSiteIds.resize(block.lines.size());
+            }
+        };
+
         std::unordered_map<std::uint32_t, std::size_t> blockIndexById;
         std::unordered_map<std::uint32_t, std::vector<std::uint32_t>> predecessors;
         std::unordered_map<std::uint32_t, std::vector<std::string>> pendingDeclarationInsertions;
@@ -362,9 +374,11 @@ namespace
             }
         }
 
-        auto assignInPredecessor = [&](std::uint32_t predecessorId, const std::string &variable, const std::string &expression)
+        std::function<void(std::uint32_t, const std::string &, const std::string &)> assignInPredecessor =
+            [&](std::uint32_t predecessorId, const std::string &variable, const std::string &expression)
         {
-            const auto blockIt = blockIndexById.find(predecessorId);
+            const std::unordered_map<std::uint32_t, std::size_t>::const_iterator blockIt =
+                blockIndexById.find(predecessorId);
             if (blockIt == blockIndexById.end())
             {
                 return;
@@ -385,12 +399,15 @@ namespace
             if (std::find(pred.lines.begin(), pred.lines.end(), assignmentLine) == pred.lines.end())
             {
                 pred.lines.push_back(assignmentLine);
+                pred.lineCallSiteIds.emplace_back();
             }
         };
 
-        auto addLineInPredecessor = [&](std::uint32_t predecessorId, const std::string &line)
+        std::function<void(std::uint32_t, const std::string &)> addLineInPredecessor =
+            [&](std::uint32_t predecessorId, const std::string &line)
         {
-            const auto blockIt = blockIndexById.find(predecessorId);
+            const std::unordered_map<std::uint32_t, std::size_t>::const_iterator blockIt =
+                blockIndexById.find(predecessorId);
             if (blockIt == blockIndexById.end())
             {
                 return;
@@ -400,16 +417,22 @@ namespace
             if (std::find(pred.lines.begin(), pred.lines.end(), line) == pred.lines.end())
             {
                 pred.lines.push_back(line);
+                pred.lineCallSiteIds.emplace_back();
             }
         };
 
         for (SerializedBlock &block : function.blocks)
         {
             std::vector<std::string> updatedLines;
+            std::vector<std::vector<std::string>> updatedLineCallSiteIds;
             updatedLines.reserve(block.lines.size());
+            updatedLineCallSiteIds.reserve(block.lines.size());
 
-            for (const std::string &line : block.lines)
+            for (std::size_t lineIndex = 0; lineIndex < block.lines.size(); ++lineIndex)
             {
+                const std::string &line = block.lines[lineIndex];
+                const std::vector<std::string> &lineCallSiteIds =
+                    lineIndex < block.lineCallSiteIds.size() ? block.lineCallSiteIds[lineIndex] : std::vector<std::string>{};
                 ConditionalStoreInfo storeInfo;
                 if (!parseConditionalStoreLine(line, storeInfo))
                 {
@@ -417,13 +440,16 @@ namespace
                     if (!parseConditionalIndexCallLine(line, indexCallInfo))
                     {
                         updatedLines.push_back(line);
+                        updatedLineCallSiteIds.push_back(lineCallSiteIds);
                         continue;
                     }
 
-                    const auto predsIt = predecessors.find(block.id);
+                    const std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>::const_iterator predsIt =
+                        predecessors.find(block.id);
                     if (predsIt == predecessors.end() || predsIt->second.size() != 2U)
                     {
                         updatedLines.push_back(line);
+                        updatedLineCallSiteIds.push_back(lineCallSiteIds);
                         continue;
                     }
 
@@ -433,7 +459,8 @@ namespace
                     std::unordered_map<std::uint32_t, std::string> callByPred;
                     std::unordered_set<std::uint32_t> usedPreds;
 
-                    auto matchCallToPred = [&](const std::string &indexExpr, const std::string &callLine)
+                    std::function<void(const std::string &, const std::string &)> matchCallToPred =
+                        [&](const std::string &indexExpr, const std::string &callLine)
                     {
                         const std::string token = "[" + trimCopy(indexExpr) + "]";
                         for (std::uint32_t predId : predIds)
@@ -443,7 +470,8 @@ namespace
                                 continue;
                             }
 
-                            const auto predBlockIt = blockIndexById.find(predId);
+                            const std::unordered_map<std::uint32_t, std::size_t>::const_iterator predBlockIt =
+                                blockIndexById.find(predId);
                             if (predBlockIt == blockIndexById.end())
                             {
                                 continue;
@@ -467,13 +495,13 @@ namespace
 
                     std::vector<std::string> remainingCalls;
                     if (std::find_if(callByPred.begin(), callByPred.end(),
-                                     [&](const auto &entry)
+                                     [&](const std::pair<const std::uint32_t, std::string> &entry)
                                      { return entry.second == indexCallInfo.trueLine; }) == callByPred.end())
                     {
                         remainingCalls.push_back(indexCallInfo.trueLine);
                     }
                     if (std::find_if(callByPred.begin(), callByPred.end(),
-                                     [&](const auto &entry)
+                                     [&](const std::pair<const std::uint32_t, std::string> &entry)
                                      { return entry.second == indexCallInfo.falseLine; }) == callByPred.end())
                     {
                         remainingCalls.push_back(indexCallInfo.falseLine);
@@ -492,7 +520,7 @@ namespace
                         }
                     }
 
-                    for (const auto &entry : callByPred)
+                    for (const std::pair<const std::uint32_t, std::string> &entry : callByPred)
                     {
                         addLineInPredecessor(entry.first, entry.second);
                     }
@@ -500,10 +528,12 @@ namespace
                     continue;
                 }
 
-                const auto predsIt = predecessors.find(block.id);
+                const std::unordered_map<std::uint32_t, std::vector<std::uint32_t>>::const_iterator predsIt =
+                    predecessors.find(block.id);
                 if (predsIt == predecessors.end() || predsIt->second.size() != 2U)
                 {
                     updatedLines.push_back(line);
+                    updatedLineCallSiteIds.push_back(lineCallSiteIds);
                     continue;
                 }
 
@@ -513,7 +543,7 @@ namespace
                 std::unordered_map<std::uint32_t, std::string> expressionByPred;
                 std::unordered_set<std::uint32_t> usedPreds;
 
-                auto matchExpressionToPred = [&](const std::string &expression)
+                std::function<void(const std::string &)> matchExpressionToPred = [&](const std::string &expression)
                 {
                     for (std::uint32_t predId : predIds)
                     {
@@ -522,7 +552,8 @@ namespace
                             continue;
                         }
 
-                        const auto predBlockIt = blockIndexById.find(predId);
+                        const std::unordered_map<std::uint32_t, std::size_t>::const_iterator predBlockIt =
+                            blockIndexById.find(predId);
                         if (predBlockIt == blockIndexById.end())
                         {
                             continue;
@@ -547,13 +578,13 @@ namespace
 
                 std::vector<std::string> remainingExpressions;
                 if (std::find_if(expressionByPred.begin(), expressionByPred.end(),
-                                 [&](const auto &entry)
+                                 [&](const std::pair<const std::uint32_t, std::string> &entry)
                                  { return entry.second == storeInfo.trueExpression; }) == expressionByPred.end())
                 {
                     remainingExpressions.push_back(storeInfo.trueExpression);
                 }
                 if (std::find_if(expressionByPred.begin(), expressionByPred.end(),
-                                 [&](const auto &entry)
+                                 [&](const std::pair<const std::uint32_t, std::string> &entry)
                                  { return entry.second == storeInfo.falseExpression; }) == expressionByPred.end())
                 {
                     remainingExpressions.push_back(storeInfo.falseExpression);
@@ -573,7 +604,7 @@ namespace
                     }
                 }
 
-                for (const auto &entry : expressionByPred)
+                for (const std::pair<const std::uint32_t, std::string> &entry : expressionByPred)
                 {
                     assignInPredecessor(entry.first, storeInfo.variable, entry.second);
                 }
@@ -614,11 +645,14 @@ namespace
             }
 
             block.lines.swap(updatedLines);
+            block.lineCallSiteIds.swap(updatedLineCallSiteIds);
+            alignBlockCallSiteIds(block);
         }
 
         for (SerializedBlock &block : function.blocks)
         {
-            const auto pendingIt = pendingDeclarationInsertions.find(block.id);
+            const std::unordered_map<std::uint32_t, std::vector<std::string>>::const_iterator pendingIt =
+                pendingDeclarationInsertions.find(block.id);
             if (pendingIt == pendingDeclarationInsertions.end())
             {
                 continue;
@@ -639,10 +673,19 @@ namespace
             }
 
             std::vector<std::string> merged;
+            std::vector<std::vector<std::string>> mergedIds;
             merged.reserve(insertions.size() + block.lines.size());
-            merged.insert(merged.end(), insertions.begin(), insertions.end());
+            mergedIds.reserve(insertions.size() + block.lines.size());
+            for (const std::string &insertedLine : insertions)
+            {
+                merged.push_back(insertedLine);
+                mergedIds.emplace_back();
+            }
             merged.insert(merged.end(), block.lines.begin(), block.lines.end());
+            mergedIds.insert(mergedIds.end(), block.lineCallSiteIds.begin(), block.lineCallSiteIds.end());
             block.lines.swap(merged);
+            block.lineCallSiteIds.swap(mergedIds);
+            alignBlockCallSiteIds(block);
         }
     }
 
@@ -651,7 +694,19 @@ namespace
      */
     void cleanupCfgPresentation(SerializedFunction &function)
     {
-        auto isLiteralOnlyLine = [](const std::string &line)
+        std::function<void(SerializedBlock &)> alignBlockCallSiteIds = [](SerializedBlock &block)
+        {
+            if (block.lineCallSiteIds.size() < block.lines.size())
+            {
+                block.lineCallSiteIds.resize(block.lines.size());
+            }
+            else if (block.lineCallSiteIds.size() > block.lines.size())
+            {
+                block.lineCallSiteIds.resize(block.lines.size());
+            }
+        };
+
+        std::function<bool(const std::string &)> isLiteralOnlyLine = [](const std::string &line)
         {
             const std::string trimmed = trimCopy(line);
             if (trimmed.empty())
@@ -672,15 +727,21 @@ namespace
         for (SerializedBlock &block : function.blocks)
         {
             std::vector<std::string> filtered;
+            std::vector<std::vector<std::string>> filteredIds;
             filtered.reserve(block.lines.size());
-            for (const std::string &line : block.lines)
+            filteredIds.reserve(block.lines.size());
+            for (std::size_t i = 0; i < block.lines.size(); ++i)
             {
+                const std::string &line = block.lines[i];
                 if (!isLiteralOnlyLine(line))
                 {
                     filtered.push_back(line);
+                    filteredIds.push_back(i < block.lineCallSiteIds.size() ? block.lineCallSiteIds[i] : std::vector<std::string>{});
                 }
             }
             block.lines.swap(filtered);
+            block.lineCallSiteIds.swap(filteredIds);
+            alignBlockCallSiteIds(block);
         }
 
         bool changed = true;
@@ -745,6 +806,11 @@ namespace
                 changed = true;
                 break;
             }
+        }
+
+        for (SerializedBlock &block : function.blocks)
+        {
+            alignBlockCallSiteIds(block);
         }
     }
 
@@ -834,22 +900,22 @@ namespace
 
         const clang::Expr *stripped = expr->IgnoreParenImpCasts();
 
-        if (const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped))
+        if (const clang::DeclRefExpr *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped))
         {
-            if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(declRef->getDecl()))
+            if (const clang::FunctionDecl *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(declRef->getDecl()))
             {
                 return functionDecl->getQualifiedNameAsString();
             }
         }
 
-        if (const auto *unaryOperator = llvm::dyn_cast<clang::UnaryOperator>(stripped))
+        if (const clang::UnaryOperator *unaryOperator = llvm::dyn_cast<clang::UnaryOperator>(stripped))
         {
             if (unaryOperator->getOpcode() == clang::UO_AddrOf)
             {
                 const clang::Expr *subExpression = unaryOperator->getSubExpr()->IgnoreParenImpCasts();
-                if (const auto *subDeclRef = llvm::dyn_cast<clang::DeclRefExpr>(subExpression))
+                if (const clang::DeclRefExpr *subDeclRef = llvm::dyn_cast<clang::DeclRefExpr>(subExpression))
                 {
-                    if (const auto *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(subDeclRef->getDecl()))
+                    if (const clang::FunctionDecl *functionDecl = llvm::dyn_cast<clang::FunctionDecl>(subDeclRef->getDecl()))
                     {
                         return functionDecl->getQualifiedNameAsString();
                     }
@@ -878,7 +944,7 @@ namespace
 
         for (const clang::Stmt *child : expr->children())
         {
-            const auto *childExpr = llvm::dyn_cast_or_null<clang::Expr>(child);
+            const clang::Expr *childExpr = llvm::dyn_cast_or_null<clang::Expr>(child);
             if (childExpr != nullptr)
             {
                 collectFunctionSymbols(childExpr, symbols);
@@ -960,6 +1026,29 @@ namespace
         }
 
         return "cs_" + std::to_string(fnv1a64(key.str()));
+    }
+
+    std::string extractReferencedIdentifier(const clang::Expr *expr)
+    {
+        if (expr == nullptr)
+        {
+            return "";
+        }
+
+        const clang::Expr *stripped = expr->IgnoreParenImpCasts();
+        const clang::DeclRefExpr *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped);
+        if (declRef == nullptr)
+        {
+            return "";
+        }
+
+        const clang::ValueDecl *valueDecl = llvm::dyn_cast<clang::ValueDecl>(declRef->getDecl());
+        if (valueDecl == nullptr || llvm::isa<clang::FunctionDecl>(valueDecl))
+        {
+            return "";
+        }
+
+        return valueDecl->getQualifiedNameAsString();
     }
 
     /**
@@ -1069,13 +1158,7 @@ namespace
             assignment.rhsTakesFunctionAddress = !assignment.assignedFunction.empty();
 
             const clang::Expr *lhsExpr = binaryOperator->getLHS()->IgnoreParenImpCasts();
-            if (const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(lhsExpr))
-            {
-                if (const auto *varDecl = llvm::dyn_cast<clang::VarDecl>(declRef->getDecl()))
-                {
-                    assignment.lhsIsGlobal = varDecl->hasGlobalStorage();
-                }
-            }
+            assignment.lhsIsGlobal = isGlobalStorageLhs(lhsExpr);
 
             if (!assignment.assignedFunction.empty() &&
                 blacklistedFunctions_.find(assignment.assignedFunction) != blacklistedFunctions_.end())
@@ -1117,9 +1200,9 @@ namespace
                 lhsMemberNames.push_back(lhsAccess.second);
 
                 const clang::Expr *lhsMemberExpr = binaryOperator->getLHS()->IgnoreParenImpCasts();
-                if (const auto *memberExpr = llvm::dyn_cast<clang::MemberExpr>(lhsMemberExpr))
+                if (const clang::MemberExpr *memberExpr = llvm::dyn_cast<clang::MemberExpr>(lhsMemberExpr))
                 {
-                    if (const auto *fieldDecl = llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
+                    if (const clang::FieldDecl *fieldDecl = llvm::dyn_cast<clang::FieldDecl>(memberExpr->getMemberDecl()))
                     {
                         const clang::RecordDecl *owner = fieldDecl->getParent();
                         if (owner != nullptr && owner->isUnion())
@@ -1289,24 +1372,24 @@ namespace
                     return;
                 }
 
-                const auto *designated = llvm::dyn_cast<clang::DesignatedInitExpr>(stripped);
+                const clang::DesignatedInitExpr *designated = llvm::dyn_cast<clang::DesignatedInitExpr>(stripped);
                 if (designated != nullptr)
                 {
                     visitInit(designated->getInit(), memberPath);
                     return;
                 }
 
-                const auto *initList = llvm::dyn_cast<clang::InitListExpr>(stripped);
+                const clang::InitListExpr *initList = llvm::dyn_cast<clang::InitListExpr>(stripped);
                 if (initList == nullptr)
                 {
                     return;
                 }
 
-                const auto *recordType = llvm::dyn_cast<clang::RecordType>(initList->getType().getCanonicalType());
+                const clang::RecordType *recordType = llvm::dyn_cast<clang::RecordType>(initList->getType().getCanonicalType());
                 if (recordType != nullptr)
                 {
                     std::vector<std::string> fieldNames;
-                    for (const auto *field : recordType->getDecl()->fields())
+                    for (const clang::FieldDecl *field : recordType->getDecl()->fields())
                     {
                         fieldNames.push_back(field->getNameAsString());
                     }
@@ -1391,13 +1474,13 @@ namespace
                 return "";
             }
             const clang::Expr *stripped = expr->IgnoreParenImpCasts();
-            const auto *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped);
+            const clang::DeclRefExpr *declRef = llvm::dyn_cast<clang::DeclRefExpr>(stripped);
             if (declRef == nullptr)
             {
                 return "";
             }
 
-            const auto *valueDecl = llvm::dyn_cast<clang::ValueDecl>(declRef->getDecl());
+            const clang::ValueDecl *valueDecl = llvm::dyn_cast<clang::ValueDecl>(declRef->getDecl());
             if (valueDecl == nullptr)
             {
                 return "";
@@ -1409,6 +1492,94 @@ namespace
             }
 
             return valueDecl->getQualifiedNameAsString();
+        }
+
+        /**
+         * @brief Determine whether an LHS expression ultimately targets global storage.
+         */
+        bool isGlobalStorageLhs(const clang::Expr *expr)
+        {
+            if (expr == nullptr)
+            {
+                return false;
+            }
+
+            const clang::Expr *current = expr->IgnoreParenImpCasts();
+            while (current != nullptr)
+            {
+                if (const clang::DeclRefExpr *declRef = llvm::dyn_cast<clang::DeclRefExpr>(current))
+                {
+                    if (const clang::VarDecl *varDecl = llvm::dyn_cast<clang::VarDecl>(declRef->getDecl()))
+                    {
+                        if (varDecl->hasGlobalStorage())
+                        {
+                            return true;
+                        }
+
+                        if (!varDecl->getType()->isPointerType())
+                        {
+                            return false;
+                        }
+
+                        const std::string directName = varDecl->getNameAsString();
+                        const std::string qualifiedName = varDecl->getQualifiedNameAsString();
+
+                        if (!directName.empty())
+                        {
+                            std::unordered_set<std::string> visited;
+                            if (!resolveGlobalBaseFromPointerName(directName, visited).empty())
+                            {
+                                return true;
+                            }
+                        }
+                        if (!qualifiedName.empty())
+                        {
+                            std::unordered_set<std::string> visited;
+                            if (!resolveGlobalBaseFromPointerName(qualifiedName, visited).empty())
+                            {
+                                return true;
+                            }
+                        }
+
+                        if (varDecl->hasInit())
+                        {
+                            const std::string initText = extractExpressionText(varDecl->getInit());
+                            if (!extractGlobalBaseFromPointerTarget(initText).empty())
+                            {
+                                return true;
+                            }
+                        }
+
+                        return false;
+                    }
+                    return false;
+                }
+
+                if (const clang::MemberExpr *memberExpr = llvm::dyn_cast<clang::MemberExpr>(current))
+                {
+                    current = memberExpr->getBase()->IgnoreParenImpCasts();
+                    continue;
+                }
+
+                if (const clang::ArraySubscriptExpr *arrayExpr = llvm::dyn_cast<clang::ArraySubscriptExpr>(current))
+                {
+                    current = arrayExpr->getBase()->IgnoreParenImpCasts();
+                    continue;
+                }
+
+                if (const clang::UnaryOperator *unaryOp = llvm::dyn_cast<clang::UnaryOperator>(current))
+                {
+                    if (unaryOp->getOpcode() == clang::UO_Deref || unaryOp->getOpcode() == clang::UO_AddrOf)
+                    {
+                        current = unaryOp->getSubExpr()->IgnoreParenImpCasts();
+                        continue;
+                    }
+                }
+
+                break;
+            }
+
+            return false;
         }
 
         /**
@@ -1481,10 +1652,43 @@ namespace
                 return "";
             }
 
-            const std::string base = extractLeadingIdentifier(pointerTarget);
+            std::unordered_set<std::string> visited;
+            return extractGlobalBaseFromPointerTargetImpl(pointerTarget, visited);
+        }
+
+        /**
+         * @brief Resolve global base variable recursively from pointer-like expression text.
+         */
+        std::string extractGlobalBaseFromPointerTargetImpl(
+            const std::string &pointerTarget,
+            std::unordered_set<std::string> &visited)
+        {
+            const std::string trimmed = trimCopy(pointerTarget);
+            if (trimmed.empty())
+            {
+                return "";
+            }
+
+            if (!visited.insert(trimmed).second)
+            {
+                return "";
+            }
+
+            const std::string base = extractLeadingIdentifier(trimmed);
             if (base.empty())
             {
                 return "";
+            }
+
+            if (isFileScopeGlobalVariable(base))
+            {
+                return base;
+            }
+
+            const std::string aliasedGlobalBase = resolveGlobalBaseFromPointerName(base, visited);
+            if (!aliasedGlobalBase.empty())
+            {
+                return aliasedGlobalBase;
             }
 
             for (const PointerAssignmentRecord &assignment : pointerAssignments_)
@@ -1509,6 +1713,112 @@ namespace
             return "";
         }
 
+        /**
+         * @brief Resolve local pointer name to a global base through recorded assignments.
+         */
+        std::string resolveGlobalBaseFromPointerName(
+            const std::string &pointerName,
+            std::unordered_set<std::string> &visited)
+        {
+            if (pointerName.empty())
+            {
+                return "";
+            }
+
+            if (!visited.insert(pointerName).second)
+            {
+                return "";
+            }
+
+            bool sawDefinition = false;
+            std::set<std::string> resolvedGlobalBases;
+
+            for (const PointerAssignmentRecord &assignment : pointerAssignments_)
+            {
+                if (assignment.lhsExpression != pointerName)
+                {
+                    continue;
+                }
+
+                sawDefinition = true;
+
+                std::unordered_set<std::string> rhsVisited = visited;
+                const std::string globalBase = extractGlobalBaseFromPointerTargetImpl(assignment.rhsExpression, rhsVisited);
+                if (globalBase.empty())
+                {
+                    // At least one definition does not resolve to a global base.
+                    // Keep lhsIsGlobal false to avoid control-flow-insensitive false positives.
+                    return "";
+                }
+
+                resolvedGlobalBases.insert(globalBase);
+                if (resolvedGlobalBases.size() > 1U)
+                {
+                    // Conflicting global targets across definitions => not must-global.
+                    return "";
+                }
+            }
+
+            if (!sawDefinition || resolvedGlobalBases.empty())
+            {
+                return "";
+            }
+
+            return *resolvedGlobalBases.begin();
+        }
+
+        /**
+         * @brief Check whether an identifier refers to a file-scope global variable.
+         */
+        bool isFileScopeGlobalVariable(const std::string &identifier)
+        {
+            if (identifier.empty())
+            {
+                return false;
+            }
+
+            ensureGlobalVariableNames();
+            return globalVariableNames_.find(identifier) != globalVariableNames_.end();
+        }
+
+        /**
+         * @brief Populate cache of file-scope global variable names.
+         */
+        void ensureGlobalVariableNames()
+        {
+            if (globalVariableNamesInitialized_)
+            {
+                return;
+            }
+
+            globalVariableNamesInitialized_ = true;
+            clang::TranslationUnitDecl *translationUnit = context_.getTranslationUnitDecl();
+            if (translationUnit == nullptr)
+            {
+                return;
+            }
+
+            for (const clang::Decl *decl : translationUnit->decls())
+            {
+                const clang::VarDecl *varDecl = llvm::dyn_cast<clang::VarDecl>(decl);
+                if (varDecl == nullptr || !varDecl->isFileVarDecl())
+                {
+                    continue;
+                }
+
+                const std::string name = varDecl->getNameAsString();
+                if (!name.empty())
+                {
+                    globalVariableNames_.insert(name);
+                }
+                const std::string qualifiedName = varDecl->getQualifiedNameAsString();
+                if (!qualifiedName.empty())
+                {
+                    globalVariableNames_.insert(qualifiedName);
+                }
+            }
+        }
+
         clang::ASTContext &context_;
         std::string functionName_;
         const std::set<std::string> &blacklistedFunctions_;
@@ -1519,6 +1829,8 @@ namespace
         std::unordered_set<std::string> seenCallSites_;
         std::unordered_set<std::string> seenAssignments_;
         std::vector<std::set<std::string>> stateChangeValues_;
+        bool globalVariableNamesInitialized_ = false;
+        std::unordered_set<std::string> globalVariableNames_;
     };
 
     /**
@@ -1540,18 +1852,85 @@ namespace
     /**
      * @brief Collect representative textual lines for one CFG block.
      */
-    std::vector<std::string> collectBlockLines(const clang::CFGBlock &block, clang::ASTContext &context)
+    struct BlockLineCollection
     {
         std::vector<std::string> lines;
+        std::vector<std::vector<std::string>> lineCallSiteIds;
+    };
+
+    std::vector<std::string> collectStatementCallSiteIds(
+        const clang::Stmt *statement,
+        clang::ASTContext &context,
+        const std::string &functionName,
+        const std::unordered_set<std::string> &knownCallSiteIds)
+    {
+        std::vector<std::string> callSiteIds;
+        if (statement == nullptr)
+        {
+            return callSiteIds;
+        }
+
+        const clang::SourceManager &sourceManager = context.getSourceManager();
+
+        std::function<void(const clang::Stmt *)> visit = [&](const clang::Stmt *node)
+        {
+            if (node == nullptr)
+            {
+                return;
+            }
+
+            for (const clang::Stmt *child : node->children())
+            {
+                visit(child);
+            }
+
+            if (const clang::CallExpr *call = llvm::dyn_cast<clang::CallExpr>(node))
+            {
+                CallSiteRecord callSite;
+                const clang::SourceLocation location = sourceManager.getSpellingLoc(call->getExprLoc());
+                callSite.location = buildSourceLocationRecord(location, sourceManager);
+                callSite.calleeExpression = extractStatementText(call->getCallee(), context);
+
+                if (const clang::FunctionDecl *callee = call->getDirectCallee())
+                {
+                    callSite.directCallee = callee->getQualifiedNameAsString();
+                }
+                else
+                {
+                    callSite.isIndirect = true;
+                    callSite.throughIdentifier = extractReferencedIdentifier(call->getCallee());
+                }
+
+                for (const clang::Expr *argument : call->arguments())
+                {
+                    callSite.argumentExpressions.push_back(extractStatementText(argument, context));
+                }
+
+                const std::string stableId = buildStableCallSiteId(functionName, callSite);
+                if (knownCallSiteIds.find(stableId) != knownCallSiteIds.end())
+                {
+                    callSiteIds.push_back(stableId);
+                }
+            }
+        };
+
+        visit(statement);
+        return callSiteIds;
+    }
+
+    BlockLineCollection collectBlockLines(
+        const clang::CFGBlock &block,
+        clang::ASTContext &context,
+        const std::string &functionName,
+        const std::unordered_set<std::string> &knownCallSiteIds)
+    {
+        BlockLineCollection result;
         std::set<const clang::Stmt *> seenStatements;
-        std::unordered_map<unsigned, std::string> bestTextByLine;
-        std::unordered_map<unsigned, int> bestScoreByLine;
-        std::vector<unsigned> lineOrder;
         std::vector<clang::SourceRange> containerRanges;
 
         for (const clang::CFGElement &element : block)
         {
-            auto statement = element.getAs<clang::CFGStmt>();
+            decltype(element.getAs<clang::CFGStmt>()) statement = element.getAs<clang::CFGStmt>();
             if (!statement)
             {
                 continue;
@@ -1569,24 +1948,9 @@ namespace
             }
         }
 
-        auto scoreStatement = [](const clang::Stmt *stmt, const std::string &text)
-        {
-            int score = 0;
-            if (!llvm::isa<clang::Expr>(stmt))
-            {
-                score += 100;
-            }
-            if (llvm::isa<clang::DeclStmt>(stmt) || llvm::isa<clang::ReturnStmt>(stmt))
-            {
-                score += 25;
-            }
-            score += static_cast<int>(std::min<std::size_t>(text.size(), 200U));
-            return score;
-        };
-
         for (const clang::CFGElement &element : block)
         {
-            auto statement = element.getAs<clang::CFGStmt>();
+            decltype(element.getAs<clang::CFGStmt>()) statement = element.getAs<clang::CFGStmt>();
             if (!statement)
             {
                 continue;
@@ -1623,45 +1987,20 @@ namespace
                 continue;
             }
 
-            const clang::SourceManager &sourceManager = context.getSourceManager();
-            const clang::SourceLocation begin = sourceManager.getSpellingLoc(stmt->getBeginLoc());
-            const unsigned line = begin.isValid() ? sourceManager.getSpellingLineNumber(begin) : 0U;
+            const std::vector<std::string> stmtCallSiteIds =
+                collectStatementCallSiteIds(stmt, context, functionName, knownCallSiteIds);
 
-            if (line == 0U)
+            // Preserve all statements in encounter order, including same-line siblings.
+            if (result.lines.empty() ||
+                result.lines.back() != stmtText ||
+                result.lineCallSiteIds.back() != stmtCallSiteIds)
             {
-                lines.push_back(stmtText);
-                continue;
-            }
-
-            const int score = scoreStatement(stmt, stmtText);
-            const auto existing = bestTextByLine.find(line);
-            if (existing == bestTextByLine.end())
-            {
-                bestTextByLine[line] = stmtText;
-                bestScoreByLine[line] = score;
-                lineOrder.push_back(line);
-                continue;
-            }
-
-            const int currentBest = bestScoreByLine[line];
-            if (score > currentBest ||
-                (score == currentBest && stmtText.size() > existing->second.size()))
-            {
-                bestTextByLine[line] = stmtText;
-                bestScoreByLine[line] = score;
+                result.lines.push_back(stmtText);
+                result.lineCallSiteIds.push_back(stmtCallSiteIds);
             }
         }
 
-        for (unsigned line : lineOrder)
-        {
-            const auto it = bestTextByLine.find(line);
-            if (it != bestTextByLine.end())
-            {
-                lines.push_back(it->second);
-            }
-        }
-
-        return lines;
+        return result;
     }
 
     struct CollectorState
@@ -1670,6 +2009,7 @@ namespace
         std::string functionFilter;
         std::set<std::string> blacklistedFunctions;
         std::vector<SerializedFunction> *functions = nullptr;
+        std::unordered_set<std::string> emittedFunctionDefinitionKeys;
     };
 
     /**
@@ -1703,6 +2043,22 @@ namespace
                 return true;
             }
 
+            const clang::SourceManager &sourceManager = state_.context->getSourceManager();
+            const SourceLocationRecord definitionLocation =
+                buildSourceLocationRecord(functionDecl->getLocation(), sourceManager);
+            std::string definitionKey = functionName;
+            if (!definitionLocation.file.empty() && definitionLocation.line != 0U)
+            {
+                definitionKey += "#" + definitionLocation.file +
+                                 "#" + std::to_string(definitionLocation.line) +
+                                 ":" + std::to_string(definitionLocation.column);
+            }
+
+            if (!state_.emittedFunctionDefinitionKeys.insert(definitionKey).second)
+            {
+                return true;
+            }
+
             clang::Stmt *body = functionDecl->getBody();
             if (body == nullptr)
             {
@@ -1722,6 +2078,18 @@ namespace
             function.entryBlockId = static_cast<std::uint32_t>(graph->getEntry().getBlockID());
             function.exitBlockId = static_cast<std::uint32_t>(graph->getExit().getBlockID());
 
+            CallVisitor callVisitor(*state_.context, functionName, state_.blacklistedFunctions);
+            callVisitor.TraverseStmt(body);
+
+            std::unordered_set<std::string> knownCallSiteIds;
+            for (const CallSiteRecord &callSite : callVisitor.callSites())
+            {
+                if (!callSite.callSiteId.empty())
+                {
+                    knownCallSiteIds.insert(callSite.callSiteId);
+                }
+            }
+
             std::vector<SerializedBlock> rawBlocks;
 
             for (const clang::CFGBlock *block : *graph)
@@ -1733,7 +2101,10 @@ namespace
 
                 SerializedBlock serializedBlock;
                 serializedBlock.id = static_cast<std::uint32_t>(block->getBlockID());
-                serializedBlock.lines = collectBlockLines(*block, *state_.context);
+                const BlockLineCollection blockLines =
+                    collectBlockLines(*block, *state_.context, functionName, knownCallSiteIds);
+                serializedBlock.lines = blockLines.lines;
+                serializedBlock.lineCallSiteIds = blockLines.lineCallSiteIds;
 
                 for (clang::CFGBlock::const_succ_iterator successorIt = block->succ_begin();
                      successorIt != block->succ_end();
@@ -1782,10 +2153,21 @@ namespace
                 }
             }
 
-            CallVisitor callVisitor(*state_.context, functionName, state_.blacklistedFunctions);
-            callVisitor.TraverseStmt(body);
-
             ensureGlobalFactsCollected();
+
+            for (const clang::ParmVarDecl *parameter : functionDecl->parameters())
+            {
+                if (parameter == nullptr)
+                {
+                    continue;
+                }
+
+                const std::string parameterName = parameter->getNameAsString();
+                if (!parameterName.empty())
+                {
+                    function.attributes.parameterNames.push_back(parameterName);
+                }
+            }
 
             function.attributes.callSites = callVisitor.callSites();
             function.attributes.pointerAssignments = globalPointerAssignments_;
@@ -1853,24 +2235,24 @@ namespace
                     return;
                 }
 
-                const auto *designated = llvm::dyn_cast<clang::DesignatedInitExpr>(stripped);
+                const clang::DesignatedInitExpr *designated = llvm::dyn_cast<clang::DesignatedInitExpr>(stripped);
                 if (designated != nullptr)
                 {
                     visitInit(designated->getInit(), memberPath);
                     return;
                 }
 
-                const auto *initList = llvm::dyn_cast<clang::InitListExpr>(stripped);
+                const clang::InitListExpr *initList = llvm::dyn_cast<clang::InitListExpr>(stripped);
                 if (initList == nullptr)
                 {
                     return;
                 }
 
-                const auto *recordType = llvm::dyn_cast<clang::RecordType>(initList->getType().getCanonicalType());
+                const clang::RecordType *recordType = llvm::dyn_cast<clang::RecordType>(initList->getType().getCanonicalType());
                 if (recordType != nullptr)
                 {
                     std::vector<std::string> fieldNames;
-                    for (const auto *field : recordType->getDecl()->fields())
+                    for (const clang::FieldDecl *field : recordType->getDecl()->fields())
                     {
                         fieldNames.push_back(field->getNameAsString());
                     }
@@ -1924,7 +2306,7 @@ namespace
 
             for (const clang::Decl *decl : translationUnit->decls())
             {
-                const auto *varDecl = llvm::dyn_cast<clang::VarDecl>(decl);
+                const clang::VarDecl *varDecl = llvm::dyn_cast<clang::VarDecl>(decl);
                 if (varDecl == nullptr || !varDecl->isFileVarDecl() || !varDecl->hasInit())
                 {
                     continue;
@@ -1939,7 +2321,7 @@ namespace
                 const clang::Expr *strippedInitializer = initializer->IgnoreParenImpCasts();
                 const clang::SourceLocation location = sourceManager.getSpellingLoc(varDecl->getLocation());
 
-                const auto *initList = llvm::dyn_cast<clang::InitListExpr>(strippedInitializer);
+                const clang::InitListExpr *initList = llvm::dyn_cast<clang::InitListExpr>(strippedInitializer);
                 if (initList != nullptr)
                 {
                     // Track struct member mappings from global initializers
@@ -2106,20 +2488,35 @@ bool generateCfgBundle(
         return false;
     }
 
+    std::function<bool(const std::filesystem::path &)> isCSourceFile = [](const std::filesystem::path &path)
+    {
+        std::string extension = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch)
+                       { return static_cast<char>(std::tolower(ch)); });
+        return extension == ".c";
+    };
+
+    std::function<bool(const std::filesystem::path &)> isCHeaderFile = [](const std::filesystem::path &path)
+    {
+        std::string extension = path.extension().string();
+        std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char ch)
+                       { return static_cast<char>(std::tolower(ch)); });
+        return extension == ".h";
+    };
+
     std::vector<std::string> sourceFiles;
     for (const std::string &input : inputs)
     {
         std::error_code ec;
         if (std::filesystem::is_directory(input, ec))
         {
-            for (auto it = std::filesystem::recursive_directory_iterator(input);
+            for (std::filesystem::recursive_directory_iterator it = std::filesystem::recursive_directory_iterator(input);
                  it != std::filesystem::recursive_directory_iterator();
                  ++it)
             {
                 if (std::filesystem::is_regular_file(it->path(), ec))
                 {
-                    const std::string extension = it->path().extension().string();
-                    if (extension == ".c" || extension == ".h")
+                    if (isCSourceFile(it->path()) || isCHeaderFile(it->path()))
                     {
                         sourceFiles.push_back(it->path().string());
                     }
@@ -2128,7 +2525,11 @@ bool generateCfgBundle(
         }
         else if (std::filesystem::is_regular_file(input, ec))
         {
-            sourceFiles.push_back(input);
+            const std::filesystem::path inputPath(input);
+            if (isCSourceFile(inputPath) || isCHeaderFile(inputPath))
+            {
+                sourceFiles.push_back(input);
+            }
         }
     }
 
@@ -2137,7 +2538,7 @@ bool generateCfgBundle(
 
     if (sourceFiles.empty())
     {
-        errorMessage = "no C source files discovered";
+        errorMessage = "no C source/header files discovered";
         return false;
     }
 
@@ -2149,7 +2550,13 @@ bool generateCfgBundle(
 
     clang::tooling::FixedCompilationDatabase compilationDatabase(".", fixedArgs);
     clang::tooling::ClangTool tool(compilationDatabase, sourceFiles);
-    tool.appendArgumentsAdjuster(clang::tooling::getInsertArgumentAdjuster("-xc", clang::tooling::ArgumentInsertPosition::BEGIN));
+    const bool containsHeaderInput = std::any_of(sourceFiles.begin(), sourceFiles.end(), [&](const std::string &file)
+                                                 { return isCHeaderFile(std::filesystem::path(file)); });
+    if (containsHeaderInput)
+    {
+        // Explicit header analysis needs an explicit language mode for standalone parsing.
+        tool.appendArgumentsAdjuster(clang::tooling::getInsertArgumentAdjuster("-xc", clang::tooling::ArgumentInsertPosition::BEGIN));
+    }
 
     std::vector<SerializedFunction> functions;
     CollectorState state;

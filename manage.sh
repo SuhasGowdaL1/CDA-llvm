@@ -21,6 +21,7 @@ DO_DOT=0
 DO_SVG=0
 DO_CALLGRAPH=0
 DO_CALLGRAPH_DOT=1
+DO_CALLGRAPH_DEBUG=0
 DO_DOCKER_BUILD=0
 ACTIVE_CONTAINER_NAMES=()
 
@@ -75,6 +76,7 @@ Options:
                              Callgraph DOT output file (default: out/callgraph.dot)
   --callgraph-context-depth N
                              Callgraph bounded context depth (default: 3)
+  --callgraph-debug          Enable non-error callgraph debug tracing
   --no-callgraph-dot         Disable callgraph DOT output
   -h, --help                 Show help
 EOF
@@ -142,7 +144,7 @@ format_sources() {
     echo "clang-format not found"
     exit 1
   fi
-  find "$ROOT_DIR/src" -type f \( -name '*.h' -o -name '*.hpp' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' \) -print0 | \
+  find "$ROOT_DIR/src" -type f \( -name '*.h' -o -name '*.c' \) -print0 | \
     xargs -0 -r clang-format -i
 }
 
@@ -164,7 +166,7 @@ generate_cfg() {
     if [[ -d "$input" ]]; then
       while IFS= read -r -d '' file; do
         expanded_inputs+=("$file")
-      done < <(find "$input" -type f \( -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \) -print0)
+      done < <(find "$input" -type f \( -name '*.c' -o -name '*.h' \) -print0)
       continue
     fi
 
@@ -209,6 +211,10 @@ generate_callgraph() {
 
   if [[ -n "$BLACKLIST_FILE" ]]; then
     cmd="$cmd --blacklist-file $(printf '%q' "$BLACKLIST_FILE")"
+  fi
+
+  if [[ "$DO_CALLGRAPH_DEBUG" -eq 1 ]]; then
+    cmd="$cmd --debug"
   fi
 
   if [[ "$DO_DOCKER_BUILD" -eq 1 ]]; then
@@ -293,6 +299,10 @@ while [[ $# -gt 0 ]]; do
     --callgraph-context-depth)
       CALLGRAPH_CONTEXT_DEPTH="$2"
       shift 2
+      ;;
+    --callgraph-debug)
+      DO_CALLGRAPH_DEBUG=1
+      shift
       ;;
     --no-callgraph-dot)
       DO_CALLGRAPH_DOT=0

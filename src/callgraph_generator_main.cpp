@@ -60,6 +60,12 @@ namespace
         llvm::cl::init(""),
         llvm::cl::cat(kCategory));
 
+    llvm::cl::opt<bool> kDebug(
+        "debug",
+        llvm::cl::desc("Enable non-error callgraph debug tracing"),
+        llvm::cl::init(false),
+        llvm::cl::cat(kCategory));
+
     bool loadNameListFile(const std::string &filePath, std::set<std::string> &names, std::string &error)
     {
         if (filePath.empty())
@@ -126,6 +132,7 @@ int main(int argc, const char **argv)
             dotOutput,
             static_cast<std::size_t>(kContextDepth),
             blacklistedFunctions,
+            static_cast<bool>(kDebug),
             stats,
             error))
     {

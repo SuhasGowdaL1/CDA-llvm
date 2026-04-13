@@ -123,6 +123,30 @@ namespace
         out << "]";
     }
 
+    void writeNestedStringArray(
+        std::ostream &out,
+        const std::vector<std::vector<std::string>> &values,
+        int indent)
+    {
+        out << "[";
+        if (!values.empty())
+        {
+            out << "\n";
+            for (std::size_t i = 0; i < values.size(); ++i)
+            {
+                writeIndent(out, indent + 2);
+                writeStringArray(out, values[i], indent + 2);
+                if (i + 1U < values.size())
+                {
+                    out << ",";
+                }
+                out << "\n";
+            }
+            writeIndent(out, indent);
+        }
+        out << "]";
+    }
+
     /**
      * @brief Emit a deterministic JSON array for a set of strings.
      */
@@ -342,6 +366,11 @@ namespace
         out << ",\n";
 
         writeIndent(out, indent + 2);
+        out << "\"lineCallSiteIds\": ";
+        writeNestedStringArray(out, block.lineCallSiteIds, indent + 2);
+        out << ",\n";
+
+        writeIndent(out, indent + 2);
         out << "\"successors\": [";
         for (std::size_t i = 0; i < block.successors.size(); ++i)
         {
@@ -392,6 +421,11 @@ namespace
         writeIndent(out, indent + 4);
         out << "\"callSites\": ";
         writeCallSites(out, function.attributes.callSites, indent + 4);
+        out << ",\n";
+
+        writeIndent(out, indent + 4);
+        out << "\"parameterNames\": ";
+        writeStringArray(out, function.attributes.parameterNames, indent + 4);
         out << ",\n";
 
         writeIndent(out, indent + 4);

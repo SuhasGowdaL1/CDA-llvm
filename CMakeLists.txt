@@ -59,6 +59,21 @@ target_link_libraries(callgraph_generator PRIVATE
     LLVM
 )
 
+# Runtime log callgraph generator executable
+add_executable(runtime_callgraph_generator
+    src/runtime_callgraph_generator_main.cpp
+    src/serialization.cpp
+)
+
+target_include_directories(runtime_callgraph_generator PRIVATE
+    ${LLVM_INCLUDE_DIRS}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+target_link_libraries(runtime_callgraph_generator PRIVATE
+    LLVM
+)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CFGGEN_BUILD_STATIC_LINUX)
     # Note: Alpine LLVM 17 only provides dynamic libraries, so static linking won't work
     # Disabling static link options
@@ -69,4 +84,4 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CFGGEN_BUILD_STATIC_LINUX)
     # )
 endif()
 
-install(TARGETS cfg_generator callgraph_generator RUNTIME DESTINATION bin)
+install(TARGETS cfg_generator callgraph_generator runtime_callgraph_generator RUNTIME DESTINATION bin)
