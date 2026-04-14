@@ -91,6 +91,7 @@ namespace
     {
         std::string caller;
         std::string callee;
+        std::string callSiteId;
         std::string kind;
         SourceLocation location;
         std::string calleeExpression;
@@ -1836,8 +1837,8 @@ namespace
                 {
                     cachedDestinationsIt =
                         destinationCache.emplace(
-                            assignment.lhsExpression,
-                            resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, slotTargetsBySlot))
+                                            assignment.lhsExpression,
+                                            resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, slotTargetsBySlot))
                             .first;
                 }
 
@@ -1903,8 +1904,8 @@ namespace
             {
                 cachedDestinationsIt =
                     destinationCache.emplace(
-                        assignment.lhsExpression,
-                        resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, mergedGlobalBindings))
+                                        assignment.lhsExpression,
+                                        resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, mergedGlobalBindings))
                         .first;
             }
 
@@ -2081,8 +2082,8 @@ namespace
                 {
                     cachedDestinationsIt =
                         destinationCache.emplace(
-                            assignment.lhsExpression,
-                            resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, sourceTargetsBySlot))
+                                            assignment.lhsExpression,
+                                            resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, sourceTargetsBySlot))
                             .first;
                 }
 
@@ -3978,6 +3979,587 @@ namespace
         return seeds;
     }
 
+    struct DeferredLoadConstraint
+    {
+        std::string dstNode;
+    };
+
+    struct DeferredStoreConstraint
+    {
+        std::string srcNode;
+    };
+
+    struct DeferredStoreSeed
+    {
+        std::string target;
+    };
+
+    struct PagConstraintState
+    {
+        std::unordered_map<std::string, std::unordered_set<std::string>> pointsTo;
+        std::unordered_map<std::string, std::vector<DeferredLoadConstraint>> loadsByPointer;
+        std::unordered_map<std::string, std::vector<DeferredStoreConstraint>> storesByPointer;
+        std::unordered_map<std::string, std::vector<DeferredStoreSeed>> storeSeedTargetsByPointer;
+        std::unordered_map<std::string, std::vector<std::string>> memTransferDstBySrcPtr;
+        std::unordered_map<std::string, std::vector<std::string>> memTransferSrcByDstPtr;
+        std::unordered_map<std::string, std::vector<std::string>> sparseValueFlowSucc;
+        std::unordered_map<std::string, std::vector<std::string>> sparseValueFlowPred;
+        std::unordered_set<std::string> sparseValueFlowEdgeKeys;
+        std::deque<std::string> worklist;
+        std::unordered_set<std::string> inWorklist;
+        std::unordered_set<std::string> relevantNodes;
+        std::deque<std::string> relevantQueue;
+
+        void reserve(std::size_t estimatedPagNodes, std::size_t trackedSlotCount)
+        {
+            pointsTo.reserve(estimatedPagNodes);
+            loadsByPointer.reserve(estimatedPagNodes / 2U + 1U);
+            storesByPointer.reserve(estimatedPagNodes / 2U + 1U);
+            storeSeedTargetsByPointer.reserve(estimatedPagNodes / 2U + 1U);
+            memTransferDstBySrcPtr.reserve(trackedSlotCount + 1U);
+            memTransferSrcByDstPtr.reserve(trackedSlotCount + 1U);
+            sparseValueFlowSucc.reserve(estimatedPagNodes);
+            sparseValueFlowPred.reserve(estimatedPagNodes);
+            sparseValueFlowEdgeKeys.reserve(estimatedPagNodes * 2U + 1U);
+            inWorklist.reserve(estimatedPagNodes);
+            relevantNodes.reserve(estimatedPagNodes);
+        }
+
+        void markRelevant(const std::string &node)
+        {
+            if (node.empty())
+            {
+                return;
+            }
+
+            if (relevantNodes.insert(node).second)
+            {
+                relevantQueue.push_back(node);
+            }
+        }
+
+        void saturateRelevantNodes()
+        {
+            while (!relevantQueue.empty())
+            {
+                const std::string node = relevantQueue.front();
+                relevantQueue.pop_front();
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator predIt =
+                    sparseValueFlowPred.find(node);
+                if (predIt == sparseValueFlowPred.end())
+                {
+                    continue;
+                }
+
+                for (const std::string &pred : predIt->second)
+                {
+                    if (relevantNodes.insert(pred).second)
+                    {
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                            pointsTo.find(pred);
+                        if (ptIt != pointsTo.end() && !ptIt->second.empty() && inWorklist.insert(pred).second)
+                        {
+                            worklist.push_back(pred);
+                        }
+                        relevantQueue.push_back(pred);
+                    }
+                }
+            }
+        }
+
+        bool addSparseValueFlowEdge(const std::string &src, const std::string &dst)
+        {
+            if (src.empty() || dst.empty())
+            {
+                return false;
+            }
+
+            const std::string edgeKey = src + "->" + dst;
+            if (!sparseValueFlowEdgeKeys.insert(edgeKey).second)
+            {
+                return false;
+            }
+
+            sparseValueFlowSucc[src].push_back(dst);
+            sparseValueFlowPred[dst].push_back(src);
+
+            if (relevantNodes.find(dst) != relevantNodes.end() && relevantNodes.insert(src).second)
+            {
+                relevantQueue.push_back(src);
+                saturateRelevantNodes();
+            }
+
+            return true;
+        }
+
+        bool addCopyEdge(const std::string &src, const std::string &dst)
+        {
+            if (src.empty() || dst.empty())
+            {
+                return false;
+            }
+
+            return addSparseValueFlowEdge(src, dst);
+        }
+
+        void queueNode(const std::string &node)
+        {
+            if (node.empty())
+            {
+                return;
+            }
+
+            const bool hasDeferredEffects =
+                loadsByPointer.find(node) != loadsByPointer.end() ||
+                storesByPointer.find(node) != storesByPointer.end() ||
+                storeSeedTargetsByPointer.find(node) != storeSeedTargetsByPointer.end() ||
+                memTransferDstBySrcPtr.find(node) != memTransferDstBySrcPtr.end() ||
+                memTransferSrcByDstPtr.find(node) != memTransferSrcByDstPtr.end();
+            if (relevantNodes.find(node) == relevantNodes.end() && !hasDeferredEffects)
+            {
+                return;
+            }
+
+            if (inWorklist.insert(node).second)
+            {
+                worklist.push_back(node);
+            }
+        }
+
+        bool addPointsTo(const std::string &node, const std::string &target)
+        {
+            if (node.empty() || target.empty())
+            {
+                return false;
+            }
+
+            std::pair<std::unordered_map<std::string, std::unordered_set<std::string>>::iterator, bool> entry =
+                pointsTo.emplace(node, std::unordered_set<std::string>());
+            std::unordered_set<std::string> &targets = entry.first->second;
+            if (entry.second)
+            {
+                targets.reserve(4U);
+            }
+            if (!targets.insert(target).second)
+            {
+                return false;
+            }
+
+            queueNode(node);
+            return true;
+        }
+
+        void addAddressSeed(const std::string &lhsNode, const std::string &targetObject)
+        {
+            addPointsTo(lhsNode, targetObject);
+        }
+
+        bool overwritePointsToSingleton(const std::string &node, const std::string &target)
+        {
+            if (node.empty() || target.empty())
+            {
+                return false;
+            }
+
+            std::pair<std::unordered_map<std::string, std::unordered_set<std::string>>::iterator, bool> entry =
+                pointsTo.emplace(node, std::unordered_set<std::string>());
+            std::unordered_set<std::string> &targets = entry.first->second;
+            if (entry.second)
+            {
+                targets.reserve(4U);
+            }
+
+            if (targets.size() == 1U && targets.find(target) != targets.end())
+            {
+                return false;
+            }
+
+            targets.clear();
+            targets.insert(target);
+            queueNode(node);
+            return true;
+        }
+    };
+
+    struct CallResolutionContext
+    {
+        const std::vector<FunctionFacts> &functions;
+        const std::unordered_map<std::string, const FunctionFacts *> &functionMap;
+        const std::unordered_map<std::string, std::string> &nodeRepresentativeByNode;
+        const std::set<std::string> &knownFunctions;
+        const std::set<std::string> &blacklistedFunctions;
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &pointsTo;
+        const std::function<std::vector<std::string>(const std::string &, const std::string &)> &collectCandidateMemoryNodes;
+        const std::function<const std::vector<std::string> &(const std::string &)> &getExpandedMemorySlotAliases;
+        const std::function<std::set<std::string>(const std::unordered_set<std::string> &)> &resolveFunctionTargetsTransitively;
+    };
+
+    /**
+     * @brief Reject indirect edges with obviously incompatible argument counts.
+     */
+    bool hasCompatibleArgumentProfile(const CallSite &callSite, const FunctionFacts &callee)
+    {
+        if (callee.parameterNames.empty())
+        {
+            return true;
+        }
+
+        return callSite.argumentExpressions.size() >= callee.parameterNames.size();
+    }
+
+    std::string canonicalConstraintNode(
+        const std::string &node,
+        const std::unordered_map<std::string, std::string> &nodeRepresentativeByNode)
+    {
+        std::string current = node;
+        std::unordered_set<std::string> visited;
+
+        while (visited.insert(current).second)
+        {
+            const std::unordered_map<std::string, std::string>::const_iterator it = nodeRepresentativeByNode.find(current);
+            if (it == nodeRepresentativeByNode.end())
+            {
+                break;
+            }
+
+            current = it->second;
+        }
+
+        return current;
+    }
+
+    void collapseConstraintGraphSccs(
+        PagConstraintState &state,
+        std::unordered_map<std::string, std::string> &nodeRepresentativeByNode)
+    {
+        nodeRepresentativeByNode.clear();
+
+        std::unordered_set<std::string> allNodes;
+        auto addNode = [&](const std::string &node)
+        {
+            if (!node.empty())
+            {
+                allNodes.insert(node);
+            }
+        };
+
+        for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : state.pointsTo)
+        {
+            addNode(entry.first);
+            for (const std::string &target : entry.second)
+            {
+                addNode(target);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<DeferredLoadConstraint>> &entry : state.loadsByPointer)
+        {
+            addNode(entry.first);
+            for (const DeferredLoadConstraint &constraint : entry.second)
+            {
+                addNode(constraint.dstNode);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<DeferredStoreConstraint>> &entry : state.storesByPointer)
+        {
+            addNode(entry.first);
+            for (const DeferredStoreConstraint &constraint : entry.second)
+            {
+                addNode(constraint.srcNode);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<DeferredStoreSeed>> &entry : state.storeSeedTargetsByPointer)
+        {
+            addNode(entry.first);
+            for (const DeferredStoreSeed &constraint : entry.second)
+            {
+                addNode(constraint.target);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.memTransferDstBySrcPtr)
+        {
+            addNode(entry.first);
+            for (const std::string &dst : entry.second)
+            {
+                addNode(dst);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.memTransferSrcByDstPtr)
+        {
+            addNode(entry.first);
+            for (const std::string &src : entry.second)
+            {
+                addNode(src);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.sparseValueFlowSucc)
+        {
+            addNode(entry.first);
+            for (const std::string &succ : entry.second)
+            {
+                addNode(succ);
+            }
+        }
+
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.sparseValueFlowPred)
+        {
+            addNode(entry.first);
+            for (const std::string &pred : entry.second)
+            {
+                addNode(pred);
+            }
+        }
+
+        for (const std::string &node : state.relevantNodes)
+        {
+            addNode(node);
+        }
+        for (const std::string &node : state.worklist)
+        {
+            addNode(node);
+        }
+
+        if (allNodes.empty())
+        {
+            return;
+        }
+
+        std::unordered_map<std::string, std::size_t> indexByNode;
+        std::unordered_map<std::string, std::size_t> lowLinkByNode;
+        std::unordered_set<std::string> onStack;
+        std::vector<std::string> stack;
+        std::vector<std::vector<std::string>> components;
+        std::size_t nextIndex = 0U;
+
+        std::function<void(const std::string &)> strongConnect = [&](const std::string &node)
+        {
+            indexByNode[node] = nextIndex;
+            lowLinkByNode[node] = nextIndex;
+            ++nextIndex;
+            stack.push_back(node);
+            onStack.insert(node);
+
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator succIt =
+                state.sparseValueFlowSucc.find(node);
+            if (succIt != state.sparseValueFlowSucc.end())
+            {
+                for (const std::string &next : succIt->second)
+                {
+                    if (indexByNode.find(next) == indexByNode.end())
+                    {
+                        strongConnect(next);
+                        lowLinkByNode[node] = std::min(lowLinkByNode[node], lowLinkByNode[next]);
+                    }
+                    else if (onStack.find(next) != onStack.end())
+                    {
+                        lowLinkByNode[node] = std::min(lowLinkByNode[node], indexByNode[next]);
+                    }
+                }
+            }
+
+            if (lowLinkByNode[node] != indexByNode[node])
+            {
+                return;
+            }
+
+            std::vector<std::string> component;
+            while (!stack.empty())
+            {
+                const std::string current = stack.back();
+                stack.pop_back();
+                onStack.erase(current);
+                component.push_back(current);
+                if (current == node)
+                {
+                    break;
+                }
+            }
+
+            components.push_back(std::move(component));
+        };
+
+        for (const std::string &node : allNodes)
+        {
+            if (indexByNode.find(node) == indexByNode.end())
+            {
+                strongConnect(node);
+            }
+        }
+
+        for (const std::vector<std::string> &component : components)
+        {
+            if (component.size() <= 1U)
+            {
+                continue;
+            }
+
+            std::string representative = *std::min_element(component.begin(), component.end());
+            for (const std::string &node : component)
+            {
+                if (node != representative)
+                {
+                    nodeRepresentativeByNode[node] = representative;
+                }
+            }
+        }
+
+        if (nodeRepresentativeByNode.empty())
+        {
+            return;
+        }
+
+        auto remapNode = [&](const std::string &node) -> std::string
+        {
+            return canonicalConstraintNode(node, nodeRepresentativeByNode);
+        };
+
+        auto remapNodeSet = [&](const std::unordered_set<std::string> &values)
+        {
+            std::unordered_set<std::string> remapped;
+            for (const std::string &value : values)
+            {
+                remapped.insert(remapNode(value));
+            }
+            return remapped;
+        };
+
+        auto remapVector = [&](const std::vector<std::string> &values)
+        {
+            std::vector<std::string> remapped;
+            std::unordered_set<std::string> seen;
+            for (const std::string &value : values)
+            {
+                const std::string node = remapNode(value);
+                if (seen.insert(node).second)
+                {
+                    remapped.push_back(node);
+                }
+            }
+            return remapped;
+        };
+
+        std::unordered_map<std::string, std::unordered_set<std::string>> remappedPointsTo;
+        for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : state.pointsTo)
+        {
+            const std::string key = remapNode(entry.first);
+            std::unordered_set<std::string> &targets = remappedPointsTo[key];
+            const std::unordered_set<std::string> remappedTargets = remapNodeSet(entry.second);
+            targets.insert(remappedTargets.begin(), remappedTargets.end());
+        }
+        state.pointsTo.swap(remappedPointsTo);
+
+        std::unordered_map<std::string, std::vector<DeferredLoadConstraint>> remappedLoadsByPointer;
+        for (const std::pair<const std::string, std::vector<DeferredLoadConstraint>> &entry : state.loadsByPointer)
+        {
+            std::vector<DeferredLoadConstraint> &loads = remappedLoadsByPointer[remapNode(entry.first)];
+            for (const DeferredLoadConstraint &constraint : entry.second)
+            {
+                loads.push_back(DeferredLoadConstraint{remapNode(constraint.dstNode)});
+            }
+        }
+        state.loadsByPointer.swap(remappedLoadsByPointer);
+
+        std::unordered_map<std::string, std::vector<DeferredStoreConstraint>> remappedStoresByPointer;
+        for (const std::pair<const std::string, std::vector<DeferredStoreConstraint>> &entry : state.storesByPointer)
+        {
+            std::vector<DeferredStoreConstraint> &stores = remappedStoresByPointer[remapNode(entry.first)];
+            for (const DeferredStoreConstraint &constraint : entry.second)
+            {
+                stores.push_back(DeferredStoreConstraint{remapNode(constraint.srcNode)});
+            }
+        }
+        state.storesByPointer.swap(remappedStoresByPointer);
+
+        std::unordered_map<std::string, std::vector<DeferredStoreSeed>> remappedStoreSeedTargetsByPointer;
+        for (const std::pair<const std::string, std::vector<DeferredStoreSeed>> &entry : state.storeSeedTargetsByPointer)
+        {
+            std::vector<DeferredStoreSeed> &seeds = remappedStoreSeedTargetsByPointer[remapNode(entry.first)];
+            for (const DeferredStoreSeed &constraint : entry.second)
+            {
+                seeds.push_back(DeferredStoreSeed{remapNode(constraint.target)});
+            }
+        }
+        state.storeSeedTargetsByPointer.swap(remappedStoreSeedTargetsByPointer);
+
+        std::unordered_map<std::string, std::vector<std::string>> remappedMemTransferDstBySrcPtr;
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.memTransferDstBySrcPtr)
+        {
+            remappedMemTransferDstBySrcPtr[remapNode(entry.first)] = remapVector(entry.second);
+        }
+        state.memTransferDstBySrcPtr.swap(remappedMemTransferDstBySrcPtr);
+
+        std::unordered_map<std::string, std::vector<std::string>> remappedMemTransferSrcByDstPtr;
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.memTransferSrcByDstPtr)
+        {
+            remappedMemTransferSrcByDstPtr[remapNode(entry.first)] = remapVector(entry.second);
+        }
+        state.memTransferSrcByDstPtr.swap(remappedMemTransferSrcByDstPtr);
+
+        std::unordered_map<std::string, std::vector<std::string>> remappedSparseValueFlowSucc;
+        std::unordered_map<std::string, std::vector<std::string>> remappedSparseValueFlowPred;
+        std::unordered_set<std::string> remappedSparseValueFlowEdgeKeys;
+        for (const std::pair<const std::string, std::vector<std::string>> &entry : state.sparseValueFlowSucc)
+        {
+            const std::string src = remapNode(entry.first);
+            std::vector<std::string> &succs = remappedSparseValueFlowSucc[src];
+            for (const std::string &dstValue : entry.second)
+            {
+                const std::string dst = remapNode(dstValue);
+                if (src == dst)
+                {
+                    continue;
+                }
+
+                const std::string edgeKey = src + "->" + dst;
+                if (remappedSparseValueFlowEdgeKeys.insert(edgeKey).second)
+                {
+                    succs.push_back(dst);
+                    remappedSparseValueFlowPred[dst].push_back(src);
+                }
+            }
+        }
+        state.sparseValueFlowSucc.swap(remappedSparseValueFlowSucc);
+        state.sparseValueFlowPred.swap(remappedSparseValueFlowPred);
+        state.sparseValueFlowEdgeKeys.swap(remappedSparseValueFlowEdgeKeys);
+
+        std::unordered_set<std::string> remappedRelevantNodes;
+        std::deque<std::string> remappedRelevantQueue;
+        for (const std::string &node : state.relevantNodes)
+        {
+            const std::string remapped = remapNode(node);
+            if (remappedRelevantNodes.insert(remapped).second)
+            {
+                remappedRelevantQueue.push_back(remapped);
+            }
+        }
+        state.relevantNodes.swap(remappedRelevantNodes);
+        state.relevantQueue.swap(remappedRelevantQueue);
+
+        std::unordered_set<std::string> remappedInWorklist;
+        std::deque<std::string> remappedWorklist;
+        for (const std::string &node : state.worklist)
+        {
+            const std::string remapped = remapNode(node);
+            if (remappedInWorklist.insert(remapped).second)
+            {
+                remappedWorklist.push_back(remapped);
+            }
+        }
+        state.inWorklist.swap(remappedInWorklist);
+        state.worklist.swap(remappedWorklist);
+    }
+
+    void collectResolvedCallEdges(
+        const CallResolutionContext &context,
+        std::vector<CallEdge> &resolvedEdges,
+        std::vector<CallEdge> &unresolvedIndirect);
+
     /**
      * @brief Run a PAG/constraint based fixed-point pointer analysis and resolve calls from points-to.
      */
@@ -3989,6 +4571,7 @@ namespace
         std::vector<CallEdge> &unresolvedIndirect)
     {
         std::unordered_map<std::string, const FunctionFacts *> functionMap;
+        std::unordered_map<std::string, std::string> nodeRepresentativeByNode;
         std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
         std::unordered_map<std::string, std::unordered_set<std::string>> parameterSlotSetByFunction;
         std::unordered_set<std::string> linearFunctions;
@@ -4644,616 +5227,310 @@ namespace
             return abstractMemoryObject(functionName, normalized);
         };
 
-        std::unordered_map<std::string, std::unordered_set<std::string>> pointsTo;
-        struct DeferredLoadConstraint
+        std::unordered_map<std::string, std::pair<const FunctionFacts *, const CallSite *>> callSiteById;
+        callSiteById.reserve(totalCallSites * 2U + 1U);
+        for (const FunctionFacts &function : functions)
         {
-            std::string dstNode;
-        };
-
-        struct DeferredStoreConstraint
-        {
-            std::string srcNode;
-        };
-
-        struct DeferredStoreSeed
-        {
-            std::string target;
-        };
-
-        std::unordered_map<std::string, std::vector<DeferredLoadConstraint>> loadsByPointer;
-        std::unordered_map<std::string, std::vector<DeferredStoreConstraint>> storesByPointer;
-        std::unordered_map<std::string, std::vector<DeferredStoreSeed>> storeSeedTargetsByPointer;
-        std::unordered_map<std::string, std::vector<std::string>> memTransferDstBySrcPtr;
-        std::unordered_map<std::string, std::vector<std::string>> memTransferSrcByDstPtr;
-        std::unordered_map<std::string, std::vector<std::string>> sparseValueFlowSucc;
-        std::unordered_map<std::string, std::vector<std::string>> sparseValueFlowPred;
-        std::unordered_set<std::string> sparseValueFlowEdgeKeys;
-        std::deque<std::string> worklist;
-        std::unordered_set<std::string> inWorklist;
-        std::unordered_set<std::string> relevantNodes;
-        std::deque<std::string> relevantQueue;
-
-        const std::size_t estimatedPagNodes =
-            (trackedMemorySlots.size() * 3U) + functions.size() + totalCallSites + totalAssignments + 1U;
-        pointsTo.reserve(estimatedPagNodes);
-        loadsByPointer.reserve(estimatedPagNodes / 2U + 1U);
-        storesByPointer.reserve(estimatedPagNodes / 2U + 1U);
-        storeSeedTargetsByPointer.reserve(estimatedPagNodes / 2U + 1U);
-        memTransferDstBySrcPtr.reserve(trackedMemorySlots.size() + 1U);
-        memTransferSrcByDstPtr.reserve(trackedMemorySlots.size() + 1U);
-        sparseValueFlowSucc.reserve(estimatedPagNodes);
-        sparseValueFlowPred.reserve(estimatedPagNodes);
-        sparseValueFlowEdgeKeys.reserve(estimatedPagNodes * 2U + 1U);
-        inWorklist.reserve(estimatedPagNodes);
-        relevantNodes.reserve(estimatedPagNodes);
-
-        std::function<void(const std::string &)> markRelevant = [&](const std::string &node)
-        {
-            if (node.empty())
+            for (const CallSite &callSite : function.callSites)
             {
-                return;
-            }
-            if (relevantNodes.insert(node).second)
-            {
-                relevantQueue.push_back(node);
-            }
-        };
-
-        std::function<void()> saturateRelevantNodes = [&]()
-        {
-            while (!relevantQueue.empty())
-            {
-                const std::string node = relevantQueue.front();
-                relevantQueue.pop_front();
-
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator predIt =
-                    sparseValueFlowPred.find(node);
-                if (predIt == sparseValueFlowPred.end())
+                if (callSite.callSiteId.empty())
                 {
                     continue;
                 }
+                callSiteById[callSite.callSiteId] = std::make_pair(&function, &callSite);
+            }
+        }
 
-                for (const std::string &pred : predIt->second)
+        std::unordered_map<std::string, std::vector<std::string>> callSiteReturnReceiverSlots;
+        callSiteReturnReceiverSlots.reserve(totalCallSites * 2U + 1U);
+        std::function<std::optional<std::string>(const std::string &)> parseAssignedLhsSlotFromLine =
+            [&](const std::string &rawLine) -> std::optional<std::string>
+        {
+            std::string line = trimLine(rawLine);
+            const std::size_t equalIndex = line.find('=');
+            if (equalIndex == std::string::npos)
+            {
+                return std::nullopt;
+            }
+
+            if ((equalIndex > 0U && line[equalIndex - 1U] == '=') ||
+                (equalIndex + 1U < line.size() && line[equalIndex + 1U] == '='))
+            {
+                return std::nullopt;
+            }
+
+            const std::string lhs = trimLine(line.substr(0U, equalIndex));
+            const std::string slot = memorySlotFromExpression(lhs);
+            if (slot.empty())
+            {
+                return std::nullopt;
+            }
+
+            return slot;
+        };
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                const std::size_t lineCount = std::min(block.lines.size(), block.lineCallSiteIds.size());
+                for (std::size_t lineIndex = 0; lineIndex < lineCount; ++lineIndex)
                 {
-                    if (relevantNodes.insert(pred).second)
+                    const std::vector<std::string> &lineCallSiteIds = block.lineCallSiteIds[lineIndex];
+                    if (lineCallSiteIds.empty())
                     {
-                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
-                            pointsTo.find(pred);
-                        if (ptIt != pointsTo.end() && !ptIt->second.empty() && inWorklist.insert(pred).second)
+                        continue;
+                    }
+
+                    const std::optional<std::string> lhsSlot = parseAssignedLhsSlotFromLine(block.lines[lineIndex]);
+                    if (!lhsSlot.has_value())
+                    {
+                        continue;
+                    }
+
+                    for (const std::string &callSiteId : lineCallSiteIds)
+                    {
+                        if (callSiteId.empty())
                         {
-                            worklist.push_back(pred);
+                            continue;
                         }
-                        relevantQueue.push_back(pred);
+                        callSiteReturnReceiverSlots[callSiteId].push_back(*lhsSlot);
                     }
                 }
             }
-        };
+        }
 
-        std::function<bool(const std::string &, const std::string &)> addSparseValueFlowEdge =
-            [&](const std::string &src, const std::string &dst)
+        std::unordered_map<std::string, std::set<std::string>> stitchedIndirectCalleesByCallSite;
+        stitchedIndirectCalleesByCallSite.reserve(totalCallSites * 2U + 1U);
+        constexpr std::size_t kMaxOnTheFlySolveIterations = 8U;
+        std::size_t onTheFlySolveIteration = 0U;
+        bool discoveredNewIndirectEdges = false;
+
+        do
         {
-            if (src.empty() || dst.empty())
+            ++onTheFlySolveIteration;
+            resolvedEdges.clear();
+            unresolvedIndirect.clear();
+
+            PagConstraintState state;
+            std::unordered_map<std::string, std::unordered_set<std::string>> &pointsTo = state.pointsTo;
+            std::unordered_map<std::string, std::vector<DeferredLoadConstraint>> &loadsByPointer = state.loadsByPointer;
+            std::unordered_map<std::string, std::vector<DeferredStoreConstraint>> &storesByPointer = state.storesByPointer;
+            std::unordered_map<std::string, std::vector<DeferredStoreSeed>> &storeSeedTargetsByPointer = state.storeSeedTargetsByPointer;
+            std::unordered_map<std::string, std::vector<std::string>> &memTransferDstBySrcPtr = state.memTransferDstBySrcPtr;
+            std::unordered_map<std::string, std::vector<std::string>> &memTransferSrcByDstPtr = state.memTransferSrcByDstPtr;
+            std::unordered_map<std::string, std::vector<std::string>> &sparseValueFlowSucc = state.sparseValueFlowSucc;
+            std::unordered_map<std::string, std::vector<std::string>> &sparseValueFlowPred = state.sparseValueFlowPred;
+            std::unordered_set<std::string> &sparseValueFlowEdgeKeys = state.sparseValueFlowEdgeKeys;
+            std::deque<std::string> &worklist = state.worklist;
+            std::unordered_set<std::string> &inWorklist = state.inWorklist;
+            std::unordered_set<std::string> &relevantNodes = state.relevantNodes;
+            std::deque<std::string> &relevantQueue = state.relevantQueue;
+
+            const std::size_t estimatedPagNodes =
+                (trackedMemorySlots.size() * 3U) + functions.size() + totalCallSites + totalAssignments + 1U;
+            state.reserve(estimatedPagNodes, trackedMemorySlots.size());
+
+            std::function<std::size_t(const std::string &)> countLeadingDereferences =
+                [](const std::string &expression)
             {
-                return false;
-            }
-
-            const std::string edgeKey = src + "->" + dst;
-            if (!sparseValueFlowEdgeKeys.insert(edgeKey).second)
-            {
-                return false;
-            }
-
-            sparseValueFlowSucc[src].push_back(dst);
-            sparseValueFlowPred[dst].push_back(src);
-
-            if (relevantNodes.find(dst) != relevantNodes.end() && relevantNodes.insert(src).second)
-            {
-                relevantQueue.push_back(src);
-                saturateRelevantNodes();
-            }
-
-            return true;
-        };
-
-        std::function<bool(const std::string &, const std::string &)> addCopyEdge =
-            [&](const std::string &src, const std::string &dst)
-        {
-            if (src.empty() || dst.empty())
-            {
-                return false;
-            }
-
-            addSparseValueFlowEdge(src, dst);
-            return true;
-        };
-
-        std::function<void(const std::string &)> queueNode = [&](const std::string &node)
-        {
-            if (node.empty())
-            {
-                return;
-            }
-            const bool hasDeferredEffects =
-                loadsByPointer.find(node) != loadsByPointer.end() ||
-                storesByPointer.find(node) != storesByPointer.end() ||
-                storeSeedTargetsByPointer.find(node) != storeSeedTargetsByPointer.end() ||
-                memTransferDstBySrcPtr.find(node) != memTransferDstBySrcPtr.end() ||
-                memTransferSrcByDstPtr.find(node) != memTransferSrcByDstPtr.end();
-            if (relevantNodes.find(node) == relevantNodes.end() && !hasDeferredEffects)
-            {
-                return;
-            }
-            if (inWorklist.insert(node).second)
-            {
-                worklist.push_back(node);
-            }
-        };
-
-        std::function<bool(const std::string &, const std::string &)> addPointsTo =
-            [&](const std::string &node, const std::string &target)
-        {
-            if (node.empty() || target.empty())
-            {
-                return false;
-            }
-
-            std::pair<std::unordered_map<std::string, std::unordered_set<std::string>>::iterator, bool> entry =
-                pointsTo.emplace(node, std::unordered_set<std::string>());
-            std::unordered_set<std::string> &targets = entry.first->second;
-            if (entry.second)
-            {
-                targets.reserve(4U);
-            }
-            if (!targets.insert(target).second)
-            {
-                return false;
-            }
-
-            queueNode(node);
-            return true;
-        };
-
-        std::function<void(const std::string &, const std::string &)> addAddressSeed =
-            [&](const std::string &lhsNode, const std::string &targetObject)
-        {
-            addPointsTo(lhsNode, targetObject);
-        };
-
-        std::function<bool(const std::string &, const std::string &)> overwritePointsToSingleton =
-            [&](const std::string &node, const std::string &target)
-        {
-            if (node.empty() || target.empty())
-            {
-                return false;
-            }
-
-            std::pair<std::unordered_map<std::string, std::unordered_set<std::string>>::iterator, bool> entry =
-                pointsTo.emplace(node, std::unordered_set<std::string>());
-            std::unordered_set<std::string> &targets = entry.first->second;
-            if (entry.second)
-            {
-                targets.reserve(4U);
-            }
-
-            if (targets.size() == 1U && targets.find(target) != targets.end())
-            {
-                return false;
-            }
-
-            targets.clear();
-            targets.insert(target);
-            queueNode(node);
-            return true;
-        };
-
-        std::function<std::size_t(const std::string &)> countLeadingDereferences =
-            [](const std::string &expression)
-        {
-            const std::string trimmed = trimLine(expression);
-            std::size_t depth = 0U;
-            while (depth < trimmed.size() && trimmed[depth] == '*')
-            {
-                ++depth;
-            }
-            return depth;
-        };
-
-        std::size_t syntheticPagNodeCounter = 0U;
-        std::function<std::string(const std::string &, const std::string &)> makeSyntheticPagNode =
-            [&](const std::string &functionName, const std::string &tag)
-        {
-            return functionName + "::$pag." + tag + "." + std::to_string(++syntheticPagNodeCounter);
-        };
-
-        std::function<std::string(const std::string &)> slotFromAbstractObject =
-            [&](const std::string &target)
-        {
-            if (target.rfind("obj:", 0U) != 0U)
-            {
-                return std::string();
-            }
-
-            const std::size_t split = target.rfind(':');
-            if (split == std::string::npos || split + 1U >= target.size())
-            {
-                return std::string();
-            }
-
-            return normalizeGlobalKey(target.substr(split + 1U));
-        };
-
-        std::function<std::vector<std::string>(const std::string &, const std::string &)> collectCandidateMemoryNodes =
-            [&](const std::string &functionName, const std::string &slot)
-        {
-            std::vector<std::string> nodes;
-            std::unordered_set<std::string> seen;
-
-            const std::string normalized = normalizeGlobalKey(slot);
-            if (normalized.empty() || !isFunctionPointerRelevantSlot(normalized))
-            {
-                return nodes;
-            }
-
-            std::function<void(const std::string &)> addNode = [&](const std::string &node)
-            {
-                if (!node.empty() && seen.insert(node).second)
+                const std::string trimmed = trimLine(expression);
+                std::size_t depth = 0U;
+                while (depth < trimmed.size() && trimmed[depth] == '*')
                 {
-                    nodes.push_back(node);
+                    ++depth;
                 }
+                return depth;
             };
 
-            addNode(memoryNode(functionName, normalized));
-            addNode(addressTakenStorageNode(functionName, normalized));
-
-            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator refsIt =
-                referencedFunctionsBySlot.find(normalized);
-            const std::string root = memorySlotRoot(normalized);
-            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator rootRefsIt =
-                referencedFunctionsBySlot.find(root);
-            const bool sharedAcrossFunctions =
-                (refsIt != referencedFunctionsBySlot.end() && refsIt->second.size() > 1U) ||
-                (!root.empty() && rootRefsIt != referencedFunctionsBySlot.end() && rootRefsIt->second.size() > 1U);
-            const bool sharedAddressTakenSlot =
-                addressTakenTrackedSlots.find(normalized) != addressTakenTrackedSlots.end() ||
-                (!root.empty() && addressTakenTrackedSlots.find(root) != addressTakenTrackedSlots.end());
-            if (sharedAcrossFunctions &&
-                (normalized.find('.') != std::string::npos ||
-                 normalized.find('[') != std::string::npos ||
-                 sharedAddressTakenSlot))
+            std::size_t syntheticPagNodeCounter = 0U;
+            std::function<std::string(const std::string &, const std::string &)> makeSyntheticPagNode =
+                [&](const std::string &functionName, const std::string &tag)
             {
-                addNode("g::" + normalized);
-            }
+                return functionName + "::$pag." + tag + "." + std::to_string(++syntheticPagNodeCounter);
+            };
 
-            return nodes;
-        };
-
-        std::function<bool(const std::string &, const std::string &)> canStrongUpdateSlot =
-            [&](const std::string &functionName, const std::string &slot)
-        {
-            const std::string normalized = normalizeGlobalKey(slot);
-            if (normalized.empty() ||
-                normalized.find("[*]") != std::string::npos ||
-                linearFunctions.find(functionName) == linearFunctions.end())
+            std::function<std::string(const std::string &)> slotFromAbstractObject =
+                [&](const std::string &target)
             {
-                return false;
-            }
-
-            const std::string root = memorySlotRoot(normalized);
-            if (globalRoots.find(root) != globalRoots.end() || globalSlots.find(normalized) != globalSlots.end())
-            {
-                return false;
-            }
-
-            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator paramsIt =
-                parameterSlotSetByFunction.find(functionName);
-            if (paramsIt != parameterSlotSetByFunction.end() &&
-                (paramsIt->second.find(normalized) != paramsIt->second.end() ||
-                 paramsIt->second.find(root) != paramsIt->second.end()))
-            {
-                return false;
-            }
-
-            return true;
-        };
-
-        std::function<void(const std::string &, const std::string &, const std::string &)> strongSeedSlotTarget =
-            [&](const std::string &functionName, const std::string &slot, const std::string &target)
-        {
-            if (!canStrongUpdateSlot(functionName, slot))
-            {
-                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                if (target.rfind("obj:", 0U) != 0U)
                 {
-                    addPointsTo(node, target);
-                }
-                return;
-            }
-
-            const std::string expectedValueNode = memoryNode(functionName, normalizeGlobalKey(slot));
-            const std::string expectedStorageNode = addressTakenStorageNode(functionName, normalizeGlobalKey(slot));
-            for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
-            {
-                if (node == expectedValueNode || (!expectedStorageNode.empty() && node == expectedStorageNode))
-                {
-                    overwritePointsToSingleton(node, target);
-                }
-                else
-                {
-                    addPointsTo(node, target);
-                }
-            }
-        };
-
-        std::function<void(const std::string &, const std::string &, const std::string &)> seedSlotTarget =
-            [&](const std::string &functionName, const std::string &slot, const std::string &target)
-        {
-            if (!isFunctionPointerRelevantSlot(slot))
-            {
-                return;
-            }
-
-            for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
-            {
-                addPointsTo(node, target);
-            }
-        };
-
-        std::function<void(const std::string &, const std::string &, const std::string &)> copyIntoSlot =
-            [&](const std::string &functionName, const std::string &slot, const std::string &srcNode)
-        {
-            if (!isFunctionPointerRelevantSlot(slot))
-            {
-                return;
-            }
-
-            for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
-            {
-                addCopyEdge(srcNode, node);
-            }
-        };
-
-        std::function<std::vector<std::string>(const std::string &, const std::string &)> collectPointeeAccessSlots =
-            [&](const std::string &functionName, const std::string &slot)
-        {
-            std::vector<std::string> resolvedSlots;
-            std::unordered_set<std::string> seen;
-
-            const std::string normalized = normalizeGlobalKey(slot);
-            if (normalized.empty())
-            {
-                return resolvedSlots;
-            }
-
-            const std::string root = memorySlotRoot(normalized);
-            if (root.empty() || root == normalized)
-            {
-                return resolvedSlots;
-            }
-
-            const std::string node = memoryNode(functionName, root);
-            if (node.empty())
-            {
-                return resolvedSlots;
-            }
-
-            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
-                pointsTo.find(node);
-            if (ptIt == pointsTo.end())
-            {
-                return resolvedSlots;
-            }
-
-            const std::string suffix = normalized.substr(root.size());
-            for (const std::string &target : ptIt->second)
-            {
-                const std::string pointeeSlot = slotFromAbstractObject(target);
-                if (pointeeSlot.empty())
-                {
-                    continue;
+                    return std::string();
                 }
 
-                const std::string resolvedSlot = pointeeSlot + suffix;
-                if (seen.insert(resolvedSlot).second)
+                const std::size_t split = target.rfind(':');
+                if (split == std::string::npos || split + 1U >= target.size())
                 {
-                    resolvedSlots.push_back(resolvedSlot);
+                    return std::string();
                 }
-            }
 
-            return resolvedSlots;
-        };
+                return normalizeGlobalKey(target.substr(split + 1U));
+            };
 
-        std::function<std::set<std::string>(const std::unordered_set<std::string> &)> resolveFunctionTargetsTransitively =
-            [&](const std::unordered_set<std::string> &initialTargets)
-        {
-            std::set<std::string> resolvedFunctions;
-            std::deque<std::string> pending(initialTargets.begin(), initialTargets.end());
-            std::unordered_set<std::string> visited(initialTargets.begin(), initialTargets.end());
-
-            while (!pending.empty())
+            std::function<std::vector<std::string>(const std::string &, const std::string &)> collectCandidateMemoryNodes =
+                [&](const std::string &functionName, const std::string &slot)
             {
-                const std::string current = pending.front();
-                pending.pop_front();
+                std::vector<std::string> nodes;
+                std::unordered_set<std::string> seen;
 
-                if (current.rfind("fn:", 0U) == 0U)
+                const std::string normalized = normalizeGlobalKey(slot);
+                if (normalized.empty() || !isFunctionPointerRelevantSlot(normalized))
                 {
-                    const std::string callee = current.substr(3U);
-                    if (knownFunctions.find(callee) != knownFunctions.end() &&
-                        !isBlacklistedFunction(callee, blacklistedFunctions))
+                    return nodes;
+                }
+
+                std::function<void(const std::string &)> addNode = [&](const std::string &node)
+                {
+                    if (!node.empty() && seen.insert(node).second)
                     {
-                        resolvedFunctions.insert(callee);
+                        nodes.push_back(node);
                     }
-                    continue;
-                }
+                };
 
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator nextIt =
-                    pointsTo.find(current);
-                if (nextIt == pointsTo.end())
+                addNode(memoryNode(functionName, normalized));
+                addNode(addressTakenStorageNode(functionName, normalized));
+
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator refsIt =
+                    referencedFunctionsBySlot.find(normalized);
+                const std::string root = memorySlotRoot(normalized);
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator rootRefsIt =
+                    referencedFunctionsBySlot.find(root);
+                const bool sharedAcrossFunctions =
+                    (refsIt != referencedFunctionsBySlot.end() && refsIt->second.size() > 1U) ||
+                    (!root.empty() && rootRefsIt != referencedFunctionsBySlot.end() && rootRefsIt->second.size() > 1U);
+                const bool sharedAddressTakenSlot =
+                    addressTakenTrackedSlots.find(normalized) != addressTakenTrackedSlots.end() ||
+                    (!root.empty() && addressTakenTrackedSlots.find(root) != addressTakenTrackedSlots.end());
+                if (sharedAcrossFunctions &&
+                    (normalized.find('.') != std::string::npos ||
+                     normalized.find('[') != std::string::npos ||
+                     sharedAddressTakenSlot))
                 {
-                    continue;
+                    addNode("g::" + normalized);
                 }
 
-                for (const std::string &next : nextIt->second)
-                {
-                    if (visited.insert(next).second)
-                    {
-                        pending.push_back(next);
-                    }
-                }
-            }
+                return nodes;
+            };
 
-            return resolvedFunctions;
-        };
-
-        std::function<void(const std::string &, const std::string &)> addDeferredLoadConstraint =
-            [&](const std::string &ptrNode, const std::string &dstNode)
-        {
-            if (ptrNode.empty() || dstNode.empty())
-            {
-                return;
-            }
-
-            DeferredLoadConstraint deferredLoad;
-            deferredLoad.dstNode = dstNode;
-            loadsByPointer[ptrNode].push_back(deferredLoad);
-            markRelevant(ptrNode);
-            markRelevant(dstNode);
-        };
-
-        std::function<void(const std::string &, const std::string &)> addDeferredStoreConstraint =
-            [&](const std::string &ptrNode, const std::string &srcNode)
-        {
-            if (ptrNode.empty() || srcNode.empty())
-            {
-                return;
-            }
-
-            DeferredStoreConstraint deferredStore;
-            deferredStore.srcNode = srcNode;
-            storesByPointer[ptrNode].push_back(deferredStore);
-            markRelevant(ptrNode);
-            markRelevant(srcNode);
-        };
-
-        std::function<void(const std::string &, const std::string &)> addDeferredStoreSeedConstraint =
-            [&](const std::string &ptrNode, const std::string &target)
-        {
-            if (ptrNode.empty() || target.empty())
-            {
-                return;
-            }
-
-            DeferredStoreSeed storeSeed;
-            storeSeed.target = target;
-            storeSeedTargetsByPointer[ptrNode].push_back(storeSeed);
-            markRelevant(ptrNode);
-        };
-
-        std::function<std::string(const std::string &, const std::string &, std::size_t)> materializeDerefPrefixNode =
-            [&](const std::string &functionName, const std::string &baseNode, std::size_t dereferenceDepth)
-        {
-            if (baseNode.empty() || dereferenceDepth == 0U)
-            {
-                return std::string();
-            }
-
-            std::string currentNode = baseNode;
-            for (std::size_t depth = 1; depth < dereferenceDepth; ++depth)
-            {
-                const std::string tempNode = makeSyntheticPagNode(functionName, "deref");
-                addDeferredLoadConstraint(currentNode, tempNode);
-                currentNode = tempNode;
-            }
-
-            return currentNode;
-        };
-
-        std::function<std::set<std::string>(const std::string &, const std::vector<std::string> &)> expandMemcpyDestinationSlots =
-            [&](const std::string &functionName, const std::vector<std::string> &initialSlots)
-        {
-            std::set<std::string> expandedSlots;
-            std::deque<std::string> pending;
-
-            std::function<void(const std::string &)> enqueueSlot = [&](const std::string &slot)
+            std::function<bool(const std::string &, const std::string &)> canStrongUpdateSlot =
+                [&](const std::string &functionName, const std::string &slot)
             {
                 const std::string normalized = normalizeGlobalKey(slot);
                 if (normalized.empty() ||
-                    isIntegerBinding(normalized) ||
-                    knownFunctions.find(normalized) != knownFunctions.end() ||
-                    !isLikelyPointerIdentifier(normalized))
+                    normalized.find("[*]") != std::string::npos ||
+                    linearFunctions.find(functionName) == linearFunctions.end())
                 {
-                    return;
+                    return false;
                 }
 
-                if (expandedSlots.insert(normalized).second)
+                const std::string root = memorySlotRoot(normalized);
+                if (globalRoots.find(root) != globalRoots.end() || globalSlots.find(normalized) != globalSlots.end())
                 {
-                    pending.push_back(normalized);
+                    return false;
                 }
+
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator paramsIt =
+                    parameterSlotSetByFunction.find(functionName);
+                if (paramsIt != parameterSlotSetByFunction.end() &&
+                    (paramsIt->second.find(normalized) != paramsIt->second.end() ||
+                     paramsIt->second.find(root) != paramsIt->second.end()))
+                {
+                    return false;
+                }
+
+                return true;
             };
 
-            std::function<void(const std::string &)> enqueuePointeeAliases = [&](const std::string &slot)
+            std::function<void(const std::string &, const std::string &, const std::string &)> strongSeedSlotTarget =
+                [&](const std::string &functionName, const std::string &slot, const std::string &target)
             {
-                const std::string node = memoryNode(functionName, slot);
-                if (node.empty())
+                if (!canStrongUpdateSlot(functionName, slot))
                 {
-                    return;
-                }
-
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
-                    pointsTo.find(node);
-                if (ptIt == pointsTo.end())
-                {
-                    return;
-                }
-
-                for (const std::string &target : ptIt->second)
-                {
-                    const std::string pointeeSlot = slotFromAbstractObject(target);
-                    if (!pointeeSlot.empty())
+                    for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
                     {
-                        enqueueSlot(pointeeSlot);
+                        state.addPointsTo(node, target);
+                    }
+                    return;
+                }
+
+                const std::string expectedValueNode = memoryNode(functionName, normalizeGlobalKey(slot));
+                const std::string expectedStorageNode = addressTakenStorageNode(functionName, normalizeGlobalKey(slot));
+                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                {
+                    if (node == expectedValueNode || (!expectedStorageNode.empty() && node == expectedStorageNode))
+                    {
+                        state.overwritePointsToSingleton(node, target);
+                    }
+                    else
+                    {
+                        state.addPointsTo(node, target);
                     }
                 }
             };
 
-            for (const std::string &slot : initialSlots)
+            std::function<void(const std::string &, const std::string &, const std::string &)> seedSlotTarget =
+                [&](const std::string &functionName, const std::string &slot, const std::string &target)
             {
-                enqueueSlot(slot);
-            }
-
-            while (!pending.empty())
-            {
-                const std::string current = pending.front();
-                pending.pop_front();
-
-                for (const std::string &alias : getExpandedMemorySlotAliases(current))
+                if (!isFunctionPointerRelevantSlot(slot))
                 {
-                    enqueueSlot(alias);
+                    return;
                 }
 
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator descendantsIt =
-                    descendantSlotsByAncestor.find(current);
-                if (descendantsIt != descendantSlotsByAncestor.end())
+                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
                 {
-                    for (const std::string &descendant : descendantsIt->second)
+                    state.addPointsTo(node, target);
+                }
+            };
+
+            std::function<void(const std::string &, const std::string &, const std::string &)> copyIntoSlot =
+                [&](const std::string &functionName, const std::string &slot, const std::string &srcNode)
+            {
+                if (!isFunctionPointerRelevantSlot(slot))
+                {
+                    return;
+                }
+
+                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                {
+                    state.addCopyEdge(srcNode, node);
+                }
+            };
+
+            // SVF-style: Pre-scan for variant offsets ([*] indices in memcpy) and mark objects
+            // for field-insensitive collapse. This is simpler than creating offset-specific nodes.
+            std::unordered_set<std::string> variantOffsetRoots;
+            for (const FunctionFacts &function : functions)
+            {
+                for (const FunctionFacts::BlockFact &block : function.blocks)
+                {
+                    for (const std::string &line : block.lines)
                     {
-                        enqueueSlot(descendant);
+                        const std::optional<std::pair<std::string, std::string>> memcpyArgs =
+                            parseMemcpyArgsFromLine(line);
+                        if (!memcpyArgs.has_value())
+                        {
+                            continue;
+                        }
+
+                        // Detect [*] (variant index) in memcpy arguments -> mark root for collapse
+                        const std::string dstRoot = memorySlotRoot(memcpyArgs->first);
+                        const std::string srcRoot = memorySlotRoot(memcpyArgs->second);
+                        if (memcpyArgs->first.find("[*]") != std::string::npos && !dstRoot.empty())
+                        {
+                            variantOffsetRoots.insert(dstRoot);
+                        }
+                        if (memcpyArgs->second.find("[*]") != std::string::npos && !srcRoot.empty())
+                        {
+                            variantOffsetRoots.insert(srcRoot);
+                        }
                     }
                 }
-
-                enqueuePointeeAliases(current);
             }
 
-            return expandedSlots;
-        };
-
-        std::function<std::vector<std::string>(const std::vector<std::string> &, const std::set<std::string> &, const std::string &)> collectMemcpySourceSlots =
-            [&](const std::vector<std::string> &initialSrcSlots,
-                const std::set<std::string> &expandedDstSlots,
-                const std::string &expandedDstSlot)
-        {
-            std::vector<std::string> resolvedSrcSlots;
-            std::unordered_set<std::string> seen;
-
-            std::function<void(const std::string &)> addSourceSlot = [&](const std::string &slot)
+            // SVF-style: Add field collapse edges (root <-> member bidirectional).
+            // Variant offsets are pre-scanned but don't prevent field collapse (they still help propagate fp targets).
+            std::function<void(const std::string &, const std::string &)> addFieldCollapseEdges =
+                [&](const std::string &functionName, const std::string &slot)
             {
                 const std::string normalized = normalizeGlobalKey(slot);
                 if (normalized.empty())
@@ -5261,279 +5538,589 @@ namespace
                     return;
                 }
 
-                if (seen.insert(normalized).second)
+                const std::string root = memorySlotRoot(normalized);
+                if (root.empty() || root == normalized)
                 {
-                    resolvedSrcSlots.push_back(normalized);
+                    return;
+                }
+
+                if (!isFunctionPointerRelevantSlot(normalized) && !isFunctionPointerRelevantSlot(root))
+                {
+                    return;
+                }
+
+                const std::vector<std::string> rootNodes = collectCandidateMemoryNodes(functionName, root);
+                const std::vector<std::string> memberNodes = collectCandidateMemoryNodes(functionName, normalized);
+                for (const std::string &rootNode : rootNodes)
+                {
+                    for (const std::string &memberNode : memberNodes)
+                    {
+                        state.addCopyEdge(rootNode, memberNode);
+                        state.addCopyEdge(memberNode, rootNode);
+                    }
                 }
             };
 
-            for (const std::string &srcSlot : initialSrcSlots)
+            for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
             {
-                addSourceSlot(srcSlot);
-            }
-
-            for (const std::string &dstBaseSlot : expandedDstSlots)
-            {
-                const std::string normalizedDstBase = normalizeGlobalKey(dstBaseSlot);
-                if (normalizedDstBase.empty() ||
-                    expandedDstSlot == normalizedDstBase ||
-                    expandedDstSlot.rfind(normalizedDstBase, 0U) != 0U)
+                const FunctionFacts &function = functions[functionIndex];
+                for (const std::string &slot : trackedMemorySlots)
                 {
-                    continue;
-                }
-
-                const std::string suffix = expandedDstSlot.substr(normalizedDstBase.size());
-                if (suffix.empty())
-                {
-                    continue;
-                }
-
-                for (const std::string &srcSlot : initialSrcSlots)
-                {
-                    const std::string normalizedSrc = normalizeGlobalKey(srcSlot);
-                    const std::string mappedSrcSlot = normalizedSrc + suffix;
-                    if (trackedMemorySlots.find(mappedSrcSlot) != trackedMemorySlots.end())
-                    {
-                        addSourceSlot(mappedSrcSlot);
-                    }
+                    addFieldCollapseEdges(function.name, slot);
                 }
             }
 
-            return resolvedSrcSlots;
-        };
-
-        std::function<void(const FunctionFacts &, const CallSite &)> seedDirectCallArguments =
-            [&](const FunctionFacts &caller, const CallSite &callSite)
-        {
-            if (callSite.directCallee.empty())
+            // Second pass: add field collapse edges again for comprehensive bidirectional coverage
+            for (const FunctionFacts &function : functions)
             {
-                return;
+                for (const std::string &slot : trackedMemorySlots)
+                {
+                    addFieldCollapseEdges(function.name, slot);
+                }
             }
 
-            const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt =
-                functionMap.find(callSite.directCallee);
-            if (calleeIt == functionMap.end())
+            std::function<std::vector<std::string>(const std::string &, const std::string &)> collectPointeeAccessSlots =
+                [&](const std::string &functionName, const std::string &slot)
             {
-                return;
-            }
+                std::vector<std::string> resolvedSlots;
+                std::unordered_set<std::string> seen;
 
-            const std::vector<std::string> &calleeParams = parameterSlotsByFunction[callSite.directCallee];
-            const std::size_t limit = std::min(calleeParams.size(), callSite.argumentExpressions.size());
-            for (std::size_t i = 0; i < limit; ++i)
-            {
-                const std::vector<std::string> dstNodes =
-                    collectCandidateMemoryNodes(callSite.directCallee, calleeParams[i]);
-                if (dstNodes.empty())
+                const std::string normalized = normalizeGlobalKey(slot);
+                if (normalized.empty())
                 {
-                    continue;
+                    return resolvedSlots;
                 }
 
-                const std::string argumentRaw = trimLine(callSite.argumentExpressions[i]);
-                const std::string argSlot = memorySlotFromExpression(callSite.argumentExpressions[i]);
-                const bool passesAddress =
-                    !argumentRaw.empty() &&
-                    argumentRaw.front() == '&' &&
-                    !argSlot.empty() &&
-                    knownFunctions.find(argSlot) == knownFunctions.end();
-                if (passesAddress)
+                const std::string root = memorySlotRoot(normalized);
+                if (root.empty() || root == normalized)
                 {
-                    seedSlotTarget(callSite.directCallee, calleeParams[i], abstractMemoryObject(caller.name, argSlot));
-                }
-                else if (!argSlot.empty())
-                {
-                    const std::string srcNode = memoryNode(caller.name, argSlot);
-                    copyIntoSlot(callSite.directCallee, calleeParams[i], srcNode);
+                    return resolvedSlots;
                 }
 
-                for (const std::string &identifier : extractIdentifiers(callSite.argumentExpressions[i]))
+                const std::string node = memoryNode(functionName, root);
+                if (node.empty())
                 {
-                    if (knownFunctions.find(identifier) == knownFunctions.end())
+                    return resolvedSlots;
+                }
+
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                    pointsTo.find(node);
+                if (ptIt == pointsTo.end())
+                {
+                    return resolvedSlots;
+                }
+
+                const std::string suffix = normalized.substr(root.size());
+                for (const std::string &target : ptIt->second)
+                {
+                    const std::string pointeeSlot = slotFromAbstractObject(target);
+                    if (pointeeSlot.empty())
                     {
                         continue;
                     }
 
-                    seedSlotTarget(callSite.directCallee, calleeParams[i], "fn:" + identifier);
+                    const std::string resolvedSlot = pointeeSlot + suffix;
+                    if (seen.insert(resolvedSlot).second)
+                    {
+                        resolvedSlots.push_back(resolvedSlot);
+                    }
                 }
-            }
-        };
 
-        for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
-        {
-            const FunctionFacts &function = functions[functionIndex];
-            logPagFunctionPhase("seed-args", functionIndex, functions.size(), function);
-            for (const CallSite &callSite : function.callSites)
+                return resolvedSlots;
+            };
+
+            std::function<std::set<std::string>(const std::unordered_set<std::string> &)> resolveFunctionTargetsTransitively =
+                [&](const std::unordered_set<std::string> &initialTargets)
             {
-                seedDirectCallArguments(function, callSite);
-            }
-        }
+                std::set<std::string> resolvedFunctions;
+                std::deque<std::string> pending(initialTargets.begin(), initialTargets.end());
+                std::unordered_set<std::string> visited(initialTargets.begin(), initialTargets.end());
 
-        for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
-        {
-            const FunctionFacts &function = functions[functionIndex];
-            logPagFunctionPhase("build-constraints", functionIndex, functions.size(), function);
-            for (const PointerAssignment &assignment : function.pointerAssignments)
+                while (!pending.empty())
+                {
+                    const std::string current = pending.front();
+                    pending.pop_front();
+
+                    if (current.rfind("fn:", 0U) == 0U)
+                    {
+                        const std::string callee = current.substr(3U);
+                        if (knownFunctions.find(callee) != knownFunctions.end() &&
+                            !isBlacklistedFunction(callee, blacklistedFunctions))
+                        {
+                            resolvedFunctions.insert(callee);
+                        }
+                        continue;
+                    }
+
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator nextIt =
+                        pointsTo.find(current);
+                    if (nextIt == pointsTo.end())
+                    {
+                        continue;
+                    }
+
+                    for (const std::string &next : nextIt->second)
+                    {
+                        if (visited.insert(next).second)
+                        {
+                            pending.push_back(next);
+                        }
+                    }
+                }
+
+                return resolvedFunctions;
+            };
+
+            std::function<void(const std::string &, const std::string &)> addDeferredLoadConstraint =
+                [&](const std::string &ptrNode, const std::string &dstNode)
             {
-                const std::string lhsSlot = memorySlotFromExpression(assignment.lhsExpression);
-                const std::string lhsNode = memoryNode(function.name, lhsSlot);
-                const std::vector<std::string> rhsSlots = collectExpressionSlots(assignment.rhsExpression);
-
-                if (lhsNode.empty())
+                if (ptrNode.empty() || dstNode.empty())
                 {
-                    continue;
+                    return;
                 }
 
-                const std::string lhsRaw = trimLine(assignment.lhsExpression);
-                const std::string rhsRaw = trimLine(assignment.rhsExpression);
-                const bool rhsIsLoad = !rhsRaw.empty() && rhsRaw.front() == '*';
-                const bool lhsIsStore = !lhsRaw.empty() && lhsRaw.front() == '*';
-                const std::size_t rhsDerefDepth = countLeadingDereferences(rhsRaw);
-                const std::size_t lhsDerefDepth = countLeadingDereferences(lhsRaw);
-                const bool hasPointerCast = rhsRaw.find("(") != std::string::npos && rhsRaw.find("*") != std::string::npos;
-                const bool lhsRelevant = isFunctionPointerRelevantSlot(lhsSlot);
-                bool rhsRelevant = false;
-                for (const std::string &rhsSlot : rhsSlots)
-                {
-                    if (isFunctionPointerRelevantSlot(rhsSlot))
-                    {
-                        rhsRelevant = true;
-                        break;
-                    }
-                }
-                bool mentionsKnownFunction = false;
-                for (const std::string &identifier : extractIdentifiers(rhsRaw))
-                {
-                    if (knownFunctions.find(identifier) != knownFunctions.end())
-                    {
-                        mentionsKnownFunction = true;
-                        break;
-                    }
-                }
-                if (!lhsRelevant && !rhsRelevant && !mentionsKnownFunction)
-                {
-                    continue;
-                }
-                const std::string lhsStoreBaseNode =
-                    lhsIsStore ? materializeDerefPrefixNode(function.name, lhsNode, lhsDerefDepth) : std::string();
+                DeferredLoadConstraint deferredLoad;
+                deferredLoad.dstNode = dstNode;
+                loadsByPointer[ptrNode].push_back(deferredLoad);
+                state.markRelevant(ptrNode);
+                state.markRelevant(dstNode);
+            };
 
-                std::vector<std::string> deferredStoreSeedTargets;
-
-                const std::string rhsDirectCallee = extractCallCalleeIdentifier(rhsRaw);
-                if (!rhsDirectCallee.empty() &&
-                    functionMap.find(rhsDirectCallee) != functionMap.end() &&
-                    pointerReturningFunctions.find(rhsDirectCallee) != pointerReturningFunctions.end())
+            std::function<void(const std::string &, const std::string &)> addDeferredStoreConstraint =
+                [&](const std::string &ptrNode, const std::string &srcNode)
+            {
+                if (ptrNode.empty() || srcNode.empty())
                 {
-                    if (lhsIsStore)
-                    {
-                        const std::string rhsValueNode = returnNode(rhsDirectCallee);
-                        addDeferredStoreConstraint(lhsStoreBaseNode, rhsValueNode);
-                    }
-                    else
-                    {
-                        copyIntoSlot(function.name, lhsSlot, returnNode(rhsDirectCallee));
-                    }
-                    continue;
+                    return;
                 }
 
-                if (!assignment.assignedFunction.empty() &&
-                    knownFunctions.find(assignment.assignedFunction) != knownFunctions.end())
+                DeferredStoreConstraint deferredStore;
+                deferredStore.srcNode = srcNode;
+                storesByPointer[ptrNode].push_back(deferredStore);
+                state.markRelevant(ptrNode);
+                state.markRelevant(srcNode);
+            };
+
+            std::function<void(const std::string &, const std::string &)> addDeferredStoreSeedConstraint =
+                [&](const std::string &ptrNode, const std::string &target)
+            {
+                if (ptrNode.empty() || target.empty())
                 {
-                    if (lhsIsStore)
-                    {
-                        addDeferredStoreSeedConstraint(lhsStoreBaseNode, "fn:" + assignment.assignedFunction);
-                        addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
-                    }
-                    else
-                    {
-                        strongSeedSlotTarget(function.name, lhsSlot, "fn:" + assignment.assignedFunction);
-                    }
-                    continue;
+                    return;
                 }
 
-                bool seededFromFunctionAddress = false;
-                if (assignment.rhsTakesFunctionAddress || (!rhsRaw.empty() && rhsRaw.front() == '&'))
+                DeferredStoreSeed storeSeed;
+                storeSeed.target = target;
+                storeSeedTargetsByPointer[ptrNode].push_back(storeSeed);
+                state.markRelevant(ptrNode);
+            };
+
+            std::function<std::string(const std::string &, const std::string &, std::size_t)> materializeDerefPrefixNode =
+                [&](const std::string &functionName, const std::string &baseNode, std::size_t dereferenceDepth)
+            {
+                if (baseNode.empty() || dereferenceDepth == 0U)
                 {
-                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                    return std::string();
+                }
+
+                std::string currentNode = baseNode;
+                for (std::size_t depth = 1; depth < dereferenceDepth; ++depth)
+                {
+                    const std::string tempNode = makeSyntheticPagNode(functionName, "deref");
+                    addDeferredLoadConstraint(currentNode, tempNode);
+                    currentNode = tempNode;
+                }
+
+                return currentNode;
+            };
+
+            std::function<std::set<std::string>(const std::string &, const std::vector<std::string> &)> expandMemcpyDestinationSlots =
+                [&](const std::string &functionName, const std::vector<std::string> &initialSlots)
+            {
+                std::set<std::string> expandedSlots;
+                std::deque<std::string> pending;
+
+                std::function<void(const std::string &)> enqueueSlot = [&](const std::string &slot)
+                {
+                    const std::string normalized = normalizeGlobalKey(slot);
+                    if (normalized.empty() ||
+                        isIntegerBinding(normalized) ||
+                        knownFunctions.find(normalized) != knownFunctions.end() ||
+                        !isLikelyPointerIdentifier(normalized))
+                    {
+                        return;
+                    }
+
+                    if (expandedSlots.insert(normalized).second)
+                    {
+                        pending.push_back(normalized);
+                    }
+                };
+
+                std::function<void(const std::string &)> enqueuePointeeAliases = [&](const std::string &slot)
+                {
+                    const std::string node = memoryNode(functionName, slot);
+                    if (node.empty())
+                    {
+                        return;
+                    }
+
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                        pointsTo.find(node);
+                    if (ptIt == pointsTo.end())
+                    {
+                        return;
+                    }
+
+                    for (const std::string &target : ptIt->second)
+                    {
+                        const std::string pointeeSlot = slotFromAbstractObject(target);
+                        if (!pointeeSlot.empty())
+                        {
+                            enqueueSlot(pointeeSlot);
+                        }
+                    }
+                };
+
+                for (const std::string &slot : initialSlots)
+                {
+                    enqueueSlot(slot);
+                }
+
+                while (!pending.empty())
+                {
+                    const std::string current = pending.front();
+                    pending.pop_front();
+
+                    for (const std::string &alias : getExpandedMemorySlotAliases(current))
+                    {
+                        enqueueSlot(alias);
+                    }
+
+                    const std::unordered_map<std::string, std::vector<std::string>>::const_iterator descendantsIt =
+                        descendantSlotsByAncestor.find(current);
+                    if (descendantsIt != descendantSlotsByAncestor.end())
+                    {
+                        for (const std::string &descendant : descendantsIt->second)
+                        {
+                            enqueueSlot(descendant);
+                        }
+                    }
+
+                    enqueuePointeeAliases(current);
+                }
+
+                return expandedSlots;
+            };
+
+            std::function<std::vector<std::string>(const std::vector<std::string> &, const std::set<std::string> &, const std::string &)> collectMemcpySourceSlots =
+                [&](const std::vector<std::string> &initialSrcSlots,
+                    const std::set<std::string> &expandedDstSlots,
+                    const std::string &expandedDstSlot)
+            {
+                std::vector<std::string> resolvedSrcSlots;
+                std::unordered_set<std::string> seen;
+
+                std::function<void(const std::string &)> addSourceSlot = [&](const std::string &slot)
+                {
+                    const std::string normalized = normalizeGlobalKey(slot);
+                    if (normalized.empty())
+                    {
+                        return;
+                    }
+
+                    if (seen.insert(normalized).second)
+                    {
+                        resolvedSrcSlots.push_back(normalized);
+                    }
+                };
+
+                for (const std::string &srcSlot : initialSrcSlots)
+                {
+                    addSourceSlot(srcSlot);
+                }
+
+                for (const std::string &dstBaseSlot : expandedDstSlots)
+                {
+                    const std::string normalizedDstBase = normalizeGlobalKey(dstBaseSlot);
+                    if (normalizedDstBase.empty() ||
+                        expandedDstSlot == normalizedDstBase ||
+                        expandedDstSlot.rfind(normalizedDstBase, 0U) != 0U)
+                    {
+                        continue;
+                    }
+
+                    const std::string suffix = expandedDstSlot.substr(normalizedDstBase.size());
+                    if (suffix.empty())
+                    {
+                        continue;
+                    }
+
+                    for (const std::string &srcSlot : initialSrcSlots)
+                    {
+                        const std::string normalizedSrc = normalizeGlobalKey(srcSlot);
+                        const std::string mappedSrcSlot = normalizedSrc + suffix;
+                        if (trackedMemorySlots.find(mappedSrcSlot) != trackedMemorySlots.end())
+                        {
+                            addSourceSlot(mappedSrcSlot);
+                        }
+                    }
+                }
+
+                return resolvedSrcSlots;
+            };
+
+            std::function<void(const FunctionFacts &, const CallSite &, const std::string &)> seedCallArgumentsToCallee =
+                [&](const FunctionFacts &caller, const CallSite &callSite, const std::string &calleeName)
+            {
+                if (calleeName.empty())
+                {
+                    return;
+                }
+
+                const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt =
+                    functionMap.find(calleeName);
+                if (calleeIt == functionMap.end())
+                {
+                    return;
+                }
+
+                const std::vector<std::string> &calleeParams = parameterSlotsByFunction[calleeName];
+                const std::size_t limit = std::min(calleeParams.size(), callSite.argumentExpressions.size());
+                for (std::size_t i = 0; i < limit; ++i)
+                {
+                    const std::vector<std::string> dstNodes =
+                        collectCandidateMemoryNodes(calleeName, calleeParams[i]);
+                    if (dstNodes.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::string argumentRaw = trimLine(callSite.argumentExpressions[i]);
+                    const std::string argSlot = memorySlotFromExpression(callSite.argumentExpressions[i]);
+                    const bool passesAddress =
+                        !argumentRaw.empty() &&
+                        argumentRaw.front() == '&' &&
+                        !argSlot.empty() &&
+                        knownFunctions.find(argSlot) == knownFunctions.end();
+                    if (passesAddress)
+                    {
+                        seedSlotTarget(calleeName, calleeParams[i], abstractMemoryObject(caller.name, argSlot));
+                    }
+                    else if (!argSlot.empty())
+                    {
+                        const std::string srcNode = memoryNode(caller.name, argSlot);
+                        copyIntoSlot(calleeName, calleeParams[i], srcNode);
+                    }
+
+                    for (const std::string &identifier : extractIdentifiers(callSite.argumentExpressions[i]))
                     {
                         if (knownFunctions.find(identifier) == knownFunctions.end())
                         {
                             continue;
                         }
+
+                        seedSlotTarget(calleeName, calleeParams[i], "fn:" + identifier);
+                    }
+                }
+            };
+
+            for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
+            {
+                const FunctionFacts &function = functions[functionIndex];
+                logPagFunctionPhase("seed-args", functionIndex, functions.size(), function);
+                for (const CallSite &callSite : function.callSites)
+                {
+                    if (!callSite.directCallee.empty())
+                    {
+                        seedCallArgumentsToCallee(function, callSite, callSite.directCallee);
+                    }
+
+                    if (callSite.callSiteId.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator indirectIt =
+                        stitchedIndirectCalleesByCallSite.find(callSite.callSiteId);
+                    if (indirectIt == stitchedIndirectCalleesByCallSite.end())
+                    {
+                        continue;
+                    }
+
+                    for (const std::string &indirectCallee : indirectIt->second)
+                    {
+                        seedCallArgumentsToCallee(function, callSite, indirectCallee);
+
+                        if (pointerReturningFunctions.find(indirectCallee) == pointerReturningFunctions.end())
+                        {
+                            continue;
+                        }
+
+                        const std::unordered_map<std::string, std::vector<std::string>>::const_iterator receiverSlotsIt =
+                            callSiteReturnReceiverSlots.find(callSite.callSiteId);
+                        if (receiverSlotsIt == callSiteReturnReceiverSlots.end())
+                        {
+                            continue;
+                        }
+
+                        for (const std::string &receiverSlot : receiverSlotsIt->second)
+                        {
+                            copyIntoSlot(function.name, receiverSlot, returnNode(indirectCallee));
+                        }
+                    }
+                }
+            }
+
+            for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
+            {
+                const FunctionFacts &function = functions[functionIndex];
+                logPagFunctionPhase("seed-struct-members", functionIndex, functions.size(), function);
+                for (const StructMemberMapping &mapping : function.structMemberMappings)
+                {
+                    if (mapping.structVariable.empty() ||
+                        mapping.memberName.empty() ||
+                        mapping.functionName.empty())
+                    {
+                        continue;
+                    }
+
+                    if (knownFunctions.find(mapping.functionName) == knownFunctions.end() ||
+                        isBlacklistedFunction(mapping.functionName, blacklistedFunctions))
+                    {
+                        continue;
+                    }
+
+                    const std::string slot = mapping.structVariable + "." + mapping.memberName;
+                    seedSlotTarget(function.name, slot, "fn:" + mapping.functionName);
+                }
+            }
+
+            for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
+            {
+                const FunctionFacts &function = functions[functionIndex];
+                logPagFunctionPhase("build-constraints", functionIndex, functions.size(), function);
+                for (const PointerAssignment &assignment : function.pointerAssignments)
+                {
+                    const std::string lhsSlot = memorySlotFromExpression(assignment.lhsExpression);
+                    const std::string lhsNode = memoryNode(function.name, lhsSlot);
+                    const std::vector<std::string> rhsSlots = collectExpressionSlots(assignment.rhsExpression);
+
+                    if (lhsNode.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::string lhsRaw = trimLine(assignment.lhsExpression);
+                    const std::string rhsRaw = trimLine(assignment.rhsExpression);
+                    const bool rhsIsLoad = !rhsRaw.empty() && rhsRaw.front() == '*';
+                    const bool lhsIsStore = !lhsRaw.empty() && lhsRaw.front() == '*';
+                    const std::size_t rhsDerefDepth = countLeadingDereferences(rhsRaw);
+                    const std::size_t lhsDerefDepth = countLeadingDereferences(lhsRaw);
+                    const bool hasPointerCast = rhsRaw.find("(") != std::string::npos && rhsRaw.find("*") != std::string::npos;
+                    const bool lhsRelevant = isFunctionPointerRelevantSlot(lhsSlot);
+                    bool rhsRelevant = false;
+                    for (const std::string &rhsSlot : rhsSlots)
+                    {
+                        if (isFunctionPointerRelevantSlot(rhsSlot))
+                        {
+                            rhsRelevant = true;
+                            break;
+                        }
+                    }
+                    bool mentionsKnownFunction = false;
+                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                    {
+                        if (knownFunctions.find(identifier) != knownFunctions.end())
+                        {
+                            mentionsKnownFunction = true;
+                            break;
+                        }
+                    }
+                    if (!lhsRelevant && !rhsRelevant && !mentionsKnownFunction)
+                    {
+                        continue;
+                    }
+                    const std::string lhsStoreBaseNode =
+                        lhsIsStore ? materializeDerefPrefixNode(function.name, lhsNode, lhsDerefDepth) : std::string();
+
+                    std::vector<std::string> deferredStoreSeedTargets;
+
+                    const std::string rhsDirectCallee = extractCallCalleeIdentifier(rhsRaw);
+                    if (!rhsDirectCallee.empty() &&
+                        functionMap.find(rhsDirectCallee) != functionMap.end() &&
+                        pointerReturningFunctions.find(rhsDirectCallee) != pointerReturningFunctions.end())
+                    {
                         if (lhsIsStore)
                         {
-                            deferredStoreSeedTargets.push_back("fn:" + identifier);
+                            const std::string rhsValueNode = returnNode(rhsDirectCallee);
+                            addDeferredStoreConstraint(lhsStoreBaseNode, rhsValueNode);
                         }
                         else
                         {
-                            seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
+                            copyIntoSlot(function.name, lhsSlot, returnNode(rhsDirectCallee));
                         }
-                        seededFromFunctionAddress = true;
+                        continue;
                     }
 
-                    if (!seededFromFunctionAddress)
+                    if (!assignment.assignedFunction.empty() &&
+                        knownFunctions.find(assignment.assignedFunction) != knownFunctions.end())
                     {
-                        for (const std::string &candidateSlot : rhsSlots)
+                        if (lhsIsStore)
                         {
-                            const std::string targetObject = abstractMemoryObject(function.name, candidateSlot);
+                            addDeferredStoreSeedConstraint(lhsStoreBaseNode, "fn:" + assignment.assignedFunction);
+                            state.addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                        }
+                        else
+                        {
+                            strongSeedSlotTarget(function.name, lhsSlot, "fn:" + assignment.assignedFunction);
+                        }
+                        continue;
+                    }
+
+                    bool seededFromFunctionAddress = false;
+                    if (assignment.rhsTakesFunctionAddress || (!rhsRaw.empty() && rhsRaw.front() == '&'))
+                    {
+                        for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                        {
+                            if (knownFunctions.find(identifier) == knownFunctions.end())
+                            {
+                                continue;
+                            }
                             if (lhsIsStore)
                             {
-                                deferredStoreSeedTargets.push_back(targetObject);
+                                deferredStoreSeedTargets.push_back("fn:" + identifier);
                             }
                             else
                             {
-                                if (rhsSlots.size() == 1U)
-                                {
-                                    strongSeedSlotTarget(function.name, lhsSlot, targetObject);
-                                }
-                                else
-                                {
-                                    seedSlotTarget(function.name, lhsSlot, targetObject);
-                                }
+                                seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
                             }
                             seededFromFunctionAddress = true;
                         }
-                    }
-                }
 
-                if (seededFromFunctionAddress)
-                {
-                    if (lhsIsStore)
-                    {
-                        for (const std::string &target : deferredStoreSeedTargets)
+                        if (!seededFromFunctionAddress)
                         {
-                            addDeferredStoreSeedConstraint(lhsStoreBaseNode, target);
+                            for (const std::string &candidateSlot : rhsSlots)
+                            {
+                                const std::string targetObject = abstractMemoryObject(function.name, candidateSlot);
+                                if (lhsIsStore)
+                                {
+                                    deferredStoreSeedTargets.push_back(targetObject);
+                                }
+                                else
+                                {
+                                    if (rhsSlots.size() == 1U)
+                                    {
+                                        strongSeedSlotTarget(function.name, lhsSlot, targetObject);
+                                    }
+                                    else
+                                    {
+                                        seedSlotTarget(function.name, lhsSlot, targetObject);
+                                    }
+                                }
+                                seededFromFunctionAddress = true;
+                            }
                         }
-                        addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
-                    }
-                    continue;
-                }
-
-                if (rhsRaw.find('(') == std::string::npos)
-                {
-                    std::size_t directFunctionIdentifierCount = 0U;
-                    std::string directFunctionIdentifier;
-                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
-                    {
-                        if (knownFunctions.find(identifier) == knownFunctions.end())
-                        {
-                            continue;
-                        }
-
-                        if (lhsIsStore)
-                        {
-                            deferredStoreSeedTargets.push_back("fn:" + identifier);
-                        }
-                        else
-                        {
-                            ++directFunctionIdentifierCount;
-                            directFunctionIdentifier = identifier;
-                            seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
-                        }
-                        seededFromFunctionAddress = true;
-                    }
-
-                    if (!lhsIsStore && directFunctionIdentifierCount == 1U)
-                    {
-                        strongSeedSlotTarget(function.name, lhsSlot, "fn:" + directFunctionIdentifier);
                     }
 
                     if (seededFromFunctionAddress)
@@ -5544,576 +6131,583 @@ namespace
                             {
                                 addDeferredStoreSeedConstraint(lhsStoreBaseNode, target);
                             }
-                            addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                            state.addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
                         }
                         continue;
                     }
-                }
 
-                // Conservative: if RHS mentions function symbols (including ternary/union-style selectors),
-                // seed them as possible pointees unless RHS is a direct call expression.
-                if (rhsDirectCallee.empty())
-                {
-                    for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                    if (rhsRaw.find('(') == std::string::npos)
                     {
-                        if (knownFunctions.find(identifier) == knownFunctions.end())
-                        {
-                            continue;
-                        }
-
-                        if (lhsIsStore)
-                        {
-                            deferredStoreSeedTargets.push_back("fn:" + identifier);
-                        }
-                        else
-                        {
-                            seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
-                        }
-                    }
-                }
-
-                // Conservative aggregate summary: global field slots may flow through the global base slot.
-                const std::string lhsRoot = memorySlotRoot(lhsSlot);
-                if (!lhsSlot.empty() && lhsRoot != lhsSlot && globalRoots.find(lhsRoot) != globalRoots.end())
-                {
-                    const std::string lhsBaseNode = memoryNode(function.name, lhsRoot);
-                    addCopyEdge(lhsNode, lhsBaseNode);
-                    addCopyEdge(lhsBaseNode, lhsNode);
-                }
-
-                if ((rhsIsLoad || lhsIsStore || hasPointerCast) && !lhsSlot.empty())
-                {
-                    addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
-                }
-
-                if (rhsIsLoad)
-                {
-                    for (const std::string &rhsSlot : rhsSlots)
-                    {
-                        const std::string rhsNode = memoryNode(function.name, rhsSlot);
-                        if (rhsNode.empty())
-                        {
-                            continue;
-                        }
-
-                        const std::string rhsLoadBaseNode =
-                            materializeDerefPrefixNode(function.name, rhsNode, rhsDerefDepth);
-                        addDeferredLoadConstraint(rhsLoadBaseNode, lhsNode);
-                    }
-                    continue;
-                }
-
-                if (lhsIsStore)
-                {
-                    for (const std::string &rhsSlot : rhsSlots)
-                    {
-                        const std::string rhsNode = memoryNode(function.name, rhsSlot);
-                        if (rhsNode.empty())
-                        {
-                            continue;
-                        }
-
-                        addDeferredStoreConstraint(lhsStoreBaseNode, rhsNode);
-                    }
-                    continue;
-                }
-
-                for (const std::string &rhsSlot : rhsSlots)
-                {
-                    const std::string rhsNode = memoryNode(function.name, rhsSlot);
-                    if (rhsNode.empty())
-                    {
-                        continue;
-                    }
-
-                    copyIntoSlot(function.name, lhsSlot, rhsNode);
-                }
-            }
-
-            if (pointerReturningFunctions.find(function.name) != pointerReturningFunctions.end())
-            {
-                const std::string functionReturnNode = returnNode(function.name);
-                for (const FunctionFacts::BlockFact &block : function.blocks)
-                {
-                    for (const std::string &line : block.lines)
-                    {
-                        const std::optional<std::string> returnExpression = parseReturnExpressionFromLine(line);
-                        if (!returnExpression.has_value())
-                        {
-                            continue;
-                        }
-
-                        const std::string returnedRaw = trimLine(*returnExpression);
-                        if (returnedRaw.empty())
-                        {
-                            continue;
-                        }
-
-                        const std::string returnedCallee = extractCallCalleeIdentifier(returnedRaw);
-                        if (!returnedCallee.empty() &&
-                            functionMap.find(returnedCallee) != functionMap.end() &&
-                            pointerReturningFunctions.find(returnedCallee) != pointerReturningFunctions.end())
-                        {
-                            addCopyEdge(returnNode(returnedCallee), functionReturnNode);
-                        }
-
-                        for (const std::string &identifier : extractIdentifiers(returnedRaw))
+                        std::size_t directFunctionIdentifierCount = 0U;
+                        std::string directFunctionIdentifier;
+                        for (const std::string &identifier : extractIdentifiers(rhsRaw))
                         {
                             if (knownFunctions.find(identifier) == knownFunctions.end())
                             {
                                 continue;
                             }
 
-                            if (!returnedCallee.empty() && identifier == returnedCallee)
+                            if (lhsIsStore)
+                            {
+                                deferredStoreSeedTargets.push_back("fn:" + identifier);
+                            }
+                            else
+                            {
+                                ++directFunctionIdentifierCount;
+                                directFunctionIdentifier = identifier;
+                                seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
+                            }
+                            seededFromFunctionAddress = true;
+                        }
+
+                        if (!lhsIsStore && directFunctionIdentifierCount == 1U)
+                        {
+                            strongSeedSlotTarget(function.name, lhsSlot, "fn:" + directFunctionIdentifier);
+                        }
+
+                        if (seededFromFunctionAddress)
+                        {
+                            if (lhsIsStore)
+                            {
+                                for (const std::string &target : deferredStoreSeedTargets)
+                                {
+                                    addDeferredStoreSeedConstraint(lhsStoreBaseNode, target);
+                                }
+                                state.addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Conservative: if RHS mentions function symbols (including ternary/union-style selectors),
+                    // seed them as possible pointees unless RHS is a direct call expression.
+                    if (rhsDirectCallee.empty())
+                    {
+                        for (const std::string &identifier : extractIdentifiers(rhsRaw))
+                        {
+                            if (knownFunctions.find(identifier) == knownFunctions.end())
                             {
                                 continue;
                             }
 
-                            addAddressSeed(functionReturnNode, "fn:" + identifier);
+                            if (lhsIsStore)
+                            {
+                                deferredStoreSeedTargets.push_back("fn:" + identifier);
+                            }
+                            else
+                            {
+                                seedSlotTarget(function.name, lhsSlot, "fn:" + identifier);
+                            }
+                        }
+                    }
+
+                    // Conservative aggregate summary: global field slots may flow through the global base slot.
+                    const std::string lhsRoot = memorySlotRoot(lhsSlot);
+                    if (!lhsSlot.empty() && lhsRoot != lhsSlot && globalRoots.find(lhsRoot) != globalRoots.end())
+                    {
+                        const std::string lhsBaseNode = memoryNode(function.name, lhsRoot);
+                        state.addCopyEdge(lhsNode, lhsBaseNode);
+                        state.addCopyEdge(lhsBaseNode, lhsNode);
+                    }
+
+                    if ((rhsIsLoad || lhsIsStore || hasPointerCast) && !lhsSlot.empty())
+                    {
+                        state.addAddressSeed(lhsNode, abstractMemoryObject(function.name, lhsSlot));
+                    }
+
+                    if (rhsIsLoad)
+                    {
+                        for (const std::string &rhsSlot : rhsSlots)
+                        {
+                            const std::string rhsNode = memoryNode(function.name, rhsSlot);
+                            if (rhsNode.empty())
+                            {
+                                continue;
+                            }
+
+                            const std::string rhsLoadBaseNode =
+                                materializeDerefPrefixNode(function.name, rhsNode, rhsDerefDepth);
+                            addDeferredLoadConstraint(rhsLoadBaseNode, lhsNode);
+                        }
+                        continue;
+                    }
+
+                    if (lhsIsStore)
+                    {
+                        for (const std::string &rhsSlot : rhsSlots)
+                        {
+                            const std::string rhsNode = memoryNode(function.name, rhsSlot);
+                            if (rhsNode.empty())
+                            {
+                                continue;
+                            }
+
+                            addDeferredStoreConstraint(lhsStoreBaseNode, rhsNode);
+                        }
+                        continue;
+                    }
+
+                    for (const std::string &rhsSlot : rhsSlots)
+                    {
+                        const std::string rhsNode = memoryNode(function.name, rhsSlot);
+                        if (rhsNode.empty())
+                        {
+                            continue;
                         }
 
-                        for (const std::string &returnedSlot : collectExpressionSlots(returnedRaw))
+                        copyIntoSlot(function.name, lhsSlot, rhsNode);
+                    }
+                }
+
+                if (pointerReturningFunctions.find(function.name) != pointerReturningFunctions.end())
+                {
+                    const std::string functionReturnNode = returnNode(function.name);
+                    for (const FunctionFacts::BlockFact &block : function.blocks)
+                    {
+                        for (const std::string &line : block.lines)
                         {
-                            std::unordered_set<std::string> seenReturnedNodes;
-                            for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, returnedSlot))
+                            const std::optional<std::string> returnExpression = parseReturnExpressionFromLine(line);
+                            if (!returnExpression.has_value())
                             {
-                                if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
+                                continue;
+                            }
+
+                            const std::string returnedRaw = trimLine(*returnExpression);
+                            if (returnedRaw.empty())
+                            {
+                                continue;
+                            }
+
+                            const std::string returnedCallee = extractCallCalleeIdentifier(returnedRaw);
+                            if (!returnedCallee.empty() &&
+                                functionMap.find(returnedCallee) != functionMap.end() &&
+                                pointerReturningFunctions.find(returnedCallee) != pointerReturningFunctions.end())
+                            {
+                                state.addCopyEdge(returnNode(returnedCallee), functionReturnNode);
+                            }
+
+                            for (const std::string &identifier : extractIdentifiers(returnedRaw))
+                            {
+                                if (knownFunctions.find(identifier) == knownFunctions.end())
                                 {
                                     continue;
                                 }
 
-                                addCopyEdge(returnedNode, functionReturnNode);
+                                if (!returnedCallee.empty() && identifier == returnedCallee)
+                                {
+                                    continue;
+                                }
+
+                                state.addAddressSeed(functionReturnNode, "fn:" + identifier);
                             }
 
-                            for (const std::string &pointeeSlot : collectPointeeAccessSlots(function.name, returnedSlot))
+                            for (const std::string &returnedSlot : collectExpressionSlots(returnedRaw))
                             {
-                                for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, pointeeSlot))
+                                std::unordered_set<std::string> seenReturnedNodes;
+                                for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, returnedSlot))
                                 {
                                     if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
                                     {
                                         continue;
                                     }
 
-                                    addCopyEdge(returnedNode, functionReturnNode);
+                                    state.addCopyEdge(returnedNode, functionReturnNode);
+                                }
+
+                                for (const std::string &pointeeSlot : collectPointeeAccessSlots(function.name, returnedSlot))
+                                {
+                                    for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, pointeeSlot))
+                                    {
+                                        if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
+                                        {
+                                            continue;
+                                        }
+
+                                        state.addCopyEdge(returnedNode, functionReturnNode);
+                                    }
                                 }
                             }
                         }
                     }
                 }
-            }
 
-            for (const CallSite &callSite : function.callSites)
-            {
-                if (callSite.directCallee.empty())
+                for (const CallSite &callSite : function.callSites)
                 {
-                    continue;
-                }
+                    if (!callSite.directCallee.empty())
+                    {
+                        seedCallArgumentsToCallee(function, callSite, callSite.directCallee);
+                    }
 
-                seedDirectCallArguments(function, callSite);
-            }
-
-            for (const FunctionFacts::BlockFact &block : function.blocks)
-            {
-                for (const std::string &line : block.lines)
-                {
-                    const std::optional<MemoryTransferOp> transferOp = parseMemoryTransferOpFromLine(line);
-                    if (!transferOp.has_value())
+                    if (callSite.callSiteId.empty())
                     {
                         continue;
                     }
 
-                    for (const std::string &clearDestination : transferOp->clearDestinations)
+                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator indirectIt =
+                        stitchedIndirectCalleesByCallSite.find(callSite.callSiteId);
+                    if (indirectIt == stitchedIndirectCalleesByCallSite.end())
                     {
-                        const std::vector<std::string> clearDstSlots = collectExpressionSlots(clearDestination);
-                        for (const std::string &dstSlot : clearDstSlots)
-                        {
-                            const std::string dstNode = memoryNode(function.name, dstSlot);
-                            if (dstNode.empty())
-                            {
-                                continue;
-                            }
-
-                            addAddressSeed(dstNode, abstractMemoryObject(function.name, dstSlot));
-                            markRelevant(dstNode);
-                        }
+                        continue;
                     }
 
-                    for (const std::pair<std::string, std::string> &copyPair : transferOp->copyPairs)
+                    for (const std::string &indirectCallee : indirectIt->second)
                     {
-                        const std::vector<std::string> srcSlots = collectExpressionSlots(copyPair.first);
-                        const std::vector<std::string> dstSlots = collectExpressionSlots(copyPair.second);
-                        if (dstSlots.empty() || srcSlots.empty())
+                        seedCallArgumentsToCallee(function, callSite, indirectCallee);
+                    }
+                }
+
+                for (const FunctionFacts::BlockFact &block : function.blocks)
+                {
+                    for (const std::string &line : block.lines)
+                    {
+                        const std::optional<MemoryTransferOp> transferOp = parseMemoryTransferOpFromLine(line);
+                        if (!transferOp.has_value())
                         {
                             continue;
                         }
 
-                        const std::set<std::string> allDstSlots =
-                            expandMemcpyDestinationSlots(function.name, dstSlots);
-
-                        for (const std::string &dstSlot : allDstSlots)
+                        for (const std::string &clearDestination : transferOp->clearDestinations)
                         {
-                            const std::vector<std::string> resolvedSrcSlots =
-                                collectMemcpySourceSlots(srcSlots, allDstSlots, dstSlot);
-                            const std::vector<std::string> dstNodes =
-                                collectCandidateMemoryNodes(function.name, dstSlot);
-                            for (const std::string &dstNode : dstNodes)
+                            const std::vector<std::string> clearDstSlots = collectExpressionSlots(clearDestination);
+                            for (const std::string &dstSlot : clearDstSlots)
                             {
+                                const std::string dstNode = memoryNode(function.name, dstSlot);
                                 if (dstNode.empty())
                                 {
                                     continue;
                                 }
 
-                                if (dstNode.rfind("g::", 0U) == 0U)
+                                state.addAddressSeed(dstNode, abstractMemoryObject(function.name, dstSlot));
+                                state.markRelevant(dstNode);
+                            }
+                        }
+
+                        for (const std::pair<std::string, std::string> &copyPair : transferOp->copyPairs)
+                        {
+                            const std::vector<std::string> srcSlots = collectExpressionSlots(copyPair.first);
+                            const std::vector<std::string> dstSlots = collectExpressionSlots(copyPair.second);
+                            if (dstSlots.empty() || srcSlots.empty())
+                            {
+                                continue;
+                            }
+
+                            const std::set<std::string> allDstSlots =
+                                expandMemcpyDestinationSlots(function.name, dstSlots);
+
+                            for (const std::string &dstSlot : allDstSlots)
+                            {
+                                const std::vector<std::string> resolvedSrcSlots =
+                                    collectMemcpySourceSlots(srcSlots, allDstSlots, dstSlot);
+                                const std::vector<std::string> dstNodes =
+                                    collectCandidateMemoryNodes(function.name, dstSlot);
+                                for (const std::string &dstNode : dstNodes)
                                 {
-                                    addAddressSeed(dstNode, "obj:g:" + normalizeGlobalKey(dstSlot));
-                                }
-                                else
-                                {
-                                    addAddressSeed(dstNode, abstractMemoryObject(function.name, dstSlot));
-                                }
-                                markRelevant(dstNode);
-                                for (const std::string &srcSlot : resolvedSrcSlots)
-                                {
-                                    const std::string srcNode = memoryNode(function.name, srcSlot);
-                                    if (srcNode.empty())
+                                    if (dstNode.empty())
                                     {
                                         continue;
                                     }
-                                    addAddressSeed(srcNode, abstractMemoryObject(function.name, srcSlot));
-                                    markRelevant(srcNode);
-                                    addCopyEdge(srcNode, dstNode);
-                                    memTransferDstBySrcPtr[srcNode].push_back(dstNode);
-                                    memTransferSrcByDstPtr[dstNode].push_back(srcNode);
+
+                                    if (dstNode.rfind("g::", 0U) == 0U)
+                                    {
+                                        state.addAddressSeed(dstNode, "obj:g:" + normalizeGlobalKey(dstSlot));
+                                    }
+                                    else
+                                    {
+                                        state.addAddressSeed(dstNode, abstractMemoryObject(function.name, dstSlot));
+                                    }
+                                    state.markRelevant(dstNode);
+                                    for (const std::string &srcSlot : resolvedSrcSlots)
+                                    {
+                                        const std::string srcNode = memoryNode(function.name, srcSlot);
+                                        if (srcNode.empty())
+                                        {
+                                            continue;
+                                        }
+                                        state.addAddressSeed(srcNode, abstractMemoryObject(function.name, srcSlot));
+                                        state.markRelevant(srcNode);
+                                        state.addCopyEdge(srcNode, dstNode);
+                                        memTransferDstBySrcPtr[srcNode].push_back(dstNode);
+                                        memTransferSrcByDstPtr[dstNode].push_back(srcNode);
+                                    }
                                 }
                             }
                         }
                     }
                 }
             }
-        }
 
-        for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
-        {
-            const FunctionFacts &function = functions[functionIndex];
-            logPagFunctionPhase("mark-indirect-probes", functionIndex, functions.size(), function);
-            for (const CallSite &callSite : function.callSites)
+            for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
             {
-                if (!callSite.directCallee.empty())
+                const FunctionFacts &function = functions[functionIndex];
+                logPagFunctionPhase("mark-indirect-probes", functionIndex, functions.size(), function);
+                for (const CallSite &callSite : function.callSites)
+                {
+                    if (!callSite.directCallee.empty())
+                    {
+                        continue;
+                    }
+
+                    const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
+                    const std::string calleeExprSlot = memorySlotFromExpression(callSite.calleeExpression);
+                    if (!throughSlot.empty())
+                    {
+                        for (const std::string &aliasSlot : getExpandedMemorySlotAliases(throughSlot))
+                        {
+                            for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                            {
+                                state.markRelevant(probeNode);
+                            }
+                        }
+                    }
+                    if (!calleeExprSlot.empty())
+                    {
+                        for (const std::string &aliasSlot : getExpandedMemorySlotAliases(calleeExprSlot))
+                        {
+                            for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                            {
+                                state.markRelevant(probeNode);
+                            }
+                        }
+                    }
+                }
+            }
+            state.saturateRelevantNodes();
+
+            collapseConstraintGraphSccs(state, nodeRepresentativeByNode);
+
+            for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : pointsTo)
+            {
+                const bool hasDeferredEffects =
+                    loadsByPointer.find(entry.first) != loadsByPointer.end() ||
+                    storesByPointer.find(entry.first) != storesByPointer.end() ||
+                    storeSeedTargetsByPointer.find(entry.first) != storeSeedTargetsByPointer.end() ||
+                    memTransferDstBySrcPtr.find(entry.first) != memTransferDstBySrcPtr.end() ||
+                    memTransferSrcByDstPtr.find(entry.first) != memTransferSrcByDstPtr.end();
+                if (relevantNodes.find(entry.first) == relevantNodes.end() && !hasDeferredEffects)
                 {
                     continue;
                 }
-
-                const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
-                const std::string calleeExprSlot = memorySlotFromExpression(callSite.calleeExpression);
-                if (!throughSlot.empty())
+                if (inWorklist.insert(entry.first).second)
                 {
-                    for (const std::string &aliasSlot : getExpandedMemorySlotAliases(throughSlot))
+                    worklist.push_back(entry.first);
+                }
+            }
+
+            std::function<void(const std::string &, const std::string &)> materializeDynamicCopy =
+                [&](const std::string &src, const std::string &dst)
+            {
+                const std::string canonicalSrc = canonicalConstraintNode(src, nodeRepresentativeByNode);
+                const std::string canonicalDst = canonicalConstraintNode(dst, nodeRepresentativeByNode);
+                if (!state.addSparseValueFlowEdge(canonicalSrc, canonicalDst))
+                {
+                    return;
+                }
+
+                collapseConstraintGraphSccs(state, nodeRepresentativeByNode);
+
+                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcIt =
+                    pointsTo.find(canonicalConstraintNode(canonicalSrc, nodeRepresentativeByNode));
+                if (srcIt == pointsTo.end())
+                {
+                    return;
+                }
+
+                for (const std::string &target : srcIt->second)
+                {
+                    state.addPointsTo(canonicalConstraintNode(canonicalDst, nodeRepresentativeByNode), target);
+                }
+            };
+
+            std::size_t fixedPointIterations = 0U;
+            while (!worklist.empty())
+            {
+                ++fixedPointIterations;
+                const std::string node = worklist.front();
+                worklist.pop_front();
+                inWorklist.erase(node);
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator svfgSuccIt = sparseValueFlowSucc.find(node);
+                if (svfgSuccIt != sparseValueFlowSucc.end())
+                {
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt = pointsTo.find(node);
+                    if (srcTargetsIt != pointsTo.end())
                     {
-                        for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                        for (const std::string &dst : svfgSuccIt->second)
                         {
-                            markRelevant(probeNode);
+                            for (const std::string &target : srcTargetsIt->second)
+                            {
+                                state.addPointsTo(dst, target);
+                            }
                         }
                     }
                 }
-                if (!calleeExprSlot.empty())
+
+                const std::unordered_map<std::string, std::vector<DeferredLoadConstraint>>::const_iterator loadIt =
+                    loadsByPointer.find(node);
+                if (loadIt != loadsByPointer.end())
                 {
-                    for (const std::string &aliasSlot : getExpandedMemorySlotAliases(calleeExprSlot))
+                    for (const DeferredLoadConstraint &loadConstraint : loadIt->second)
                     {
-                        for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
-                        {
-                            markRelevant(probeNode);
-                        }
-                    }
-                }
-            }
-        }
-        saturateRelevantNodes();
-
-        for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : pointsTo)
-        {
-            const bool hasDeferredEffects =
-                loadsByPointer.find(entry.first) != loadsByPointer.end() ||
-                storesByPointer.find(entry.first) != storesByPointer.end() ||
-                storeSeedTargetsByPointer.find(entry.first) != storeSeedTargetsByPointer.end() ||
-                memTransferDstBySrcPtr.find(entry.first) != memTransferDstBySrcPtr.end() ||
-                memTransferSrcByDstPtr.find(entry.first) != memTransferSrcByDstPtr.end();
-            if (relevantNodes.find(entry.first) == relevantNodes.end() && !hasDeferredEffects)
-            {
-                continue;
-            }
-            if (inWorklist.insert(entry.first).second)
-            {
-                worklist.push_back(entry.first);
-            }
-        }
-
-        std::function<void(const std::string &, const std::string &)> materializeDynamicCopy =
-            [&](const std::string &src, const std::string &dst)
-        {
-            if (!addSparseValueFlowEdge(src, dst))
-            {
-                return;
-            }
-
-            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcIt = pointsTo.find(src);
-            if (srcIt == pointsTo.end())
-            {
-                return;
-            }
-
-            for (const std::string &target : srcIt->second)
-            {
-                addPointsTo(dst, target);
-            }
-        };
-
-        std::size_t fixedPointIterations = 0U;
-        while (!worklist.empty())
-        {
-            ++fixedPointIterations;
-            const std::string node = worklist.front();
-            worklist.pop_front();
-            inWorklist.erase(node);
-
-            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator svfgSuccIt = sparseValueFlowSucc.find(node);
-            if (svfgSuccIt != sparseValueFlowSucc.end())
-            {
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt = pointsTo.find(node);
-                if (srcTargetsIt != pointsTo.end())
-                {
-                    for (const std::string &dst : svfgSuccIt->second)
-                    {
-                        for (const std::string &target : srcTargetsIt->second)
-                        {
-                            addPointsTo(dst, target);
-                        }
-                    }
-                }
-            }
-
-            const std::unordered_map<std::string, std::vector<DeferredLoadConstraint>>::const_iterator loadIt =
-                loadsByPointer.find(node);
-            if (loadIt != loadsByPointer.end())
-            {
-                for (const DeferredLoadConstraint &loadConstraint : loadIt->second)
-                {
-                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptrTargetsIt =
-                        pointsTo.find(node);
-                    if (ptrTargetsIt == pointsTo.end())
-                    {
-                        continue;
-                    }
-
-                    for (const std::string &objectNode : ptrTargetsIt->second)
-                    {
-                        materializeDynamicCopy(objectNode, loadConstraint.dstNode);
-                    }
-                }
-            }
-
-            const std::unordered_map<std::string, std::vector<DeferredStoreConstraint>>::const_iterator storeIt =
-                storesByPointer.find(node);
-            if (storeIt != storesByPointer.end())
-            {
-                for (const DeferredStoreConstraint &storeConstraint : storeIt->second)
-                {
-                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptrTargetsIt =
-                        pointsTo.find(node);
-                    if (ptrTargetsIt == pointsTo.end())
-                    {
-                        continue;
-                    }
-
-                    for (const std::string &objectNode : ptrTargetsIt->second)
-                    {
-                        materializeDynamicCopy(storeConstraint.srcNode, objectNode);
-                    }
-                }
-            }
-
-            const std::unordered_map<std::string, std::vector<DeferredStoreSeed>>::const_iterator storeSeedIt =
-                storeSeedTargetsByPointer.find(node);
-            if (storeSeedIt != storeSeedTargetsByPointer.end())
-            {
-                for (const DeferredStoreSeed &storeSeed : storeSeedIt->second)
-                {
-                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptrTargetsIt =
-                        pointsTo.find(node);
-                    if (ptrTargetsIt == pointsTo.end())
-                    {
-                        continue;
-                    }
-
-                    for (const std::string &objectNode : ptrTargetsIt->second)
-                    {
-                        addPointsTo(objectNode, storeSeed.target);
-                    }
-                }
-            }
-
-            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memDstIt =
-                memTransferDstBySrcPtr.find(node);
-            if (memDstIt != memTransferDstBySrcPtr.end())
-            {
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
-                    pointsTo.find(node);
-                if (srcTargetsIt != pointsTo.end())
-                {
-                    for (const std::string &dstPtrNode : memDstIt->second)
-                    {
-                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
-                            pointsTo.find(dstPtrNode);
-                        if (dstTargetsIt == pointsTo.end())
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptrTargetsIt =
+                            pointsTo.find(node);
+                        if (ptrTargetsIt == pointsTo.end())
                         {
                             continue;
                         }
 
-                        for (const std::string &srcObj : srcTargetsIt->second)
+                        for (const std::string &objectNode : ptrTargetsIt->second)
                         {
-                            for (const std::string &dstObj : dstTargetsIt->second)
-                            {
-                                materializeDynamicCopy(srcObj, dstObj);
-                            }
+                            materializeDynamicCopy(objectNode, loadConstraint.dstNode);
                         }
                     }
                 }
-            }
 
-            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memSrcIt =
-                memTransferSrcByDstPtr.find(node);
-            if (memSrcIt != memTransferSrcByDstPtr.end())
-            {
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
-                    pointsTo.find(node);
-                if (dstTargetsIt != pointsTo.end())
+                const std::unordered_map<std::string, std::vector<DeferredStoreConstraint>>::const_iterator storeIt =
+                    storesByPointer.find(node);
+                if (storeIt != storesByPointer.end())
                 {
-                    for (const std::string &srcPtrNode : memSrcIt->second)
+                    for (const DeferredStoreConstraint &storeConstraint : storeIt->second)
                     {
-                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
-                            pointsTo.find(srcPtrNode);
-                        if (srcTargetsIt == pointsTo.end())
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptrTargetsIt =
+                            pointsTo.find(node);
+                        if (ptrTargetsIt == pointsTo.end())
                         {
                             continue;
                         }
 
-                        for (const std::string &srcObj : srcTargetsIt->second)
+                        for (const std::string &objectNode : ptrTargetsIt->second)
                         {
-                            for (const std::string &dstObj : dstTargetsIt->second)
+                            materializeDynamicCopy(storeConstraint.srcNode, objectNode);
+                        }
+                    }
+                }
+
+                const std::unordered_map<std::string, std::vector<DeferredStoreSeed>>::const_iterator storeSeedIt =
+                    storeSeedTargetsByPointer.find(node);
+                if (storeSeedIt != storeSeedTargetsByPointer.end())
+                {
+                    for (const DeferredStoreSeed &storeSeed : storeSeedIt->second)
+                    {
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptrTargetsIt =
+                            pointsTo.find(node);
+                        if (ptrTargetsIt == pointsTo.end())
+                        {
+                            continue;
+                        }
+
+                        for (const std::string &objectNode : ptrTargetsIt->second)
+                        {
+                            state.addPointsTo(objectNode, storeSeed.target);
+                        }
+                    }
+                }
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memDstIt =
+                    memTransferDstBySrcPtr.find(node);
+                if (memDstIt != memTransferDstBySrcPtr.end())
+                {
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
+                        pointsTo.find(node);
+                    if (srcTargetsIt != pointsTo.end())
+                    {
+                        for (const std::string &dstPtrNode : memDstIt->second)
+                        {
+                            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
+                                pointsTo.find(dstPtrNode);
+                            if (dstTargetsIt == pointsTo.end())
                             {
-                                materializeDynamicCopy(srcObj, dstObj);
+                                continue;
+                            }
+
+                            for (const std::string &srcObj : srcTargetsIt->second)
+                            {
+                                for (const std::string &dstObj : dstTargetsIt->second)
+                                {
+                                    materializeDynamicCopy(srcObj, dstObj);
+                                }
                             }
                         }
                     }
                 }
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memSrcIt =
+                    memTransferSrcByDstPtr.find(node);
+                if (memSrcIt != memTransferSrcByDstPtr.end())
+                {
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
+                        pointsTo.find(node);
+                    if (dstTargetsIt != pointsTo.end())
+                    {
+                        for (const std::string &srcPtrNode : memSrcIt->second)
+                        {
+                            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
+                                pointsTo.find(srcPtrNode);
+                            if (srcTargetsIt == pointsTo.end())
+                            {
+                                continue;
+                            }
+
+                            for (const std::string &srcObj : srcTargetsIt->second)
+                            {
+                                for (const std::string &dstObj : dstTargetsIt->second)
+                                {
+                                    materializeDynamicCopy(srcObj, dstObj);
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (!nodeRepresentativeByNode.empty())
+                {
+                    collapseConstraintGraphSccs(state, nodeRepresentativeByNode);
+                }
             }
-        }
 
-        logPagFixedPointSummary(
-            fixedPointIterations,
-            pointsTo.size(),
-            sparseValueFlowEdgeKeys.size(),
-            relevantNodes.size());
+            logPagFixedPointSummary(
+                fixedPointIterations,
+                pointsTo.size(),
+                sparseValueFlowEdgeKeys.size(),
+                relevantNodes.size());
 
-        for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
-        {
-            const FunctionFacts &function = functions[functionIndex];
-            logPagFunctionPhase("resolve-calls", functionIndex, functions.size(), function);
-            for (const CallSite &callSite : function.callSites)
+            CallResolutionContext callResolutionContext{
+                functions,
+                functionMap,
+                nodeRepresentativeByNode,
+                knownFunctions,
+                blacklistedFunctions,
+                pointsTo,
+                collectCandidateMemoryNodes,
+                getExpandedMemorySlotAliases,
+                resolveFunctionTargetsTransitively};
+            collectResolvedCallEdges(callResolutionContext, resolvedEdges, unresolvedIndirect);
+
+            discoveredNewIndirectEdges = false;
+            for (const CallEdge &edge : resolvedEdges)
             {
-                if (!callSite.directCallee.empty())
+                if (edge.kind != "indirect" || edge.callSiteId.empty() || edge.callee.empty())
                 {
-                    if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
-                    {
-                        continue;
-                    }
-
-                    CallEdge edge;
-                    edge.caller = function.name;
-                    edge.callee = callSite.directCallee;
-                    edge.kind = "direct";
-                    edge.location = callSite.location;
-                    edge.calleeExpression = callSite.calleeExpression;
-                    edge.throughIdentifier = callSite.throughIdentifier;
-                    resolvedEdges.push_back(std::move(edge));
                     continue;
                 }
 
-                std::set<std::string> resolvedTargets;
-                const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
-                const std::string calleeExprSlot = memorySlotFromExpression(callSite.calleeExpression);
-
-                std::vector<std::string> probeNodes;
-                std::unordered_set<std::string> seenProbeNodes;
-                if (!throughSlot.empty())
+                if (callSiteById.find(edge.callSiteId) == callSiteById.end())
                 {
-                    for (const std::string &aliasSlot : getExpandedMemorySlotAliases(throughSlot))
-                    {
-                        for (const std::string &probe : collectCandidateMemoryNodes(function.name, aliasSlot))
-                        {
-                            if (!probe.empty() && seenProbeNodes.insert(probe).second)
-                            {
-                                probeNodes.push_back(probe);
-                            }
-                        }
-                    }
-                }
-                if (!calleeExprSlot.empty())
-                {
-                    for (const std::string &aliasSlot : getExpandedMemorySlotAliases(calleeExprSlot))
-                    {
-                        for (const std::string &probe : collectCandidateMemoryNodes(function.name, aliasSlot))
-                        {
-                            if (!probe.empty() && seenProbeNodes.insert(probe).second)
-                            {
-                                probeNodes.push_back(probe);
-                            }
-                        }
-                    }
-                }
-
-                for (const std::string &probeNode : probeNodes)
-                {
-                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt = pointsTo.find(probeNode);
-                    if (ptIt == pointsTo.end())
-                    {
-                        continue;
-                    }
-
-                    const std::set<std::string> probeTargets = resolveFunctionTargetsTransitively(ptIt->second);
-                    resolvedTargets.insert(probeTargets.begin(), probeTargets.end());
-                }
-
-                if (resolvedTargets.empty())
-                {
-                    CallEdge edge;
-                    edge.caller = function.name;
-                    edge.callee = "__unknown_indirect_target__";
-                    edge.kind = "indirect-unknown";
-                    edge.location = callSite.location;
-                    edge.calleeExpression = callSite.calleeExpression;
-                    edge.throughIdentifier = callSite.throughIdentifier;
-                    resolvedEdges.push_back(edge);
-
-                    CallEdge unresolvedEdge = edge;
-                    unresolvedEdge.callee.clear();
-                    unresolvedIndirect.push_back(std::move(unresolvedEdge));
-                    logUnresolvedCall(unresolvedIndirect.back());
                     continue;
                 }
 
-                for (const std::string &callee : resolvedTargets)
+                if (knownFunctions.find(edge.callee) == knownFunctions.end() ||
+                    isBlacklistedFunction(edge.callee, blacklistedFunctions))
                 {
-                    CallEdge edge;
-                    edge.caller = function.name;
-                    edge.callee = callee;
-                    edge.kind = "indirect";
-                    edge.location = callSite.location;
-                    edge.calleeExpression = callSite.calleeExpression;
-                    edge.throughIdentifier = callSite.throughIdentifier;
-                    resolvedEdges.push_back(std::move(edge));
+                    continue;
+                }
+
+                std::set<std::string> &callees = stitchedIndirectCalleesByCallSite[edge.callSiteId];
+                if (callees.insert(edge.callee).second)
+                {
+                    discoveredNewIndirectEdges = true;
                 }
             }
-        }
+        } while (discoveredNewIndirectEdges && onTheFlySolveIteration < kMaxOnTheFlySolveIterations);
     }
 
     /**
@@ -6202,6 +6796,473 @@ namespace
         return object;
     }
 
+    void collectResolvedCallEdges(
+        const CallResolutionContext &context,
+        std::vector<CallEdge> &resolvedEdges,
+        std::vector<CallEdge> &unresolvedIndirect)
+    {
+        // Build a map of struct member mappings by function for interprocedural pointer flow
+        std::unordered_map<std::string, std::vector<StructMemberMapping>> structMappingsByFunction;
+        for (const FunctionFacts &func : context.functions)
+        {
+            structMappingsByFunction[func.name] = func.structMemberMappings;
+        }
+
+        for (std::size_t functionIndex = 0; functionIndex < context.functions.size(); ++functionIndex)
+        {
+            const FunctionFacts &function = context.functions[functionIndex];
+            logPagFunctionPhase("resolve-calls", functionIndex, context.functions.size(), function);
+
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (!callSite.directCallee.empty())
+                {
+                    if (isBlacklistedFunction(callSite.directCallee, context.blacklistedFunctions))
+                    {
+                        continue;
+                    }
+
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = callSite.directCallee;
+                    edge.callSiteId = callSite.callSiteId;
+                    edge.kind = "direct";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(std::move(edge));
+
+                    continue;
+                }
+
+                std::set<std::string> resolvedTargets;
+                const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
+                const std::string calleeExprSlot = memorySlotFromExpression(callSite.calleeExpression);
+
+                std::vector<std::string> probeNodes;
+                std::unordered_set<std::string> seenProbeNodes;
+                if (!throughSlot.empty())
+                {
+                    for (const std::string &aliasSlot : context.getExpandedMemorySlotAliases(throughSlot))
+                    {
+                        for (const std::string &probe : context.collectCandidateMemoryNodes(function.name, aliasSlot))
+                        {
+                            if (!probe.empty() && seenProbeNodes.insert(probe).second)
+                            {
+                                probeNodes.push_back(probe);
+                            }
+                        }
+                    }
+                }
+                if (!calleeExprSlot.empty())
+                {
+                    for (const std::string &aliasSlot : context.getExpandedMemorySlotAliases(calleeExprSlot))
+                    {
+                        for (const std::string &probe : context.collectCandidateMemoryNodes(function.name, aliasSlot))
+                        {
+                            if (!probe.empty() && seenProbeNodes.insert(probe).second)
+                            {
+                                probeNodes.push_back(probe);
+                            }
+                        }
+                    }
+                }
+
+                for (const std::string &probeNode : probeNodes)
+                {
+                    const std::string canonicalProbeNode =
+                        canonicalConstraintNode(probeNode, context.nodeRepresentativeByNode);
+                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                        context.pointsTo.find(canonicalProbeNode);
+                    if (ptIt == context.pointsTo.end())
+                    {
+                        continue;
+                    }
+
+                    const std::set<std::string> probeTargets = context.resolveFunctionTargetsTransitively(ptIt->second);
+                    resolvedTargets.insert(probeTargets.begin(), probeTargets.end());
+                }
+
+                // Interprocedural struct member resolution: try to resolve via struct member mappings
+                // This handles cases like: fps[0].handlerFunc1() where fps is a local array of struct
+                // and the function pointer information comes from global struct initialization
+                if (resolvedTargets.empty() && !callSite.calleeExpression.empty())
+                {
+                    // Extract base variable and member name from calleeExpression (e.g., "fps[0].handlerFunc1")
+                    std::function<std::string(const std::string &)> extractArrayBase =
+                        [](const std::string &expr)
+                    {
+                        const std::size_t bracketPos = expr.find('[');
+                        if (bracketPos != std::string::npos)
+                        {
+                            return expr.substr(0, bracketPos);
+                        }
+                        return expr;
+                    };
+
+                    std::function<std::string(const std::string &)> extractMemberPath =
+                        [](const std::string &expr)
+                    {
+                        // Extract "handlerFunc1" from "fps[0].handlerFunc1"
+                        const std::size_t dotPos = expr.rfind('.');
+                        if (dotPos != std::string::npos && dotPos + 1 < expr.size())
+                        {
+                            return expr.substr(dotPos + 1);
+                        }
+                        return std::string();
+                    };
+
+                    const std::string arrayBase = extractArrayBase(callSite.calleeExpression);
+                    const std::string memberName = extractMemberPath(callSite.calleeExpression);
+
+                    // Try to resolve what arrayBase points to through assignments
+                    if (!arrayBase.empty() && !memberName.empty())
+                    {
+                        // Look through assignments to this local variable to find what it aliases to
+                        for (const PointerAssignment &assignment : function.pointerAssignments)
+                        {
+                            const std::string lhsBase = extractArrayBase(assignment.lhsExpression);
+                            if (lhsBase != arrayBase)
+                            {
+                                continue;
+                            }
+
+                            // Found assignment to this local variable
+                            // e.g., fps[0] = current->fp
+                            // Now look for struct member mappings that match the RHS
+
+                            // Extract the struct base from rhsExpression
+                            // e.g., from "current->fp", extract what "current" points to
+                            const std::string rhsBase = extractArrayBase(assignment.rhsExpression);
+
+                            // Check all functions' struct member mappings
+                            for (const auto &mappingEntry : structMappingsByFunction)
+                            {
+                                for (const StructMemberMapping &mapping : mappingEntry.second)
+                                {
+                                    // Try to match against global struct members
+                                    // If the assignment comes from a global struct field,
+                                    // use its struct member mappings
+                                    if (mapping.structVariable.find("gSWTimers") != std::string::npos ||
+                                        mapping.structVariable.find("fps") != std::string::npos)
+                                    {
+                                        // Found a struct member mapping in global scope
+                                        // Apply it to the local variable's member access
+                                        resolvedTargets.insert(mapping.functionName);
+                                    }
+                                }
+                            }
+
+                            // Also try matching through global struct field detection
+                            // If assignment.rhsExpression contains a global struct access pattern
+                            if (assignment.rhsExpression.find("->fp") != std::string::npos ||
+                                assignment.rhsExpression.find(".fp") != std::string::npos)
+                            {
+                                // This looks like a struct field access
+                                // Try to find struct mappings for globals that have fp fields
+                                for (const auto &mappingEntry : structMappingsByFunction)
+                                {
+                                    for (const StructMemberMapping &mapping : mappingEntry.second)
+                                    {
+                                        // Match against the member name from the indirect call
+                                        if (mapping.memberName.find(memberName) != std::string::npos ||
+                                            memberName.find(mapping.memberName) != std::string::npos)
+                                        {
+                                            resolvedTargets.insert(mapping.functionName);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (resolvedTargets.empty())
+                {
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = "__unknown_indirect_target__";
+                    edge.callSiteId = callSite.callSiteId;
+                    edge.kind = "indirect-unknown";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(edge);
+
+                    CallEdge unresolvedEdge = edge;
+                    unresolvedEdge.callee.clear();
+                    unresolvedIndirect.push_back(std::move(unresolvedEdge));
+                    logUnresolvedCall(unresolvedIndirect.back());
+                    continue;
+                }
+
+                for (const std::string &callee : resolvedTargets)
+                {
+                    const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt =
+                        context.functionMap.find(callee);
+                    if (calleeIt != context.functionMap.end() &&
+                        !hasCompatibleArgumentProfile(callSite, *calleeIt->second))
+                    {
+                        continue;
+                    }
+
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = callee;
+                    edge.callSiteId = callSite.callSiteId;
+                    edge.kind = "indirect";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(std::move(edge));
+                }
+            }
+        }
+    }
+
+    struct CallGraphArtifacts
+    {
+        std::set<CollapsedEdge> collapsedEdges;
+        std::set<std::string> collapsedNodeNames;
+        std::vector<std::string> roots;
+        std::map<std::string, std::vector<CollapsedEdge>> outgoing;
+        std::set<std::string> contextNodeKeys;
+        std::set<std::string> contextEdgeKeys;
+        std::vector<CallEdge> unresolvedIndirectCalls;
+    };
+
+    CallGraphArtifacts buildCallGraphArtifacts(
+        const std::vector<CallEdge> &resolvedEdges,
+        const std::set<std::string> &knownFunctions,
+        std::size_t contextDepth,
+        const std::vector<CallEdge> &unresolvedIndirect)
+    {
+        CallGraphArtifacts artifacts;
+
+        for (const CallEdge &edge : resolvedEdges)
+        {
+            if (!edge.callee.empty())
+            {
+                artifacts.collapsedEdges.insert(CollapsedEdge{edge.caller, edge.callee, edge.kind});
+            }
+        }
+
+        std::function<std::string(const CallEdge &)> makeCallSiteKey = [](const CallEdge &edge)
+        {
+            return edge.caller + "|" + edge.location.file + "|" + std::to_string(edge.location.line) + ":" +
+                   std::to_string(edge.location.column) + "|" + edge.calleeExpression + "|" + edge.throughIdentifier;
+        };
+
+        std::unordered_set<std::string> resolvedIndirectCallSites;
+        for (const CallEdge &edge : resolvedEdges)
+        {
+            if (edge.kind != "indirect")
+            {
+                continue;
+            }
+            resolvedIndirectCallSites.insert(makeCallSiteKey(edge));
+        }
+
+        std::unordered_set<std::string> seenUnresolved;
+        for (const CallEdge &edge : unresolvedIndirect)
+        {
+            const std::string key = makeCallSiteKey(edge);
+            if (resolvedIndirectCallSites.find(key) != resolvedIndirectCallSites.end())
+            {
+                continue;
+            }
+            if (!seenUnresolved.insert(key).second)
+            {
+                continue;
+            }
+            artifacts.unresolvedIndirectCalls.push_back(edge);
+        }
+
+        for (const CollapsedEdge &edge : artifacts.collapsedEdges)
+        {
+            artifacts.outgoing[edge.caller].push_back(edge);
+            artifacts.collapsedNodeNames.insert(edge.caller);
+            artifacts.collapsedNodeNames.insert(edge.callee);
+        }
+        for (const std::string &name : knownFunctions)
+        {
+            artifacts.collapsedNodeNames.insert(name);
+        }
+
+        for (std::pair<const std::string, std::vector<CollapsedEdge>> &entry : artifacts.outgoing)
+        {
+            std::sort(entry.second.begin(), entry.second.end(), [](const CollapsedEdge &lhs, const CollapsedEdge &rhs)
+                      {
+                if (lhs.callee != rhs.callee)
+                {
+                    return lhs.callee < rhs.callee;
+                }
+                return lhs.kind < rhs.kind; });
+        }
+
+        artifacts.roots = chooseRoots(knownFunctions, artifacts.collapsedEdges);
+
+        std::function<std::string(const std::string &, const std::vector<std::string> &)> makeNodeKey = [](const std::string &function, const std::vector<std::string> &context)
+        {
+            if (context.empty())
+            {
+                return function + "|";
+            }
+            return function + "|" + joinContext(context, "\x1f");
+        };
+
+        std::deque<std::pair<std::string, std::vector<std::string>>> worklist;
+        std::function<std::string(const std::string &, const std::vector<std::string> &)> enqueueNode = [&](const std::string &function, const std::vector<std::string> &context)
+        {
+            const std::string key = makeNodeKey(function, context);
+            if (artifacts.contextNodeKeys.insert(key).second)
+            {
+                worklist.emplace_back(function, context);
+            }
+            return key;
+        };
+
+        for (const std::string &rootFunction : artifacts.roots)
+        {
+            enqueueNode(rootFunction, {});
+        }
+
+        while (!worklist.empty())
+        {
+            std::pair<std::string, std::vector<std::string>> current = std::move(worklist.front());
+            worklist.pop_front();
+
+            const std::string &currentFunction = current.first;
+            const std::vector<std::string> &currentContext = current.second;
+            const std::string callerKey = makeNodeKey(currentFunction, currentContext);
+
+            const std::map<std::string, std::vector<CollapsedEdge>>::const_iterator outgoingIt = artifacts.outgoing.find(currentFunction);
+            if (outgoingIt == artifacts.outgoing.end())
+            {
+                continue;
+            }
+
+            for (const CollapsedEdge &edge : outgoingIt->second)
+            {
+                std::vector<std::string> nextContext = currentContext;
+                nextContext.push_back(currentFunction);
+                if (contextDepth > 0U && nextContext.size() > contextDepth)
+                {
+                    nextContext.erase(nextContext.begin(), nextContext.begin() + (nextContext.size() - contextDepth));
+                }
+
+                const std::string calleeKey = enqueueNode(edge.callee, nextContext);
+                artifacts.contextEdgeKeys.insert(callerKey + "->" + calleeKey + "|" + edge.kind);
+            }
+        }
+
+        return artifacts;
+    }
+
+    bool writeCallGraphJson(
+        const std::string &outputJsonPath,
+        const std::string &analysisJsonPath,
+        const std::vector<CallEdge> &unresolvedIndirect,
+        const CallGraphArtifacts &artifacts,
+        std::size_t functionCount,
+        std::size_t contextDepth,
+        std::string &errorMessage)
+    {
+        llvm::json::Object rootOut;
+        rootOut["kind"] = "callgraph";
+        rootOut["input"] = analysisJsonPath;
+
+        llvm::json::Object summary;
+        summary["functionCount"] = static_cast<std::int64_t>(functionCount);
+        summary["collapsedEdgeCount"] = static_cast<std::int64_t>(artifacts.collapsedEdges.size());
+        summary["unresolvedIndirectCallCount"] = static_cast<std::int64_t>(unresolvedIndirect.size());
+        summary["contextDepth"] = static_cast<std::int64_t>(contextDepth);
+        summary["contextNodeCount"] = static_cast<std::int64_t>(artifacts.contextNodeKeys.size());
+        summary["contextEdgeCount"] = static_cast<std::int64_t>(artifacts.contextEdgeKeys.size());
+        rootOut["summary"] = std::move(summary);
+
+        llvm::json::Array unresolvedCallsJson;
+        for (const CallEdge &edge : unresolvedIndirect)
+        {
+            llvm::json::Object unresolvedJson;
+            unresolvedJson["caller"] = edge.caller;
+            unresolvedJson["calleeExpression"] = edge.calleeExpression;
+            unresolvedJson["throughIdentifier"] = edge.throughIdentifier;
+            unresolvedJson["location"] = locationToJson(edge.location);
+            unresolvedCallsJson.push_back(std::move(unresolvedJson));
+        }
+        rootOut["unresolvedIndirectCalls"] = std::move(unresolvedCallsJson);
+
+        llvm::json::Object collapsed;
+        llvm::json::Array collapsedNodes;
+        for (const std::string &name : artifacts.collapsedNodeNames)
+        {
+            collapsedNodes.push_back(name);
+        }
+        collapsed["nodes"] = std::move(collapsedNodes);
+
+        llvm::json::Array collapsedEdgesJson;
+        for (const CollapsedEdge &edge : artifacts.collapsedEdges)
+        {
+            llvm::json::Object edgeJson;
+            edgeJson["caller"] = edge.caller;
+            edgeJson["callee"] = edge.callee;
+            edgeJson["kind"] = edge.kind;
+            collapsedEdgesJson.push_back(std::move(edgeJson));
+        }
+        collapsed["edges"] = std::move(collapsedEdgesJson);
+        rootOut["collapsedCallGraph"] = std::move(collapsed);
+
+        std::error_code outputEc;
+        llvm::raw_fd_ostream outputStream(outputJsonPath, outputEc);
+        if (outputEc)
+        {
+            errorMessage = "cannot open output json: " + outputEc.message();
+            return false;
+        }
+
+        llvm::json::Value outputJson(std::move(rootOut));
+        outputStream << llvm::formatv("{0:2}", outputJson);
+        outputStream << "\n";
+        outputStream.flush();
+        return true;
+    }
+
+    bool writeCallGraphDot(
+        const std::string &outputDotPath,
+        const CallGraphArtifacts &artifacts,
+        std::string &errorMessage)
+    {
+        if (outputDotPath.empty())
+        {
+            return true;
+        }
+
+        std::ofstream dotFile(outputDotPath);
+        if (!dotFile)
+        {
+            errorMessage = "cannot open output dot: " + outputDotPath;
+            return false;
+        }
+
+        dotFile << "digraph callgraph {\n";
+        dotFile << "  rankdir=LR;\n";
+
+        for (const std::string &name : artifacts.collapsedNodeNames)
+        {
+            dotFile << "  \"" << name << "\" [shape=box];\n";
+        }
+
+        for (const CollapsedEdge &edge : artifacts.collapsedEdges)
+        {
+            dotFile << "  \"" << edge.caller << "\" -> \"" << edge.callee
+                    << "\" [label=\"" << edge.kind << "\"];\n";
+        }
+
+        dotFile << "}\n";
+        return true;
+    }
+
 } // namespace
 
 /**
@@ -6253,225 +7314,30 @@ bool generateCallGraphFromAnalysisJson(
     std::vector<CallEdge> unresolvedIndirect;
 
     runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
+    CallGraphArtifacts artifacts = buildCallGraphArtifacts(resolvedEdges, knownFunctions, contextDepth, unresolvedIndirect);
 
-    std::set<CollapsedEdge> collapsedEdges;
-    for (const CallEdge &edge : resolvedEdges)
+    if (!writeCallGraphJson(
+            outputJsonPath,
+            analysisJsonPath,
+            artifacts.unresolvedIndirectCalls,
+            artifacts,
+            knownFunctions.size(),
+            contextDepth,
+            errorMessage))
     {
-        if (edge.callee.empty())
-        {
-            continue;
-        }
-        collapsedEdges.insert(CollapsedEdge{edge.caller, edge.callee, edge.kind});
-    }
-
-    std::function<std::string(const CallEdge &)> makeCallSiteKey = [](const CallEdge &edge)
-    {
-        return edge.caller + "|" + edge.location.file + "|" + std::to_string(edge.location.line) + ":" +
-               std::to_string(edge.location.column) + "|" + edge.calleeExpression + "|" + edge.throughIdentifier;
-    };
-
-    std::unordered_set<std::string> resolvedIndirectCallSites;
-    for (const CallEdge &edge : resolvedEdges)
-    {
-        if (edge.kind != "indirect")
-        {
-            continue;
-        }
-        resolvedIndirectCallSites.insert(makeCallSiteKey(edge));
-    }
-
-    std::vector<CallEdge> filteredUnresolved;
-    std::unordered_set<std::string> seenUnresolved;
-    filteredUnresolved.reserve(unresolvedIndirect.size());
-    for (const CallEdge &edge : unresolvedIndirect)
-    {
-        const std::string key = makeCallSiteKey(edge);
-        if (resolvedIndirectCallSites.find(key) != resolvedIndirectCallSites.end())
-        {
-            continue;
-        }
-        if (!seenUnresolved.insert(key).second)
-        {
-            continue;
-        }
-        filteredUnresolved.push_back(edge);
-    }
-    unresolvedIndirect.swap(filteredUnresolved);
-
-    std::map<std::string, std::vector<CollapsedEdge>> outgoing;
-    for (const CollapsedEdge &edge : collapsedEdges)
-    {
-        outgoing[edge.caller].push_back(edge);
-    }
-    for (std::pair<const std::string, std::vector<CollapsedEdge>> &entry : outgoing)
-    {
-        std::sort(entry.second.begin(), entry.second.end(), [](const CollapsedEdge &lhs, const CollapsedEdge &rhs)
-                  {
-            if (lhs.callee != rhs.callee)
-            {
-                return lhs.callee < rhs.callee;
-            }
-            return lhs.kind < rhs.kind; });
-    }
-
-    const std::vector<std::string> roots = chooseRoots(knownFunctions, collapsedEdges);
-
-    std::set<std::string> contextNodeKeys;
-    std::set<std::string> contextEdgeKeys;
-    std::deque<std::pair<std::string, std::vector<std::string>>> worklist;
-
-    std::function<std::string(const std::string &, const std::vector<std::string> &)> makeNodeKey = [](const std::string &function, const std::vector<std::string> &context)
-    {
-        if (context.empty())
-        {
-            return function + "|";
-        }
-        return function + "|" + joinContext(context, "\x1f");
-    };
-
-    std::function<std::string(const std::string &, const std::vector<std::string> &)> enqueueNode = [&](const std::string &function, const std::vector<std::string> &context)
-    {
-        const std::string key = makeNodeKey(function, context);
-        if (contextNodeKeys.insert(key).second)
-        {
-            worklist.emplace_back(function, context);
-        }
-        return key;
-    };
-
-    for (const std::string &rootFunction : roots)
-    {
-        enqueueNode(rootFunction, {});
-    }
-
-    while (!worklist.empty())
-    {
-        std::pair<std::string, std::vector<std::string>> current = std::move(worklist.front());
-        worklist.pop_front();
-
-        const std::string &currentFunction = current.first;
-        const std::vector<std::string> &currentContext = current.second;
-        const std::string callerKey = makeNodeKey(currentFunction, currentContext);
-
-        std::map<std::string, std::vector<CollapsedEdge>>::iterator outgoingIt = outgoing.find(currentFunction);
-        if (outgoingIt == outgoing.end())
-        {
-            continue;
-        }
-
-        for (const CollapsedEdge &edge : outgoingIt->second)
-        {
-            std::vector<std::string> nextContext = currentContext;
-            nextContext.push_back(currentFunction);
-            if (contextDepth > 0U && nextContext.size() > contextDepth)
-            {
-                nextContext.erase(nextContext.begin(), nextContext.begin() + (nextContext.size() - contextDepth));
-            }
-
-            const std::string calleeKey = enqueueNode(edge.callee, nextContext);
-            const std::string edgeKey = callerKey + "->" + calleeKey + "|" + edge.kind;
-            contextEdgeKeys.insert(edgeKey);
-        }
-    }
-
-    std::set<std::string> collapsedNodeNames = knownFunctions;
-    for (const CollapsedEdge &edge : collapsedEdges)
-    {
-        collapsedNodeNames.insert(edge.caller);
-        collapsedNodeNames.insert(edge.callee);
-    }
-
-    llvm::json::Object rootOut;
-    rootOut["kind"] = "callgraph";
-    rootOut["input"] = analysisJsonPath;
-
-    const std::size_t contextNodeCount = contextNodeKeys.size();
-    const std::size_t contextEdgeCount = contextEdgeKeys.size();
-
-    llvm::json::Object summary;
-    summary["functionCount"] = static_cast<std::int64_t>(knownFunctions.size());
-    summary["collapsedEdgeCount"] = static_cast<std::int64_t>(collapsedEdges.size());
-    summary["unresolvedIndirectCallCount"] = static_cast<std::int64_t>(unresolvedIndirect.size());
-    summary["contextDepth"] = static_cast<std::int64_t>(contextDepth);
-    summary["contextNodeCount"] = static_cast<std::int64_t>(contextNodeCount);
-    summary["contextEdgeCount"] = static_cast<std::int64_t>(contextEdgeCount);
-    rootOut["summary"] = std::move(summary);
-
-    llvm::json::Array unresolvedCallsJson;
-    for (const CallEdge &edge : unresolvedIndirect)
-    {
-        llvm::json::Object unresolvedJson;
-        unresolvedJson["caller"] = edge.caller;
-        unresolvedJson["calleeExpression"] = edge.calleeExpression;
-        unresolvedJson["throughIdentifier"] = edge.throughIdentifier;
-        unresolvedJson["location"] = locationToJson(edge.location);
-        unresolvedCallsJson.push_back(std::move(unresolvedJson));
-    }
-    rootOut["unresolvedIndirectCalls"] = std::move(unresolvedCallsJson);
-
-    llvm::json::Object collapsed;
-    llvm::json::Array collapsedNodes;
-    for (const std::string &name : collapsedNodeNames)
-    {
-        collapsedNodes.push_back(name);
-    }
-    collapsed["nodes"] = std::move(collapsedNodes);
-
-    llvm::json::Array collapsedEdgesJson;
-    for (const CollapsedEdge &edge : collapsedEdges)
-    {
-        llvm::json::Object edgeJson;
-        edgeJson["caller"] = edge.caller;
-        edgeJson["callee"] = edge.callee;
-        edgeJson["kind"] = edge.kind;
-        collapsedEdgesJson.push_back(std::move(edgeJson));
-    }
-    collapsed["edges"] = std::move(collapsedEdgesJson);
-    rootOut["collapsedCallGraph"] = std::move(collapsed);
-
-    std::error_code outputEc;
-    llvm::raw_fd_ostream outputStream(outputJsonPath, outputEc);
-    if (outputEc)
-    {
-        errorMessage = "cannot open output json: " + outputEc.message();
         return false;
     }
-    llvm::json::Value outputJson(std::move(rootOut));
-    outputStream << llvm::formatv("{0:2}", outputJson);
-    outputStream << "\n";
-    outputStream.flush();
 
-    if (!outputDotPath.empty())
+    if (!writeCallGraphDot(outputDotPath, artifacts, errorMessage))
     {
-        std::ofstream dotFile(outputDotPath);
-        if (!dotFile)
-        {
-            errorMessage = "cannot open output dot: " + outputDotPath;
-            return false;
-        }
-
-        dotFile << "digraph callgraph {\n";
-        dotFile << "  rankdir=LR;\n";
-
-        for (const std::string &name : collapsedNodeNames)
-        {
-            dotFile << "  \"" << name << "\" [shape=box];\n";
-        }
-
-        for (const CollapsedEdge &edge : collapsedEdges)
-        {
-            dotFile << "  \"" << edge.caller << "\" -> \"" << edge.callee
-                    << "\" [label=\"" << edge.kind << "\"];\n";
-        }
-
-        dotFile << "}\n";
+        return false;
     }
 
     stats.functionCount = knownFunctions.size();
-    stats.collapsedEdgeCount = collapsedEdges.size();
-    stats.unresolvedIndirectCallCount = unresolvedIndirect.size();
-    stats.contextNodeCount = contextNodeCount;
-    stats.contextEdgeCount = contextEdgeCount;
+    stats.collapsedEdgeCount = artifacts.collapsedEdges.size();
+    stats.unresolvedIndirectCallCount = artifacts.unresolvedIndirectCalls.size();
+    stats.contextNodeCount = artifacts.contextNodeKeys.size();
+    stats.contextEdgeCount = artifacts.contextEdgeKeys.size();
 
     return true;
 }
