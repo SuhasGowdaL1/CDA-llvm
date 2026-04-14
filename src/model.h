@@ -76,6 +76,7 @@ struct SerializedBlock
 struct FunctionAttributes
 {
     bool callsStateChange = false;
+    bool returnsPointerLike = false;
     std::vector<std::string> parameterNames;
     std::vector<CallSiteRecord> callSites;
     std::vector<PointerAssignmentRecord> pointerAssignments;

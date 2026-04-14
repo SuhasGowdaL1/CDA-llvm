@@ -2169,6 +2169,12 @@ namespace
                 }
             }
 
+            const clang::QualType returnType = functionDecl->getReturnType();
+            function.attributes.returnsPointerLike =
+                returnType->isAnyPointerType() ||
+                returnType->isBlockPointerType() ||
+                returnType->isReferenceType();
+
             function.attributes.callSites = callVisitor.callSites();
             function.attributes.pointerAssignments = globalPointerAssignments_;
             function.attributes.pointerAssignments.insert(

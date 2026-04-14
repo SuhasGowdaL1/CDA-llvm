@@ -409,6 +409,11 @@ namespace
             << ",\n";
 
         writeIndent(out, indent + 4);
+        out << "\"returnsPointerLike\": "
+            << (function.attributes.returnsPointerLike ? "true" : "false")
+            << ",\n";
+
+        writeIndent(out, indent + 4);
         out << "\"stateChangeParameterValues\": ";
         writeStateChangeValues(out, function.attributes.stateChangeParameterValues, indent + 4);
         out << ",\n";
