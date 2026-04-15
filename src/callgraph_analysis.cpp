@@ -2554,6 +2554,44 @@ namespace
             }
         }
 
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (callSite.directCallee.empty())
+                {
+                    continue;
+                }
+
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator calleeParamsIt =
+                    parameterSlotsByFunction.find(callSite.directCallee);
+                if (calleeParamsIt == parameterSlotsByFunction.end())
+                {
+                    continue;
+                }
+
+                const std::vector<std::string> &calleeParams = calleeParamsIt->second;
+                const std::size_t limit = std::min(calleeParams.size(), callSite.argumentExpressions.size());
+                for (std::size_t i = 0; i < limit; ++i)
+                {
+                    bool argumentCarriesFunction = false;
+                    for (const std::string &identifier : extractIdentifiers(callSite.argumentExpressions[i]))
+                    {
+                        if (knownFunctions.find(identifier) != knownFunctions.end())
+                        {
+                            argumentCarriesFunction = true;
+                            break;
+                        }
+                    }
+
+                    if (argumentCarriesFunction)
+                    {
+                        recordFunctionPointerRelevantSlot(calleeParams[i]);
+                    }
+                }
+            }
+        }
+
         std::function<bool(const std::string &)> isFunctionPointerRelevantSlot =
             [&](const std::string &slot)
         {
@@ -3176,19 +3214,8 @@ namespace
                 const std::string root = memorySlotRoot(normalized);
                 const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator rootRefsIt =
                     referencedFunctionsBySlot.find(root);
-                const bool sharedAcrossFunctions =
-                    (refsIt != referencedFunctionsBySlot.end() && refsIt->second.size() > 1U) ||
-                    (!root.empty() && rootRefsIt != referencedFunctionsBySlot.end() && rootRefsIt->second.size() > 1U);
-                const bool sharedAddressTakenSlot =
-                    addressTakenTrackedSlots.find(normalized) != addressTakenTrackedSlots.end() ||
-                    (!root.empty() && addressTakenTrackedSlots.find(root) != addressTakenTrackedSlots.end());
-                if (sharedAcrossFunctions &&
-                    (normalized.find('.') != std::string::npos ||
-                     normalized.find('[') != std::string::npos ||
-                     sharedAddressTakenSlot))
-                {
-                    addNode("g::" + normalized);
-                }
+                (void)refsIt;
+                (void)rootRefsIt;
 
                 return nodes;
             };
@@ -3313,6 +3340,17 @@ namespace
 
                 const std::string root = memorySlotRoot(normalized);
                 if (root.empty() || root == normalized)
+                {
+                    return;
+                }
+
+                const bool normalizedIsGlobal =
+                    globalRoots.find(memorySlotRoot(normalized)) != globalRoots.end() ||
+                    globalSlots.find(normalized) != globalSlots.end();
+                const bool rootIsGlobal =
+                    globalRoots.find(memorySlotRoot(root)) != globalRoots.end() ||
+                    globalSlots.find(root) != globalSlots.end();
+                if (normalizedIsGlobal || rootIsGlobal)
                 {
                     return;
                 }
@@ -3996,14 +4034,7 @@ namespace
                         }
                     }
 
-                    // Conservative aggregate summary: global field slots may flow through the global base slot.
-                    const std::string lhsRoot = memorySlotRoot(lhsSlot);
-                    if (!lhsSlot.empty() && lhsRoot != lhsSlot && globalRoots.find(lhsRoot) != globalRoots.end())
-                    {
-                        const std::string lhsBaseNode = memoryNode(function.name, lhsRoot);
-                        state.addCopyEdge(lhsNode, lhsBaseNode);
-                        state.addCopyEdge(lhsBaseNode, lhsNode);
-                    }
+                    // Keep global field slots distinct to avoid over-merging unrelated global members.
 
                     if ((rhsIsLoad || lhsIsStore || hasPointerCast) && !lhsSlot.empty())
                     {
@@ -4964,31 +4995,6 @@ namespace
         std::vector<CallEdge> &resolvedEdges,
         std::vector<CallEdge> &unresolvedIndirect)
     {
-        // Pre-index struct member mappings for interprocedural fallback lookups.
-        SmallStringList globalStructMappingTargets;
-        std::vector<std::pair<std::string, std::string>> structMemberTargetPairs;
-        for (const FunctionFacts &func : context.functions)
-        {
-            for (const StructMemberMapping &mapping : func.structMemberMappings)
-            {
-                if (mapping.functionName.empty())
-                {
-                    continue;
-                }
-
-                if (mapping.structVariable.find("gSWTimers") != std::string::npos ||
-                    mapping.structVariable.find("fps") != std::string::npos)
-                {
-                    appendUnique(globalStructMappingTargets, mapping.functionName);
-                }
-
-                if (!mapping.memberName.empty())
-                {
-                    structMemberTargetPairs.push_back(std::make_pair(mapping.memberName, mapping.functionName));
-                }
-            }
-        }
-
         std::unordered_map<std::string, SmallStringList> resolvedTargetsByProbeNode;
         resolvedTargetsByProbeNode.reserve(context.pointsTo.size() * 2U + 1U);
 
@@ -5033,6 +5039,78 @@ namespace
 
             return candidateNodesByFunctionSlotCache.emplace(cacheKey, context.collectCandidateMemoryNodes(functionName, slot)).first->second;
         };
+
+        std::unordered_map<std::string, SmallStringList> exactMemberTargetsByPath;
+        for (const FunctionFacts &func : context.functions)
+        {
+            for (const PointerAssignment &assignment : func.pointerAssignments)
+            {
+                const std::string lhsExpression = trimLine(assignment.lhsExpression);
+                const std::size_t dotPos = lhsExpression.rfind('.');
+                if (dotPos == std::string::npos || dotPos + 1U >= lhsExpression.size())
+                {
+                    continue;
+                }
+
+                const std::string lhsBaseExpr = trimLine(lhsExpression.substr(0U, dotPos));
+                const std::string lhsMember = lhsExpression.substr(dotPos + 1U);
+                const std::string lhsBase = memorySlotFromExpression(lhsBaseExpr);
+                if (lhsBase.empty() || lhsMember.empty())
+                {
+                    continue;
+                }
+
+                SmallStringList &targets = exactMemberTargetsByPath[memorySlotRoot(lhsBase) + "." + lhsMember];
+
+                for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
+                {
+                    if (context.functionMap.find(identifier) != context.functionMap.end())
+                    {
+                        appendUnique(targets, identifier);
+                    }
+                }
+
+                const auto appendTargetsFromSlot = [&](const std::string &slot)
+                {
+                    const std::string normalizedSlot = memorySlotFromExpression(slot).empty() ? trimLine(slot) : memorySlotFromExpression(slot);
+                    if (normalizedSlot.empty())
+                    {
+                        return;
+                    }
+
+                    SmallStringList slotNodes;
+                    for (const std::string &node : getCachedCandidateNodes(func.name, normalizedSlot))
+                    {
+                        appendUnique(slotNodes, node);
+                    }
+                    appendUnique(slotNodes, func.name + "::" + normalizedSlot);
+                    appendUnique(slotNodes, "g::" + normalizedSlot);
+                    appendUnique(slotNodes, normalizedSlot);
+
+                    for (const std::string &node : slotNodes)
+                    {
+                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator ptIt =
+                            context.pointsTo.find(node);
+                        if (ptIt == context.pointsTo.end())
+                        {
+                            continue;
+                        }
+
+                        const SmallStringList resolved = context.resolveFunctionTargetsTransitively(ptIt->second);
+                        for (const std::string &resolvedTarget : resolved)
+                        {
+                            appendUnique(targets, resolvedTarget);
+                        }
+                    }
+                };
+
+                appendTargetsFromSlot(memorySlotFromExpression(assignment.rhsExpression));
+                for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
+                {
+                    appendTargetsFromSlot(identifier);
+                }
+            }
+        }
 
         for (std::size_t functionIndex = 0; functionIndex < context.functions.size(); ++functionIndex)
         {
@@ -5151,80 +5229,41 @@ namespace
                     }
                 }
 
-                // Interprocedural struct member resolution: try to resolve via struct member mappings
-                // This handles cases like: fps[0].handlerFunc1() where fps is a local array of struct
-                // and the function pointer information comes from global struct initialization
-                if (resolvedTargets.empty() && !callSite.calleeExpression.empty())
+                if (resolvedTargets.empty() && callSite.calleeExpression.find('.') != std::string::npos)
                 {
-                    // Extract base variable and member name from calleeExpression (e.g., "fps[0].handlerFunc1")
-                    std::function<std::string(const std::string &)> extractArrayBase =
-                        [](const std::string &expr)
+                    const std::size_t memberDot = callSite.calleeExpression.rfind('.');
+                    if (memberDot != std::string::npos && memberDot + 1U < callSite.calleeExpression.size())
                     {
-                        const std::size_t bracketPos = expr.find('[');
-                        if (bracketPos != std::string::npos)
+                        const std::string memberName = callSite.calleeExpression.substr(memberDot + 1U);
+                        const std::string callMemberPath =
+                            memorySlotRoot(trimLine(callSite.calleeExpression.substr(0U, memberDot))) +
+                            "." +
+                            memberName;
+
+                        const std::unordered_map<std::string, SmallStringList>::const_iterator exactMemberIt =
+                            exactMemberTargetsByPath.find(callMemberPath);
+                        if (exactMemberIt != exactMemberTargetsByPath.end())
                         {
-                            return expr.substr(0, bracketPos);
-                        }
-                        return expr;
-                    };
-
-                    std::function<std::string(const std::string &)> extractMemberPath =
-                        [](const std::string &expr)
-                    {
-                        // Extract "handlerFunc1" from "fps[0].handlerFunc1"
-                        const std::size_t dotPos = expr.rfind('.');
-                        if (dotPos != std::string::npos && dotPos + 1 < expr.size())
-                        {
-                            return expr.substr(dotPos + 1);
-                        }
-                        return std::string();
-                    };
-
-                    const std::string arrayBase = extractArrayBase(callSite.calleeExpression);
-                    const std::string memberName = extractMemberPath(callSite.calleeExpression);
-
-                    // Try to resolve what arrayBase points to through assignments
-                    if (!arrayBase.empty() && !memberName.empty())
-                    {
-                        // Look through assignments to this local variable to find what it aliases to.
-                        bool hasAliasAssignment = false;
-                        bool hasStructFieldAssignment = false;
-                        for (const PointerAssignment &assignment : function.pointerAssignments)
-                        {
-                            const std::string lhsBase = extractArrayBase(assignment.lhsExpression);
-                            if (lhsBase != arrayBase)
-                            {
-                                continue;
-                            }
-
-                            hasAliasAssignment = true;
-                            if (assignment.rhsExpression.find("->fp") != std::string::npos ||
-                                assignment.rhsExpression.find(".fp") != std::string::npos)
-                            {
-                                hasStructFieldAssignment = true;
-                            }
-                        }
-
-                        if (hasAliasAssignment)
-                        {
-                            // Found assignment to this local variable (for example, fps[0] = current->fp).
-                            // Apply global struct mapping fallback once instead of rescanning all mappings
-                            // for every matching assignment.
-                            for (const std::string &target : globalStructMappingTargets)
+                            for (const std::string &target : exactMemberIt->second)
                             {
                                 appendUnique(resolvedTargets, target);
                             }
                         }
 
-                        if (hasAliasAssignment && hasStructFieldAssignment)
+                        if (resolvedTargets.empty() && !memberName.empty())
                         {
-                            // If assignment RHS looks like struct field access, match by member name.
-                            for (const std::pair<std::string, std::string> &memberTargetPair : structMemberTargetPairs)
+                            const std::string memberSuffix = "." + memberName;
+                            for (const std::pair<const std::string, SmallStringList> &entry : exactMemberTargetsByPath)
                             {
-                                if (memberTargetPair.first.find(memberName) != std::string::npos ||
-                                    memberName.find(memberTargetPair.first) != std::string::npos)
+                                if (entry.first.size() < memberSuffix.size() ||
+                                    entry.first.compare(entry.first.size() - memberSuffix.size(), memberSuffix.size(), memberSuffix) != 0)
                                 {
-                                    appendUnique(resolvedTargets, memberTargetPair.second);
+                                    continue;
+                                }
+
+                                for (const std::string &target : entry.second)
+                                {
+                                    appendUnique(resolvedTargets, target);
                                 }
                             }
                         }
