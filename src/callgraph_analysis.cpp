@@ -23,6 +23,8 @@
 
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/FormatVariadic.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -33,6 +35,8 @@ namespace
 
     using CallSiteId = std::uint32_t;
     constexpr CallSiteId kInvalidCallSiteId = 0U;
+    using PagNodeId = std::uint32_t;
+    constexpr PagNodeId kInvalidPagNodeId = 0U;
 
     struct StringInterner
     {
@@ -56,23 +60,6 @@ namespace
             values.push_back(value);
             idsByValue.emplace(values.back(), id);
             return id;
-        }
-
-        const std::string &lookup(CallSiteId id) const
-        {
-            static const std::string kEmpty;
-            if (id == kInvalidCallSiteId)
-            {
-                return kEmpty;
-            }
-
-            const std::size_t index = static_cast<std::size_t>(id - 1U);
-            if (index >= values.size())
-            {
-                return kEmpty;
-            }
-
-            return values[index];
         }
     };
 
@@ -188,80 +175,11 @@ namespace
     using PointsToMap = std::unordered_map<std::string, std::set<std::string>>;
 
     /**
-     * @brief Parse a plain signed integer literal.
-     */
-    bool isIntegerLiteral(const std::string &text, long long &value)
-    {
-        if (text.empty())
-        {
-            return false;
-        }
-
-        std::size_t index = 0;
-        if (text[0] == '+' || text[0] == '-')
-        {
-            index = 1;
-        }
-
-        if (index >= text.size())
-        {
-            return false;
-        }
-
-        for (; index < text.size(); ++index)
-        {
-            if (std::isdigit(static_cast<unsigned char>(text[index])) == 0)
-            {
-                return false;
-            }
-        }
-
-        try
-        {
-            value = std::stoll(text);
-        }
-        catch (...)
-        {
-            return false;
-        }
-
-        return true;
-    }
-
-    /**
      * @brief Check whether a binding token encodes a scalar integer value.
      */
     bool isIntegerBinding(const std::string &value)
     {
         return value.rfind("#int:", 0) == 0;
-    }
-
-    /**
-     * @brief Encode scalar integer value into binding-map token format.
-     */
-    std::string makeIntegerBinding(long long value)
-    {
-        return "#int:" + std::to_string(value);
-    }
-
-    /**
-     * @brief Decode scalar integer binding token.
-     */
-    std::optional<long long> parseIntegerBinding(const std::string &value)
-    {
-        if (!isIntegerBinding(value))
-        {
-            return std::nullopt;
-        }
-
-        try
-        {
-            return std::stoll(value.substr(5U));
-        }
-        catch (...)
-        {
-            return std::nullopt;
-        }
     }
 
     /**
@@ -768,135 +686,6 @@ namespace
     }
 
     /**
-     * @brief Resolve the destination slot(s) written by an assignment LHS.
-     */
-    std::set<std::string> resolveAssignmentDestinationSlots(
-        const std::string &lhsExpression,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &pointsTo)
-    {
-        std::set<std::string> destinationSlots;
-        std::string trimmedLhs = trimLine(lhsExpression);
-        if (trimmedLhs.empty())
-        {
-            return destinationSlots;
-        }
-
-        std::size_t derefDepth = 0U;
-        while (derefDepth < trimmedLhs.size() && trimmedLhs[derefDepth] == '*')
-        {
-            ++derefDepth;
-        }
-
-        const std::string baseSlot = canonicalSlot(lhsExpression);
-        if (baseSlot.empty())
-        {
-            return destinationSlots;
-        }
-
-        std::set<std::string> currentSlots{baseSlot};
-        if (derefDepth == 0U)
-        {
-            destinationSlots.insert(baseSlot);
-            return destinationSlots;
-        }
-
-        for (std::size_t depth = 0; depth < derefDepth; ++depth)
-        {
-            std::set<std::string> nextSlots;
-            for (const std::string &slot : currentSlots)
-            {
-                const std::unordered_map<std::string, std::set<std::string>>::const_iterator it = pointsTo.find(slot);
-                if (it == pointsTo.end())
-                {
-                    continue;
-                }
-
-                nextSlots.insert(it->second.begin(), it->second.end());
-            }
-
-            if (nextSlots.empty())
-            {
-                break;
-            }
-
-            currentSlots = std::move(nextSlots);
-        }
-
-        for (const std::string &slot : currentSlots)
-        {
-            if (!slot.empty() && !isIntegerBinding(slot) && knownFunctions.find(slot) == knownFunctions.end())
-            {
-                destinationSlots.insert(slot);
-            }
-        }
-
-        if (destinationSlots.empty())
-        {
-            destinationSlots.insert(baseSlot);
-        }
-
-        return destinationSlots;
-    }
-
-    /**
-     * @brief Resolve seed tokens through transitive points-to edges.
-     */
-    std::set<std::string> resolveTransitiveTargets(
-        const std::set<std::string> &seedTargets,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &pointsTo,
-        bool preserveUnknownTargets)
-    {
-        std::set<std::string> resolvedTargets;
-        std::deque<std::string> pending(seedTargets.begin(), seedTargets.end());
-        std::unordered_set<std::string> seen;
-
-        while (!pending.empty())
-        {
-            const std::string value = pending.front();
-            pending.pop_front();
-
-            if (value.empty() || !seen.insert(value).second)
-            {
-                continue;
-            }
-
-            if (knownFunctions.find(value) != knownFunctions.end())
-            {
-                resolvedTargets.insert(value);
-                continue;
-            }
-
-            const std::unordered_map<std::string, std::set<std::string>>::const_iterator it = pointsTo.find(value);
-            if (it == pointsTo.end() || it->second.empty())
-            {
-                if (preserveUnknownTargets)
-                {
-                    resolvedTargets.insert(value);
-                }
-                continue;
-            }
-
-            for (const std::string &next : it->second)
-            {
-                if (knownFunctions.find(next) != knownFunctions.end())
-                {
-                    resolvedTargets.insert(next);
-                    continue;
-                }
-
-                if (!next.empty())
-                {
-                    pending.push_back(next);
-                }
-            }
-        }
-
-        return resolvedTargets;
-    }
-
-    /**
      * @brief Extract callee identifier from a simple call expression text.
      */
     std::string extractCallCalleeIdentifier(const std::string &expression)
@@ -915,55 +704,6 @@ namespace
         }
 
         return canonicalSlot(calleeExpr);
-    }
-
-    /**
-     * @brief Resolve possible direct/indirect callee function targets for a call expression text.
-     */
-    std::set<std::string> resolveCallCalleeTargets(
-        const std::string &expression,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &bindings)
-    {
-        std::set<std::string> targets;
-
-        const std::string trimmed = trimLine(expression);
-        const std::size_t openParen = trimmed.find('(');
-        if (openParen == std::string::npos)
-        {
-            return targets;
-        }
-
-        const std::string calleeExpr = trimLine(trimmed.substr(0, openParen));
-        if (calleeExpr.empty())
-        {
-            return targets;
-        }
-
-        const std::string slot = canonicalSlot(calleeExpr);
-        if (!slot.empty())
-        {
-            const std::unordered_map<std::string, std::set<std::string>>::const_iterator it = bindings.find(slot);
-            if (it != bindings.end())
-            {
-                targets.insert(it->second.begin(), it->second.end());
-            }
-        }
-
-        for (const std::string &identifier : extractIdentifiers(calleeExpr))
-        {
-            const std::unordered_map<std::string, std::set<std::string>>::const_iterator it = bindings.find(identifier);
-            if (it != bindings.end())
-            {
-                targets.insert(it->second.begin(), it->second.end());
-            }
-            if (knownFunctions.find(identifier) != knownFunctions.end())
-            {
-                targets.insert(identifier);
-            }
-        }
-
-        return targets;
     }
 
     /**
@@ -1012,17 +752,6 @@ namespace
     bool isDebugLoggingEnabled()
     {
         return gDebugLoggingEnabled;
-    }
-
-    void logFunctionProcessed(const std::string &functionName, const PointsToMap &seededPointsTo)
-    {
-        if (!isDebugLoggingEnabled())
-        {
-            return;
-        }
-
-        llvm::errs() << "[callgraph] processing function=" << functionName
-                     << " seed-bindings=" << seededPointsTo.size() << "\n";
     }
 
     void logPagFunctionPhase(
@@ -1315,1004 +1044,7 @@ namespace
         return true;
     }
 
-    /**
-     * @brief Resolve assignment RHS targets under current points-to map.
-     */
-    std::set<std::string> resolveAssignmentTargets(
-        const PointerAssignment &assignment,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &pointsTo)
-    {
-        std::function<bool(const std::string &)> startsWithAddressOf = [](const std::string &expression)
-        {
-            const std::string trimmed = trimLine(expression);
-            return !trimmed.empty() && trimmed.front() == '&';
-        };
-
-        std::function<std::set<std::string>(const std::string &)> collectFunctionDesignators = [&](const std::string &expression)
-        {
-            std::set<std::string> designators;
-            for (const std::string &identifier : extractIdentifiers(expression))
-            {
-                if (knownFunctions.find(identifier) == knownFunctions.end())
-                {
-                    continue;
-                }
-
-                std::size_t searchPos = 0;
-                while (true)
-                {
-                    searchPos = expression.find(identifier, searchPos);
-                    if (searchPos == std::string::npos)
-                    {
-                        break;
-                    }
-
-                    const bool hasLeft = searchPos > 0U;
-                    const bool hasRight = searchPos + identifier.size() < expression.size();
-                    const bool leftIsIdent =
-                        hasLeft &&
-                        (std::isalnum(static_cast<unsigned char>(expression[searchPos - 1U])) != 0 || expression[searchPos - 1U] == '_');
-                    const bool rightIsIdent =
-                        hasRight &&
-                        (std::isalnum(static_cast<unsigned char>(expression[searchPos + identifier.size()])) != 0 ||
-                         expression[searchPos + identifier.size()] == '_');
-                    if (leftIsIdent || rightIsIdent)
-                    {
-                        searchPos += identifier.size();
-                        continue;
-                    }
-
-                    std::size_t after = searchPos + identifier.size();
-                    while (after < expression.size() && std::isspace(static_cast<unsigned char>(expression[after])) != 0)
-                    {
-                        ++after;
-                    }
-
-                    // Treat as function-pointer designator only when it is not a direct call token.
-                    if (after >= expression.size() || expression[after] != '(')
-                    {
-                        designators.insert(identifier);
-                        break;
-                    }
-
-                    searchPos += identifier.size();
-                }
-            }
-
-            return designators;
-        };
-
-        std::set<std::string> seeds;
-
-        if (!assignment.assignedFunction.empty())
-        {
-            if (knownFunctions.find(assignment.assignedFunction) != knownFunctions.end())
-            {
-                seeds.insert(assignment.assignedFunction);
-            }
-            return resolveTransitiveTargets(seeds, knownFunctions, pointsTo, false);
-        }
-
-        if (assignment.rhsTakesFunctionAddress)
-        {
-            for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
-            {
-                if (knownFunctions.find(identifier) != knownFunctions.end())
-                {
-                    seeds.insert(identifier);
-                }
-            }
-            return resolveTransitiveTargets(seeds, knownFunctions, pointsTo, false);
-        }
-
-        if (startsWithAddressOf(assignment.rhsExpression))
-        {
-            const std::vector<std::string> identifiers = extractIdentifiers(assignment.rhsExpression);
-            for (const std::string &identifier : identifiers)
-            {
-                if (knownFunctions.find(identifier) == knownFunctions.end())
-                {
-                    // Preserve pointer-level aliasing for address-of assignments.
-                    // Example: "loc2 = &loc" must bind loc2 -> loc (not transitively to loc's pointee).
-                    return std::set<std::string>{identifier};
-                }
-            }
-        }
-
-        const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
-        if (!rhsSlot.empty())
-        {
-            if (knownFunctions.find(rhsSlot) == knownFunctions.end() && !isIntegerBinding(rhsSlot))
-            {
-                seeds.insert(rhsSlot);
-            }
-        }
-
-        for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
-        {
-            const std::unordered_map<std::string, std::set<std::string>>::const_iterator it = pointsTo.find(identifier);
-            if (it != pointsTo.end())
-            {
-                seeds.insert(it->second.begin(), it->second.end());
-                continue;
-            }
-
-            if (knownFunctions.find(identifier) == knownFunctions.end() && !isIntegerBinding(identifier))
-            {
-                seeds.insert(identifier);
-            }
-        }
-
-        const std::set<std::string> functionDesignators = collectFunctionDesignators(assignment.rhsExpression);
-        seeds.insert(functionDesignators.begin(), functionDesignators.end());
-
-        return resolveTransitiveTargets(seeds, knownFunctions, pointsTo, true);
-    }
-
-    std::set<std::string> resolveExpressionTargets(
-        const std::string &expression,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &pointsTo);
-
-    std::set<std::string> resolveMixedExpressionValues(
-        const std::string &expression,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &bindings,
-        bool includeSlotIdentity = true);
-
-    PointsToMap buildSeedBindings(
-        const CallSite &callSite,
-        const std::vector<std::string> &parameterSlots,
-        const std::set<std::string> &pointerSlots,
-        const PointsToMap &callerPointsTo,
-        const std::set<std::string> &knownFunctions);
-
     std::vector<std::string> parseCallArgumentExpressions(const std::string &rawExpression);
-
-    std::optional<std::pair<std::string, std::string>> parseMemcpyArgsFromLine(const std::string &rawLine);
-
-    std::optional<MemoryTransferOp> parseMemoryTransferOpFromLine(const std::string &rawLine);
-
-    /**
-     * @brief Resolve callee return tokens through the current caller bindings and call arguments.
-     */
-    std::set<std::string> resolveCallReturnTargets(
-        const std::string &callExpression,
-        const std::string &calleeName,
-        const PointsToMap &callerBindings,
-        const std::unordered_map<std::string, std::set<std::string>> &programWideBindings,
-        const std::vector<StructMemberMapping> &callerStructMappings,
-        const std::vector<std::string> &calleeParameters,
-        const std::set<std::string> &calleePointerSlots,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &returnTargetsByFunction)
-    {
-        std::set<std::string> resolvedTargets;
-        const std::vector<std::string> argumentExpressions = parseCallArgumentExpressions(callExpression);
-
-        CallSite syntheticCallSite;
-        syntheticCallSite.argumentExpressions = argumentExpressions;
-        PointsToMap callSeeds;
-        if (!calleeParameters.empty())
-        {
-            callSeeds = buildSeedBindings(syntheticCallSite, calleeParameters, calleePointerSlots, callerBindings, knownFunctions);
-        }
-
-        std::unordered_map<std::string, std::set<std::string>> parameterArgumentBases;
-        const std::size_t argumentLimit = std::min(calleeParameters.size(), argumentExpressions.size());
-        for (std::size_t index = 0; index < argumentLimit; ++index)
-        {
-            const std::string &parameter = calleeParameters[index];
-            if (parameter.empty())
-            {
-                continue;
-            }
-
-            std::set<std::string> &bases = parameterArgumentBases[parameter];
-            const std::string argumentSlot = canonicalSlot(argumentExpressions[index]);
-            if (!argumentSlot.empty())
-            {
-                bases.insert(argumentSlot);
-                const PointsToMap::const_iterator argBindingIt = callerBindings.find(argumentSlot);
-                if (argBindingIt != callerBindings.end())
-                {
-                    bases.insert(argBindingIt->second.begin(), argBindingIt->second.end());
-                }
-            }
-
-            const std::set<std::string> resolvedArgumentValues =
-                resolveMixedExpressionValues(argumentExpressions[index], knownFunctions, callerBindings);
-            for (const std::string &value : resolvedArgumentValues)
-            {
-                if (value.empty() || isIntegerBinding(value) || knownFunctions.find(value) != knownFunctions.end())
-                {
-                    continue;
-                }
-
-                bases.insert(value);
-            }
-        }
-
-        std::function<PointsToMap(const PointsToMap &, const PointsToMap &)> mergeBindings = [](const PointsToMap &lhs, const PointsToMap &rhs)
-        {
-            PointsToMap merged = lhs;
-            for (const std::pair<const std::string, std::set<std::string>> &entry : rhs)
-            {
-                std::set<std::string> &values = merged[entry.first];
-                values.insert(entry.second.begin(), entry.second.end());
-            }
-            return merged;
-        };
-
-        const PointsToMap combinedBindings = mergeBindings(mergeBindings(callerBindings, callSeeds), programWideBindings);
-
-        std::function<std::string(std::string)> normalizeStructAccess = [](std::string expression)
-        {
-            expression = trimLine(expression);
-            while (!expression.empty() && (expression.front() == '&' || expression.front() == '*'))
-            {
-                expression.erase(expression.begin());
-                expression = trimLine(expression);
-            }
-
-            for (std::size_t pos = expression.find("->"); pos != std::string::npos; pos = expression.find("->", pos + 1U))
-            {
-                expression.replace(pos, 2U, ".");
-            }
-
-            std::string stripped;
-            stripped.reserve(expression.size());
-            int bracketDepth = 0;
-            for (char ch : expression)
-            {
-                if (ch == '[')
-                {
-                    ++bracketDepth;
-                    continue;
-                }
-                if (ch == ']')
-                {
-                    if (bracketDepth > 0)
-                    {
-                        --bracketDepth;
-                    }
-                    continue;
-                }
-                if (std::isspace(static_cast<unsigned char>(ch)) == 0 && bracketDepth == 0)
-                {
-                    stripped.push_back(ch);
-                }
-            }
-
-            return trimLine(stripped);
-        };
-
-        std::function<std::pair<std::string, std::string>(const std::string &)> splitStructAccess = [&](const std::string &expression) -> std::pair<std::string, std::string>
-        {
-            const std::string normalized = normalizeStructAccess(expression);
-            const std::size_t dotIndex = normalized.find('.');
-            if (dotIndex == std::string::npos || dotIndex == 0U)
-            {
-                return {"", ""};
-            }
-
-            return {normalized.substr(0, dotIndex), normalized.substr(dotIndex + 1U)};
-        };
-
-        std::function<bool(const std::string &, const std::string &)> structMemberMatches = [](const std::string &returnedMember, const std::string &mappingMember)
-        {
-            if (returnedMember.empty() || mappingMember.empty())
-            {
-                return false;
-            }
-
-            if (returnedMember == mappingMember)
-            {
-                return true;
-            }
-
-            const std::size_t returnedLeafDot = returnedMember.rfind('.');
-            const std::size_t mappingLeafDot = mappingMember.rfind('.');
-            const std::string returnedLeaf = returnedLeafDot == std::string::npos ? returnedMember : returnedMember.substr(returnedLeafDot + 1U);
-            const std::string mappingLeaf = mappingLeafDot == std::string::npos ? mappingMember : mappingMember.substr(mappingLeafDot + 1U);
-            return returnedLeaf == mappingLeaf;
-        };
-
-        const std::unordered_map<std::string, std::set<std::string>>::const_iterator returnIt = returnTargetsByFunction.find(calleeName);
-        if (returnIt == returnTargetsByFunction.end())
-        {
-            return resolvedTargets;
-        }
-
-        for (const std::string &returned : returnIt->second)
-        {
-            if (knownFunctions.find(returned) != knownFunctions.end())
-            {
-                resolvedTargets.insert(returned);
-                continue;
-            }
-
-            const PointsToMap::const_iterator seedIt = callSeeds.find(returned);
-            if (seedIt != callSeeds.end())
-            {
-                resolvedTargets.insert(seedIt->second.begin(), seedIt->second.end());
-                continue;
-            }
-
-            const PointsToMap::const_iterator bindingIt = callerBindings.find(returned);
-            if (bindingIt != callerBindings.end())
-            {
-                resolvedTargets.insert(bindingIt->second.begin(), bindingIt->second.end());
-                continue;
-            }
-
-            std::set<std::string> translatedSeeds{returned};
-            for (const std::string &parameter : calleeParameters)
-            {
-                if (parameter.empty())
-                {
-                    continue;
-                }
-
-                const bool exactMatch = returned == parameter;
-                const bool memberMatch =
-                    returned.size() > parameter.size() &&
-                    returned.rfind(parameter, 0U) == 0U &&
-                    returned[parameter.size()] == '.';
-                if (!exactMatch && !memberMatch)
-                {
-                    continue;
-                }
-
-                const std::string suffix = exactMatch ? "" : returned.substr(parameter.size());
-                const PointsToMap::const_iterator translatedIt = callSeeds.find(parameter);
-                if (translatedIt == callSeeds.end())
-                {
-                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator argumentBasesIt =
-                        parameterArgumentBases.find(parameter);
-                    if (argumentBasesIt == parameterArgumentBases.end())
-                    {
-                        continue;
-                    }
-
-                    for (const std::string &base : argumentBasesIt->second)
-                    {
-                        if (suffix.empty())
-                        {
-                            translatedSeeds.insert(base);
-                            continue;
-                        }
-
-                        if (knownFunctions.find(base) == knownFunctions.end())
-                        {
-                            translatedSeeds.insert(base + suffix);
-                        }
-                    }
-                    continue;
-                }
-
-                for (const std::string &base : translatedIt->second)
-                {
-                    if (suffix.empty())
-                    {
-                        translatedSeeds.insert(base);
-                        continue;
-                    }
-
-                    if (knownFunctions.find(base) == knownFunctions.end())
-                    {
-                        translatedSeeds.insert(base + suffix);
-                    }
-                }
-            }
-
-            const std::set<std::string> translatedTargets =
-                resolveTransitiveTargets(translatedSeeds, knownFunctions, combinedBindings, true);
-            if (!translatedTargets.empty())
-            {
-                resolvedTargets.insert(translatedTargets.begin(), translatedTargets.end());
-                continue;
-            }
-
-            const std::pair<std::string, std::string> returnedAccess = splitStructAccess(returned);
-            if (!returnedAccess.first.empty() && !returnedAccess.second.empty())
-            {
-                std::set<std::string> candidateStructBases;
-                candidateStructBases.insert(returnedAccess.first);
-
-                const PointsToMap::const_iterator candidateSeedIt = callSeeds.find(returnedAccess.first);
-                if (candidateSeedIt != callSeeds.end())
-                {
-                    candidateStructBases.insert(candidateSeedIt->second.begin(), candidateSeedIt->second.end());
-                }
-
-                const std::unordered_map<std::string, std::set<std::string>>::const_iterator argumentBasesIt =
-                    parameterArgumentBases.find(returnedAccess.first);
-                if (argumentBasesIt != parameterArgumentBases.end())
-                {
-                    candidateStructBases.insert(argumentBasesIt->second.begin(), argumentBasesIt->second.end());
-                }
-
-                const PointsToMap::const_iterator candidateBindingIt = callerBindings.find(returnedAccess.first);
-                if (candidateBindingIt != callerBindings.end())
-                {
-                    candidateStructBases.insert(candidateBindingIt->second.begin(), candidateBindingIt->second.end());
-                }
-
-                for (const std::string &parameter : calleeParameters)
-                {
-                    if (parameter.empty())
-                    {
-                        continue;
-                    }
-
-                    if (returnedAccess.first != parameter)
-                    {
-                        continue;
-                    }
-
-                    const PointsToMap::const_iterator parameterSeedIt = callSeeds.find(parameter);
-                    if (parameterSeedIt != callSeeds.end())
-                    {
-                        candidateStructBases.insert(parameterSeedIt->second.begin(), parameterSeedIt->second.end());
-                    }
-                }
-
-                for (const std::string &candidateBase : candidateStructBases)
-                {
-                    if (candidateBase.empty() || knownFunctions.find(candidateBase) != knownFunctions.end())
-                    {
-                        continue;
-                    }
-
-                    const std::set<std::string> aliases =
-                        resolveTransitiveTargets(std::set<std::string>{candidateBase}, knownFunctions, combinedBindings, true);
-
-                    std::set<std::string> allBases = aliases;
-                    allBases.insert(candidateBase);
-
-                    for (const std::string &base : allBases)
-                    {
-                        if (base.empty() || knownFunctions.find(base) != knownFunctions.end())
-                        {
-                            continue;
-                        }
-
-                        for (const StructMemberMapping &mapping : callerStructMappings)
-                        {
-                            if (mapping.structVariable != base)
-                            {
-                                continue;
-                            }
-
-                            if (!structMemberMatches(returnedAccess.second, mapping.memberName))
-                            {
-                                continue;
-                            }
-
-                            if (knownFunctions.find(mapping.functionName) != knownFunctions.end())
-                            {
-                                resolvedTargets.insert(mapping.functionName);
-                            }
-                        }
-                    }
-                }
-
-                if (!resolvedTargets.empty())
-                {
-                    continue;
-                }
-            }
-
-            resolvedTargets.insert(returned);
-        }
-
-        return resolvedTargets;
-    }
-
-    /**
-     * @brief Collect conservative program-wide slot->function targets from assignments.
-     */
-    std::unordered_map<std::string, std::set<std::string>> collectProgramWidePointerTargets(
-        const std::vector<FunctionFacts> &functions,
-        const std::set<std::string> &knownFunctions)
-    {
-        std::unordered_map<std::string, std::set<std::string>> targetsBySlot;
-        std::unordered_map<std::string, std::set<std::string>> sourceTargetsBySlot;
-        std::set<std::string> globalSlots;
-
-        std::size_t totalAssignments = 0U;
-        for (const FunctionFacts &function : functions)
-        {
-            totalAssignments += function.pointerAssignments.size();
-        }
-
-        targetsBySlot.reserve(totalAssignments * 2U + 1U);
-        sourceTargetsBySlot.reserve(totalAssignments * 2U + 1U);
-
-        std::vector<const PointerAssignment *> allAssignments;
-        std::vector<const PointerAssignment *> globalAssignments;
-        allAssignments.reserve(totalAssignments);
-        globalAssignments.reserve(totalAssignments);
-        for (const FunctionFacts &function : functions)
-        {
-            for (const PointerAssignment &assignment : function.pointerAssignments)
-            {
-                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-                if (!lhsSlot.empty())
-                {
-                    allAssignments.push_back(&assignment);
-                }
-
-                if (!assignment.lhsIsGlobal)
-                {
-                    continue;
-                }
-
-                if (lhsSlot.empty())
-                {
-                    continue;
-                }
-
-                globalSlots.insert(lhsSlot);
-                globalAssignments.push_back(&assignment);
-            }
-        }
-
-        std::function<void(const std::vector<const PointerAssignment *> &,
-                           std::unordered_map<std::string, std::set<std::string>> &)>
-            applyOrderedAssignments = [&](const std::vector<const PointerAssignment *> &assignments,
-                                          std::unordered_map<std::string, std::set<std::string>> &slotTargetsBySlot)
-        {
-            std::unordered_map<std::string, std::set<std::string>> destinationCache;
-            for (const PointerAssignment *assignmentPtr : assignments)
-            {
-                const PointerAssignment &assignment = *assignmentPtr;
-                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-                if (lhsSlot.empty())
-                {
-                    continue;
-                }
-
-                std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, slotTargetsBySlot);
-
-                const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
-                if (!rhsSlot.empty())
-                {
-                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator rhsIt =
-                        slotTargetsBySlot.find(rhsSlot);
-                    if (rhsIt != slotTargetsBySlot.end())
-                    {
-                        targets.insert(rhsIt->second.begin(), rhsIt->second.end());
-                    }
-                }
-
-                if (targets.empty())
-                {
-                    continue;
-                }
-
-                std::unordered_map<std::string, std::set<std::string>>::const_iterator cachedDestinationsIt =
-                    destinationCache.find(assignment.lhsExpression);
-                if (cachedDestinationsIt == destinationCache.end())
-                {
-                    cachedDestinationsIt =
-                        destinationCache.emplace(
-                                            assignment.lhsExpression,
-                                            resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, slotTargetsBySlot))
-                            .first;
-                }
-
-                bool bindingsChanged = false;
-                const std::set<std::string> &destinationSlots = cachedDestinationsIt->second;
-                for (const std::string &destinationSlot : destinationSlots)
-                {
-                    std::set<std::string> &existingTargets = slotTargetsBySlot[destinationSlot];
-                    if (existingTargets != targets)
-                    {
-                        existingTargets = targets;
-                        bindingsChanged = true;
-                    }
-                }
-
-                if (bindingsChanged)
-                {
-                    destinationCache.clear();
-                }
-            }
-        };
-
-        applyOrderedAssignments(allAssignments, sourceTargetsBySlot);
-
-        PointsToMap mergedGlobalBindings = sourceTargetsBySlot;
-        for (const std::pair<const std::string, std::set<std::string>> &entry : targetsBySlot)
-        {
-            std::set<std::string> &values = mergedGlobalBindings[entry.first];
-            values.insert(entry.second.begin(), entry.second.end());
-        }
-
-        std::unordered_map<std::string, std::set<std::string>> destinationCache;
-        for (const PointerAssignment *assignmentPtr : globalAssignments)
-        {
-            const PointerAssignment &assignment = *assignmentPtr;
-            const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-            if (lhsSlot.empty())
-            {
-                continue;
-            }
-
-            std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, mergedGlobalBindings);
-
-            const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
-            if (!rhsSlot.empty())
-            {
-                const std::unordered_map<std::string, std::set<std::string>>::const_iterator rhsIt =
-                    mergedGlobalBindings.find(rhsSlot);
-                if (rhsIt != mergedGlobalBindings.end())
-                {
-                    targets.insert(rhsIt->second.begin(), rhsIt->second.end());
-                }
-            }
-
-            if (targets.empty())
-            {
-                continue;
-            }
-
-            std::unordered_map<std::string, std::set<std::string>>::const_iterator cachedDestinationsIt =
-                destinationCache.find(assignment.lhsExpression);
-            if (cachedDestinationsIt == destinationCache.end())
-            {
-                cachedDestinationsIt =
-                    destinationCache.emplace(
-                                        assignment.lhsExpression,
-                                        resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, mergedGlobalBindings))
-                        .first;
-            }
-
-            bool bindingsChanged = false;
-            const std::set<std::string> &destinationSlots = cachedDestinationsIt->second;
-            for (const std::string &destinationSlot : destinationSlots)
-            {
-                if (targetsBySlot[destinationSlot] != targets)
-                {
-                    targetsBySlot[destinationSlot] = targets;
-                    bindingsChanged = true;
-                }
-                if (mergedGlobalBindings[destinationSlot] != targets)
-                {
-                    mergedGlobalBindings[destinationSlot] = targets;
-                    bindingsChanged = true;
-                }
-            }
-
-            if (bindingsChanged)
-            {
-                destinationCache.clear();
-            }
-        }
-
-        for (const FunctionFacts &function : functions)
-        {
-            for (const CallSite &callSite : function.callSites)
-            {
-                if (callSite.directCallee != "memcpy" &&
-                    callSite.directCallee != "memmove" &&
-                    callSite.directCallee != "__builtin_memcpy" &&
-                    callSite.directCallee != "__builtin_memmove")
-                {
-                    continue;
-                }
-
-                if (callSite.argumentExpressions.size() < 2U)
-                {
-                    continue;
-                }
-
-                const std::string dstSlot = canonicalSlot(callSite.argumentExpressions[0]);
-                const std::string srcSlot = canonicalSlot(callSite.argumentExpressions[1]);
-                if (dstSlot.empty() || globalSlots.find(dstSlot) == globalSlots.end())
-                {
-                    continue;
-                }
-
-                std::set<std::string> copiedTargets;
-                if (!srcSlot.empty())
-                {
-                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator srcIt =
-                        targetsBySlot.find(srcSlot);
-                    if (srcIt != targetsBySlot.end())
-                    {
-                        copiedTargets.insert(srcIt->second.begin(), srcIt->second.end());
-                    }
-
-                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator srcSourceIt =
-                        sourceTargetsBySlot.find(srcSlot);
-                    if (srcSourceIt != sourceTargetsBySlot.end())
-                    {
-                        copiedTargets.insert(srcSourceIt->second.begin(), srcSourceIt->second.end());
-                    }
-                }
-
-                if (copiedTargets.empty())
-                {
-                    for (const std::string &identifier : extractIdentifiers(callSite.argumentExpressions[1]))
-                    {
-                        if (knownFunctions.find(identifier) != knownFunctions.end())
-                        {
-                            copiedTargets.insert(identifier);
-                        }
-                    }
-                }
-
-                if (copiedTargets.empty())
-                {
-                    continue;
-                }
-
-                targetsBySlot[dstSlot] = copiedTargets;
-            }
-        }
-
-        if (gDebugLoggingEnabled)
-        {
-            std::function<void(const std::string &)> logSlot = [&](const std::string &slotName)
-            {
-                const std::unordered_map<std::string, std::set<std::string>>::const_iterator it =
-                    targetsBySlot.find(slotName);
-                if (it == targetsBySlot.end())
-                {
-                    llvm::errs() << "[callgraph] program-wide slot " << slotName << " = <missing>\n";
-                    return;
-                }
-
-                llvm::errs() << "[callgraph] program-wide slot " << slotName << " = ";
-                bool first = true;
-                for (const std::string &value : it->second)
-                {
-                    if (!first)
-                    {
-                        llvm::errs() << ",";
-                    }
-                    llvm::errs() << value;
-                    first = false;
-                }
-                llvm::errs() << "\n";
-            };
-
-            logSlot("g_left");
-            logSlot("g_right");
-        }
-
-        return targetsBySlot;
-    }
-
-    /**
-     * @brief Collect cross-function memcpy/memmove destination slot summaries.
-     */
-    std::unordered_map<std::string, std::set<std::string>> collectMemcpyCopySummaryTargets(
-        const std::vector<FunctionFacts> &functions,
-        const std::set<std::string> &knownFunctions)
-    {
-        std::unordered_map<std::string, std::set<std::string>> sourceTargetsBySlot;
-        std::unordered_map<std::string, std::set<std::string>> destinationCache;
-
-        std::size_t totalAssignments = 0U;
-        for (const FunctionFacts &function : functions)
-        {
-            totalAssignments += function.pointerAssignments.size();
-        }
-
-        sourceTargetsBySlot.reserve(totalAssignments * 2U + 1U);
-        destinationCache.reserve(totalAssignments + 1U);
-
-        // Single ordered pass keeps overwrite semantics monotonic: later writes replace earlier
-        // values on the same resolved destination slot, while alias slots still accumulate.
-        for (const FunctionFacts &function : functions)
-        {
-            for (const PointerAssignment &assignment : function.pointerAssignments)
-            {
-                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-                if (lhsSlot.empty())
-                {
-                    continue;
-                }
-
-                std::set<std::string> targets =
-                    resolveAssignmentTargets(assignment, knownFunctions, sourceTargetsBySlot);
-
-                const std::string rhsSlot = canonicalSlot(assignment.rhsExpression);
-                if (!rhsSlot.empty())
-                {
-                    const std::unordered_map<std::string, std::set<std::string>>::const_iterator rhsIt =
-                        sourceTargetsBySlot.find(rhsSlot);
-                    if (rhsIt != sourceTargetsBySlot.end())
-                    {
-                        targets.insert(rhsIt->second.begin(), rhsIt->second.end());
-                    }
-                }
-
-                if (targets.empty())
-                {
-                    continue;
-                }
-
-                std::unordered_map<std::string, std::set<std::string>>::const_iterator cachedDestinationsIt =
-                    destinationCache.find(assignment.lhsExpression);
-                if (cachedDestinationsIt == destinationCache.end())
-                {
-                    cachedDestinationsIt =
-                        destinationCache.emplace(
-                                            assignment.lhsExpression,
-                                            resolveAssignmentDestinationSlots(assignment.lhsExpression, knownFunctions, sourceTargetsBySlot))
-                            .first;
-                }
-
-                bool bindingsChanged = false;
-                const std::set<std::string> &destinationSlots = cachedDestinationsIt->second;
-                for (const std::string &destinationSlot : destinationSlots)
-                {
-                    std::set<std::string> &existingTargets = sourceTargetsBySlot[destinationSlot];
-                    if (existingTargets != targets)
-                    {
-                        existingTargets = targets;
-                        bindingsChanged = true;
-                    }
-                }
-
-                if (bindingsChanged)
-                {
-                    destinationCache.clear();
-                }
-            }
-        }
-
-        std::unordered_map<std::string, std::set<std::string>> summaryByDestinationSlot;
-        for (const FunctionFacts &function : functions)
-        {
-            for (const FunctionFacts::BlockFact &block : function.blocks)
-            {
-                for (const std::string &rawLine : block.lines)
-                {
-                    const std::optional<std::pair<std::string, std::string>> memcpyArgs =
-                        parseMemcpyArgsFromLine(rawLine);
-                    if (!memcpyArgs.has_value())
-                    {
-                        continue;
-                    }
-
-                    const std::string dstSlot = canonicalSlot(memcpyArgs->first);
-                    if (dstSlot.empty())
-                    {
-                        continue;
-                    }
-
-                    std::set<std::string> destinationSlots;
-                    destinationSlots.insert(dstSlot);
-                    const std::set<std::string> destinationAliases =
-                        resolveTransitiveTargets(std::set<std::string>{dstSlot}, knownFunctions, sourceTargetsBySlot, true);
-                    for (const std::string &alias : destinationAliases)
-                    {
-                        if (!alias.empty() &&
-                            !isIntegerBinding(alias) &&
-                            knownFunctions.find(alias) == knownFunctions.end())
-                        {
-                            destinationSlots.insert(alias);
-                        }
-                    }
-
-                    std::set<std::string> copiedTargets;
-                    const std::string srcSlot = canonicalSlot(memcpyArgs->second);
-                    if (!srcSlot.empty())
-                    {
-                        const std::unordered_map<std::string, std::set<std::string>>::const_iterator srcIt =
-                            sourceTargetsBySlot.find(srcSlot);
-                        if (srcIt != sourceTargetsBySlot.end())
-                        {
-                            copiedTargets.insert(srcIt->second.begin(), srcIt->second.end());
-                        }
-                    }
-
-                    const std::set<std::string> sourceValues =
-                        resolveMixedExpressionValues(memcpyArgs->second, knownFunctions, sourceTargetsBySlot, false);
-                    copiedTargets.insert(sourceValues.begin(), sourceValues.end());
-
-                    const std::set<std::string> resolvedTargets =
-                        resolveTransitiveTargets(copiedTargets, knownFunctions, sourceTargetsBySlot, true);
-                    for (const std::string &target : resolvedTargets)
-                    {
-                        if (knownFunctions.find(target) != knownFunctions.end())
-                        {
-                            for (const std::string &destinationSlot : destinationSlots)
-                            {
-                                summaryByDestinationSlot[destinationSlot].insert(target);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return summaryByDestinationSlot;
-    }
-
-    /**
-     * @brief Parse memcpy/memmove destination and source slots from a CFG line.
-     */
-    std::optional<std::pair<std::string, std::string>> parseMemcpyArgsFromLine(const std::string &rawLine)
-    {
-        std::string line = trimLine(rawLine);
-        if (!line.empty() && line.back() == ';')
-        {
-            line.pop_back();
-            line = trimLine(line);
-        }
-
-        std::function<bool(const std::string &)> startsWith = [&](const std::string &prefix)
-        {
-            return line.rfind(prefix, 0U) == 0U;
-        };
-
-        if (!startsWith("memcpy(") &&
-            !startsWith("memmove(") &&
-            !startsWith("__builtin_memcpy(") &&
-            !startsWith("__builtin_memmove("))
-        {
-            return std::nullopt;
-        }
-
-        const std::size_t openParen = line.find('(');
-        const std::size_t closeParen = line.rfind(')');
-        if (openParen == std::string::npos || closeParen == std::string::npos || closeParen <= openParen + 1U)
-        {
-            return std::nullopt;
-        }
-
-        const std::string argsText = line.substr(openParen + 1U, closeParen - openParen - 1U);
-        std::vector<std::string> args;
-        std::string current;
-        int parenDepth = 0;
-        for (char ch : argsText)
-        {
-            if (ch == '(')
-            {
-                ++parenDepth;
-            }
-            else if (ch == ')')
-            {
-                if (parenDepth > 0)
-                {
-                    --parenDepth;
-                }
-            }
-
-            if (ch == ',' && parenDepth == 0)
-            {
-                args.push_back(trimLine(current));
-                current.clear();
-                continue;
-            }
-
-            current.push_back(ch);
-        }
-        if (!current.empty())
-        {
-            args.push_back(trimLine(current));
-        }
-
-        if (args.size() < 2U)
-        {
-            return std::nullopt;
-        }
-
-        if (args[0].empty() || args[1].empty())
-        {
-            return std::nullopt;
-        }
-
-        return std::make_pair(args[0], args[1]);
-    }
 
     /**
      * @brief Parse argument expressions from a call-like expression text.
@@ -2587,40 +1319,6 @@ namespace
         const std::set<std::string> &knownFunctions);
 
     /**
-     * @brief Resolve function targets referenced by an expression.
-     */
-    std::set<std::string> resolveExpressionTargets(
-        const std::string &expression,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &pointsTo)
-    {
-        std::set<std::string> seeds;
-
-        const std::string slot = canonicalSlot(expression);
-        if (!slot.empty())
-        {
-            seeds.insert(slot);
-        }
-
-        for (const std::string &identifier : extractIdentifiers(expression))
-        {
-            if (knownFunctions.find(identifier) != knownFunctions.end())
-            {
-                seeds.insert(identifier);
-                continue;
-            }
-
-            const std::unordered_map<std::string, std::set<std::string>>::const_iterator it = pointsTo.find(identifier);
-            if (it != pointsTo.end())
-            {
-                seeds.insert(it->second.begin(), it->second.end());
-            }
-        }
-
-        return resolveTransitiveTargets(seeds, knownFunctions, pointsTo, false);
-    }
-
-    /**
      * @brief Collect slots that are expected to hold function targets.
      */
     std::set<std::string> collectPointerSlots(const FunctionFacts &function)
@@ -2708,389 +1406,6 @@ namespace
         }
 
         return slots;
-    }
-
-    /**
-     * @brief Resolve mixed scalar/function values from an expression.
-     */
-    std::set<std::string> resolveMixedExpressionValues(
-        const std::string &expression,
-        const std::set<std::string> &knownFunctions,
-        const std::unordered_map<std::string, std::set<std::string>> &bindings,
-        bool includeSlotIdentity)
-    {
-        std::set<std::string> values;
-
-        long long literalValue = 0;
-        if (isIntegerLiteral(trimLine(expression), literalValue))
-        {
-            values.insert(makeIntegerBinding(literalValue));
-        }
-
-        if (expression.find('&') != std::string::npos)
-        {
-            for (const std::string &identifier : extractIdentifiers(expression))
-            {
-                if (knownFunctions.find(identifier) == knownFunctions.end())
-                {
-                    values.insert(identifier);
-                    break;
-                }
-            }
-        }
-
-        if (includeSlotIdentity)
-        {
-            const std::string slot = canonicalSlot(expression);
-            if (!slot.empty())
-            {
-                values.insert(slot);
-            }
-        }
-
-        for (const std::string &identifier : extractIdentifiers(expression))
-        {
-            if (knownFunctions.find(identifier) != knownFunctions.end())
-            {
-                values.insert(identifier);
-            }
-
-            const std::unordered_map<std::string, std::set<std::string>>::const_iterator bindingIt = bindings.find(identifier);
-            if (bindingIt != bindings.end())
-            {
-                values.insert(bindingIt->second.begin(), bindingIt->second.end());
-                continue;
-            }
-
-            if (knownFunctions.find(identifier) == knownFunctions.end())
-            {
-                values.insert(identifier);
-            }
-        }
-
-        std::set<std::string> resolved = resolveTransitiveTargets(values, knownFunctions, bindings, true);
-        for (const std::string &value : values)
-        {
-            if (isIntegerBinding(value))
-            {
-                resolved.insert(value);
-            }
-        }
-
-        if (resolved.empty() && !values.empty())
-        {
-            return values;
-        }
-
-        return resolved;
-    }
-
-    /**
-     * @brief Collect direct function targets returned by each function.
-     */
-    std::unordered_map<std::string, std::set<std::string>> collectReturnTargetsByFunction(
-        const std::vector<FunctionFacts> &functions,
-        const std::set<std::string> &knownFunctions)
-    {
-        std::unordered_map<std::string, std::set<std::string>> targetsByFunction;
-        std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
-        std::unordered_map<std::string, std::set<std::string>> pointerSlotsByFunction;
-
-        for (const FunctionFacts &function : functions)
-        {
-            parameterSlotsByFunction[function.name] = collectParameterSlots(function, knownFunctions);
-            pointerSlotsByFunction[function.name] = collectPointerSlots(function);
-        }
-
-        std::function<PointsToMap(const FunctionFacts &)> seedGlobalPointerBindings = [&](const FunctionFacts &function)
-        {
-            PointsToMap bindings;
-            for (const PointerAssignment &assignment : function.pointerAssignments)
-            {
-                if (!assignment.lhsIsGlobal)
-                {
-                    continue;
-                }
-
-                const std::string lhsSlot = canonicalSlot(assignment.lhsExpression);
-                if (lhsSlot.empty())
-                {
-                    continue;
-                }
-
-                const std::set<std::string> targets = resolveAssignmentTargets(assignment, knownFunctions, bindings);
-                if (targets.empty())
-                {
-                    continue;
-                }
-
-                std::set<std::string> &slotTargets = bindings[lhsSlot];
-                slotTargets.insert(targets.begin(), targets.end());
-            }
-
-            return bindings;
-        };
-
-        std::function<std::set<std::string>(
-            const std::string &,
-            const PointsToMap &,
-            const std::unordered_map<std::string, std::set<std::string>> &)>
-            resolveReturnedCallTargets = [&](const std::string &expression,
-                                             const PointsToMap &bindings,
-                                             const std::unordered_map<std::string, std::set<std::string>> &currentTargets)
-        {
-            std::set<std::string> resolved;
-            const std::set<std::string> callees = resolveCallCalleeTargets(expression, knownFunctions, bindings);
-            const std::vector<std::string> argumentExpressions = parseCallArgumentExpressions(expression);
-
-            for (const std::string &callee : callees)
-            {
-                const std::unordered_map<std::string, std::set<std::string>>::const_iterator returnIt =
-                    currentTargets.find(callee);
-                if (returnIt == currentTargets.end())
-                {
-                    continue;
-                }
-
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator parametersIt =
-                    parameterSlotsByFunction.find(callee);
-                const std::unordered_map<std::string, std::set<std::string>>::const_iterator pointerSlotsIt =
-                    pointerSlotsByFunction.find(callee);
-                const std::vector<std::string> emptyParameters;
-                const std::set<std::string> emptyPointerSlots;
-                const std::vector<std::string> &calleeParameters =
-                    parametersIt != parameterSlotsByFunction.end() ? parametersIt->second : emptyParameters;
-                const std::set<std::string> &calleePointerSlots =
-                    pointerSlotsIt != pointerSlotsByFunction.end() ? pointerSlotsIt->second : emptyPointerSlots;
-
-                CallSite syntheticCallSite;
-                syntheticCallSite.argumentExpressions = argumentExpressions;
-                PointsToMap callSeeds;
-                if (!calleeParameters.empty())
-                {
-                    callSeeds = buildSeedBindings(syntheticCallSite, calleeParameters, calleePointerSlots, bindings, knownFunctions);
-                }
-
-                for (const std::string &returned : returnIt->second)
-                {
-                    if (knownFunctions.find(returned) != knownFunctions.end())
-                    {
-                        resolved.insert(returned);
-                        continue;
-                    }
-
-                    const PointsToMap::const_iterator seedIt = callSeeds.find(returned);
-                    if (seedIt != callSeeds.end())
-                    {
-                        resolved.insert(seedIt->second.begin(), seedIt->second.end());
-                        continue;
-                    }
-
-                    const PointsToMap::const_iterator bindingIt = bindings.find(returned);
-                    if (bindingIt != bindings.end())
-                    {
-                        resolved.insert(bindingIt->second.begin(), bindingIt->second.end());
-                        continue;
-                    }
-
-                    resolved.insert(returned);
-                }
-            }
-
-            return resolved;
-        };
-
-        bool changed = true;
-        while (changed)
-        {
-            changed = false;
-
-            for (const FunctionFacts &function : functions)
-            {
-                std::unordered_map<std::uint32_t, const FunctionFacts::BlockFact *> blockMap;
-                for (const FunctionFacts::BlockFact &block : function.blocks)
-                {
-                    blockMap[block.id] = &block;
-                }
-
-                std::uint32_t entryBlockId = function.entryBlockId;
-                if (blockMap.find(entryBlockId) == blockMap.end())
-                {
-                    if (function.blocks.empty())
-                    {
-                        continue;
-                    }
-
-                    entryBlockId = function.blocks.front().id;
-                }
-
-                struct BlockState
-                {
-                    std::uint32_t blockId = 0;
-                    PointsToMap bindings;
-                };
-
-                std::function<std::string(std::uint32_t, const PointsToMap &)> makeStateKey = [](std::uint32_t blockId, const PointsToMap &bindings)
-                {
-                    std::vector<std::pair<std::string, std::vector<std::string>>> entries;
-                    entries.reserve(bindings.size());
-                    for (const std::pair<const std::string, std::set<std::string>> &entry : bindings)
-                    {
-                        std::vector<std::string> values(entry.second.begin(), entry.second.end());
-                        std::sort(values.begin(), values.end());
-                        entries.push_back(std::make_pair(entry.first, std::move(values)));
-                    }
-                    std::sort(entries.begin(), entries.end(), [](const std::pair<std::string, std::vector<std::string>> &lhs, const std::pair<std::string, std::vector<std::string>> &rhs)
-                              { return lhs.first < rhs.first; });
-
-                    std::string key = std::to_string(blockId);
-                    key.push_back('|');
-                    for (const std::pair<std::string, std::vector<std::string>> &entry : entries)
-                    {
-                        key += entry.first;
-                        key.push_back('=');
-                        for (const std::string &value : entry.second)
-                        {
-                            key += value;
-                            key.push_back(',');
-                        }
-                        key.push_back(';');
-                    }
-                    return key;
-                };
-
-                std::set<std::string> collectedTargets = targetsByFunction[function.name];
-                std::deque<BlockState> worklist;
-                std::unordered_set<std::string> seenStates;
-                worklist.push_back(BlockState{entryBlockId, seedGlobalPointerBindings(function)});
-
-                while (!worklist.empty())
-                {
-                    BlockState state = std::move(worklist.front());
-                    worklist.pop_front();
-
-                    const std::unordered_map<std::uint32_t, const FunctionFacts::BlockFact *>::const_iterator blockIt =
-                        blockMap.find(state.blockId);
-                    if (blockIt == blockMap.end())
-                    {
-                        continue;
-                    }
-
-                    const FunctionFacts::BlockFact &block = *blockIt->second;
-                    const std::string stateKey = makeStateKey(block.id, state.bindings);
-                    if (!seenStates.insert(stateKey).second)
-                    {
-                        continue;
-                    }
-
-                    PointsToMap bindings = std::move(state.bindings);
-
-                    for (const std::string &rawLine : block.lines)
-                    {
-                        const std::string line = trimLine(rawLine);
-                        if (line.empty())
-                        {
-                            continue;
-                        }
-
-                        if (line.find('=') != std::string::npos &&
-                            line.find("==") == std::string::npos &&
-                            line.find("!=") == std::string::npos &&
-                            line.find("<=") == std::string::npos &&
-                            line.find(">=") == std::string::npos)
-                        {
-                            const std::size_t equalIndex = line.find('=');
-                            if (equalIndex == std::string::npos)
-                            {
-                                continue;
-                            }
-
-                            std::string lhs = trimLine(line.substr(0, equalIndex));
-                            std::string rhs = trimLine(line.substr(equalIndex + 1U));
-                            if (!rhs.empty() && rhs.back() == ';')
-                            {
-                                rhs.pop_back();
-                                rhs = trimLine(rhs);
-                            }
-
-                            const std::string lhsSlot = canonicalSlot(lhs);
-                            if (lhsSlot.empty())
-                            {
-                                continue;
-                            }
-                            std::set<std::string> values = resolveMixedExpressionValues(rhs, knownFunctions, bindings, false);
-                            const std::set<std::string> callReturns =
-                                resolveReturnedCallTargets(rhs, bindings, targetsByFunction);
-                            if (!callReturns.empty())
-                            {
-                                values = std::move(callReturns);
-                            }
-
-                            if (!values.empty())
-                            {
-                                std::set<std::string> &slotValues = bindings[lhsSlot];
-                                slotValues.clear();
-                                slotValues.insert(values.begin(), values.end());
-                            }
-
-                            continue;
-                        }
-
-                        const bool startsWithReturn = line.rfind("return", 0) == 0;
-                        const bool hasReturnTokenBoundary =
-                            line.size() == 6U ||
-                            line[6] == ';' ||
-                            std::isspace(static_cast<unsigned char>(line[6])) != 0;
-                        if (!startsWithReturn || !hasReturnTokenBoundary)
-                        {
-                            continue;
-                        }
-
-                        std::string returned = trimLine(line.substr(6U));
-                        if (!returned.empty() && returned.front() == ' ')
-                        {
-                            returned = trimLine(returned);
-                        }
-                        if (!returned.empty() && returned.back() == ';')
-                        {
-                            returned.pop_back();
-                            returned = trimLine(returned);
-                        }
-
-                        std::set<std::string> values = resolveMixedExpressionValues(returned, knownFunctions, bindings);
-                        const std::set<std::string> callReturns =
-                            resolveReturnedCallTargets(returned, bindings, targetsByFunction);
-                        if (!callReturns.empty())
-                        {
-                            values.insert(callReturns.begin(), callReturns.end());
-                        }
-
-                        for (const std::string &value : values)
-                        {
-                            if (!value.empty() && !isIntegerBinding(value))
-                            {
-                                collectedTargets.insert(value);
-                            }
-                        }
-                    }
-
-                    for (std::uint32_t successor : block.successors)
-                    {
-                        worklist.push_back(BlockState{successor, bindings});
-                    }
-                }
-
-                std::set<std::string> &current = targetsByFunction[function.name];
-                const std::size_t before = current.size();
-                current.insert(collectedTargets.begin(), collectedTargets.end());
-                if (current.size() != before)
-                {
-                    changed = true;
-                }
-            }
-        }
-
-        return targetsByFunction;
     }
 
     /**
@@ -3193,65 +1508,6 @@ namespace
         }
 
         return parameterSlots;
-    }
-
-    /**
-     * @brief Build callee seed bindings from caller argument expressions.
-     */
-    PointsToMap buildSeedBindings(
-        const CallSite &callSite,
-        const std::vector<std::string> &parameterSlots,
-        const std::set<std::string> &pointerSlots,
-        const PointsToMap &callerPointsTo,
-        const std::set<std::string> &knownFunctions)
-    {
-        PointsToMap seeds;
-
-        const std::size_t limit = std::min(parameterSlots.size(), callSite.argumentExpressions.size());
-        for (std::size_t index = 0; index < limit; ++index)
-        {
-            const std::string &slot = parameterSlots[index];
-            const std::string &argumentExpression = callSite.argumentExpressions[index];
-            const bool isPointerSlot = pointerSlots.find(slot) != pointerSlots.end();
-            const bool argumentLooksPointerLike =
-                argumentExpression.find('&') != std::string::npos ||
-                argumentExpression.find("->") != std::string::npos ||
-                argumentExpression.find('.') != std::string::npos;
-            const std::set<std::string> targets =
-                resolveMixedExpressionValues(argumentExpression, knownFunctions, callerPointsTo);
-
-            bool hasNonIntegerTarget = false;
-            for (const std::string &target : targets)
-            {
-                if (!isIntegerBinding(target))
-                {
-                    hasNonIntegerTarget = true;
-                    break;
-                }
-            }
-
-            const bool treatAsPointerLike = isPointerSlot || argumentLooksPointerLike || hasNonIntegerTarget;
-
-            for (const std::string &target : targets)
-            {
-                if (treatAsPointerLike)
-                {
-                    if (!isIntegerBinding(target))
-                    {
-                        seeds[slot].insert(target);
-                    }
-                }
-                else
-                {
-                    if (isIntegerBinding(target))
-                    {
-                        seeds[slot].insert(target);
-                    }
-                }
-            }
-        }
-
-        return seeds;
     }
 
     struct DeferredLoadConstraint
@@ -3461,8 +1717,9 @@ namespace
     {
         const std::vector<FunctionFacts> &functions;
         const std::unordered_map<std::string, const FunctionFacts *> &functionMap;
-        const std::unordered_map<std::string, std::string> &nodeRepresentativeByNode;
-        const std::set<std::string> &knownFunctions;
+        const llvm::DenseMap<PagNodeId, PagNodeId> &nodeRepresentativeByNodeId;
+        const std::unordered_map<std::string, PagNodeId> &pagNodeIdsByName;
+        const std::vector<std::string> &pagNodeNamesById;
         const std::set<std::string> &blacklistedFunctions;
         const std::unordered_map<std::string, std::unordered_set<std::string>> &pointsTo;
         const std::function<std::vector<std::string>(const std::string &, const std::string &)> &collectCandidateMemoryNodes;
@@ -3485,17 +1742,17 @@ namespace
         return callSite.argumentExpressions.size() >= callee.parameterNames.size();
     }
 
-    std::string canonicalConstraintNode(
-        const std::string &node,
-        const std::unordered_map<std::string, std::string> &nodeRepresentativeByNode)
+    PagNodeId canonicalConstraintNodeId(
+        PagNodeId nodeId,
+        const llvm::DenseMap<PagNodeId, PagNodeId> &nodeRepresentativeByNodeId)
     {
-        std::string current = node;
-        std::unordered_set<std::string> visited;
+        PagNodeId current = nodeId;
+        llvm::DenseSet<PagNodeId> visited;
 
         while (visited.insert(current).second)
         {
-            const std::unordered_map<std::string, std::string>::const_iterator it = nodeRepresentativeByNode.find(current);
-            if (it == nodeRepresentativeByNode.end())
+            const llvm::DenseMap<PagNodeId, PagNodeId>::const_iterator it = nodeRepresentativeByNodeId.find(current);
+            if (it == nodeRepresentativeByNodeId.end())
             {
                 break;
             }
@@ -3506,18 +1763,84 @@ namespace
         return current;
     }
 
+    std::string canonicalConstraintNode(
+        const std::string &node,
+        const llvm::DenseMap<PagNodeId, PagNodeId> &nodeRepresentativeByNodeId,
+        const std::unordered_map<std::string, PagNodeId> &pagNodeIdsByName,
+        const std::vector<std::string> &pagNodeNamesById)
+    {
+        if (node.empty())
+        {
+            return std::string();
+        }
+
+        const std::unordered_map<std::string, PagNodeId>::const_iterator idIt = pagNodeIdsByName.find(node);
+        if (idIt == pagNodeIdsByName.end())
+        {
+            return node;
+        }
+
+        const PagNodeId canonicalId = canonicalConstraintNodeId(idIt->second, nodeRepresentativeByNodeId);
+        const std::size_t canonicalIndex = static_cast<std::size_t>(canonicalId);
+        if (canonicalId == kInvalidPagNodeId || canonicalIndex >= pagNodeNamesById.size())
+        {
+            return node;
+        }
+
+        return pagNodeNamesById[canonicalIndex];
+    }
+
     void collapseConstraintGraphSccs(
         PagConstraintState &state,
-        std::unordered_map<std::string, std::string> &nodeRepresentativeByNode)
+        llvm::DenseMap<PagNodeId, PagNodeId> &nodeRepresentativeByNodeId,
+        std::unordered_map<std::string, PagNodeId> &pagNodeIdsByName,
+        std::vector<std::string> &pagNodeNamesById)
     {
-        nodeRepresentativeByNode.clear();
+        nodeRepresentativeByNodeId.clear();
 
-        std::unordered_set<std::string> allNodes;
+        const auto internPagNode = [&](const std::string &name) -> PagNodeId
+        {
+            if (name.empty())
+            {
+                return kInvalidPagNodeId;
+            }
+
+            const std::unordered_map<std::string, PagNodeId>::const_iterator existing = pagNodeIdsByName.find(name);
+            if (existing != pagNodeIdsByName.end())
+            {
+                return existing->second;
+            }
+
+            const PagNodeId id = static_cast<PagNodeId>(pagNodeNamesById.size());
+            pagNodeNamesById.push_back(name);
+            pagNodeIdsByName.emplace(pagNodeNamesById.back(), id);
+            return id;
+        };
+
+        const auto lookupPagNode = [&](PagNodeId id) -> const std::string &
+        {
+            static const std::string kEmpty;
+            if (id == kInvalidPagNodeId)
+            {
+                return kEmpty;
+            }
+
+            const std::size_t index = static_cast<std::size_t>(id);
+            if (index >= pagNodeNamesById.size())
+            {
+                return kEmpty;
+            }
+
+            return pagNodeNamesById[index];
+        };
+
+        llvm::DenseSet<PagNodeId> allNodes;
         auto addNode = [&](const std::string &node)
         {
-            if (!node.empty())
+            const PagNodeId nodeId = internPagNode(node);
+            if (nodeId != kInvalidPagNodeId)
             {
-                allNodes.insert(node);
+                allNodes.insert(nodeId);
             }
         };
 
@@ -3607,14 +1930,14 @@ namespace
             return;
         }
 
-        std::unordered_map<std::string, std::size_t> indexByNode;
-        std::unordered_map<std::string, std::size_t> lowLinkByNode;
-        std::unordered_set<std::string> onStack;
-        std::vector<std::string> stack;
-        std::vector<std::vector<std::string>> components;
+        llvm::DenseMap<PagNodeId, std::size_t> indexByNode;
+        llvm::DenseMap<PagNodeId, std::size_t> lowLinkByNode;
+        llvm::DenseSet<PagNodeId> onStack;
+        std::vector<PagNodeId> stack;
+        std::vector<std::vector<PagNodeId>> components;
         std::size_t nextIndex = 0U;
 
-        std::function<void(const std::string &)> strongConnect = [&](const std::string &node)
+        std::function<void(PagNodeId)> strongConnect = [&](PagNodeId node)
         {
             indexByNode[node] = nextIndex;
             lowLinkByNode[node] = nextIndex;
@@ -3622,12 +1945,18 @@ namespace
             stack.push_back(node);
             onStack.insert(node);
 
-            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator succIt =
-                state.sparseValueFlowSucc.find(node);
-            if (succIt != state.sparseValueFlowSucc.end())
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator succNameIt =
+                state.sparseValueFlowSucc.find(lookupPagNode(node));
+            if (succNameIt != state.sparseValueFlowSucc.end())
             {
-                for (const std::string &next : succIt->second)
+                for (const std::string &nextName : succNameIt->second)
                 {
+                    const PagNodeId next = internPagNode(nextName);
+                    if (next == kInvalidPagNodeId)
+                    {
+                        continue;
+                    }
+
                     if (indexByNode.find(next) == indexByNode.end())
                     {
                         strongConnect(next);
@@ -3645,10 +1974,10 @@ namespace
                 return;
             }
 
-            std::vector<std::string> component;
+            std::vector<PagNodeId> component;
             while (!stack.empty())
             {
-                const std::string current = stack.back();
+                const PagNodeId current = stack.back();
                 stack.pop_back();
                 onStack.erase(current);
                 component.push_back(current);
@@ -3661,7 +1990,7 @@ namespace
             components.push_back(std::move(component));
         };
 
-        for (const std::string &node : allNodes)
+        for (const PagNodeId node : allNodes)
         {
             if (indexByNode.find(node) == indexByNode.end())
             {
@@ -3669,31 +1998,44 @@ namespace
             }
         }
 
-        for (const std::vector<std::string> &component : components)
+        for (const std::vector<PagNodeId> &component : components)
         {
             if (component.size() <= 1U)
             {
                 continue;
             }
 
-            std::string representative = *std::min_element(component.begin(), component.end());
-            for (const std::string &node : component)
+            const PagNodeId representative = *std::min_element(
+                component.begin(),
+                component.end(),
+                [&](PagNodeId lhs, PagNodeId rhs)
+                {
+                    return lookupPagNode(lhs) < lookupPagNode(rhs);
+                });
+            for (const PagNodeId node : component)
             {
                 if (node != representative)
                 {
-                    nodeRepresentativeByNode[node] = representative;
+                    nodeRepresentativeByNodeId[node] = representative;
                 }
             }
         }
 
-        if (nodeRepresentativeByNode.empty())
+        if (nodeRepresentativeByNodeId.empty())
         {
             return;
         }
 
         auto remapNode = [&](const std::string &node) -> std::string
         {
-            return canonicalConstraintNode(node, nodeRepresentativeByNode);
+            const PagNodeId nodeId = internPagNode(node);
+            if (nodeId == kInvalidPagNodeId)
+            {
+                return std::string();
+            }
+
+            const PagNodeId canonicalId = canonicalConstraintNodeId(nodeId, nodeRepresentativeByNodeId);
+            return lookupPagNode(canonicalId);
         };
 
         auto remapNodeSet = [&](const std::unordered_set<std::string> &values)
@@ -3848,7 +2190,9 @@ namespace
         std::vector<CallEdge> &unresolvedIndirect)
     {
         std::unordered_map<std::string, const FunctionFacts *> functionMap;
-        std::unordered_map<std::string, std::string> nodeRepresentativeByNode;
+        llvm::DenseMap<PagNodeId, PagNodeId> nodeRepresentativeByNodeId;
+        std::unordered_map<std::string, PagNodeId> pagNodeIdsByName;
+        std::vector<std::string> pagNodeNamesById(1U);
         std::unordered_map<std::string, std::vector<std::string>> parameterSlotsByFunction;
         std::unordered_map<std::string, std::unordered_set<std::string>> parameterSlotSetByFunction;
         std::unordered_set<std::string> linearFunctions;
@@ -3871,6 +2215,8 @@ namespace
         linearFunctions.reserve(functions.size() * 2U + 1U);
         globalSlots.reserve(totalAssignments + 1U);
         globalRoots.reserve(totalAssignments + 1U);
+        nodeRepresentativeByNodeId.reserve(totalAssignments * 4U + totalCallSites * 2U + 1U);
+        pagNodeIdsByName.reserve(totalAssignments * 8U + totalCallSites * 4U + 1U);
 
         for (std::size_t functionIndex = 0; functionIndex < functions.size(); ++functionIndex)
         {
@@ -4579,7 +2925,7 @@ namespace
             }
         }
 
-        std::unordered_map<CallSiteId, std::set<std::string>> stitchedIndirectCalleesByCallSite;
+        std::unordered_map<CallSiteId, SmallStringList> stitchedIndirectCalleesByCallSite;
         stitchedIndirectCalleesByCallSite.reserve(totalCallSites * 2U + 1U);
 
         std::unordered_map<std::string, std::vector<std::string>> directCalleesByFunction;
@@ -4637,10 +2983,61 @@ namespace
             active.reserve(functions.size() * 2U + 1U);
 
             std::deque<std::string> queue;
+            const auto enqueueReachable = [&](const std::string &seed)
+            {
+                if (!active.insert(seed).second)
+                {
+                    return;
+                }
+                queue.push_back(seed);
+
+                while (!queue.empty())
+                {
+                    const std::string current = queue.front();
+                    queue.pop_front();
+
+                    const std::unordered_map<std::string, std::vector<std::string>>::const_iterator directIt =
+                        directCalleesByFunction.find(current);
+                    if (directIt != directCalleesByFunction.end())
+                    {
+                        for (const std::string &callee : directIt->second)
+                        {
+                            if (active.insert(callee).second)
+                            {
+                                queue.push_back(callee);
+                            }
+                        }
+                    }
+
+                    const std::unordered_map<std::string, std::vector<CallSiteId>>::const_iterator indirectIt =
+                        indirectCallSiteIdsByFunction.find(current);
+                    if (indirectIt != indirectCallSiteIdsByFunction.end())
+                    {
+                        for (const CallSiteId callSiteId : indirectIt->second)
+                        {
+                            const std::unordered_map<CallSiteId, SmallStringList>::const_iterator targetsIt =
+                                stitchedIndirectCalleesByCallSite.find(callSiteId);
+                            if (targetsIt == stitchedIndirectCalleesByCallSite.end())
+                            {
+                                continue;
+                            }
+
+                            for (const std::string &callee : targetsIt->second)
+                            {
+                                if (functionMap.find(callee) != functionMap.end() &&
+                                    active.insert(callee).second)
+                                {
+                                    queue.push_back(callee);
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
             if (functionMap.find("main") != functionMap.end())
             {
-                active.insert("main");
-                queue.push_back("main");
+                enqueueReachable("main");
             }
             else
             {
@@ -4650,60 +3047,21 @@ namespace
                         directIncomingCountByFunction.find(function.name);
                     if (incomingIt != directIncomingCountByFunction.end() && incomingIt->second == 0U)
                     {
-                        if (active.insert(function.name).second)
-                        {
-                            queue.push_back(function.name);
-                        }
+                        enqueueReachable(function.name);
                     }
                 }
             }
 
             if (queue.empty() && !functions.empty())
             {
-                active.insert(functions.front().name);
-                queue.push_back(functions.front().name);
+                enqueueReachable(functions.front().name);
             }
 
-            while (!queue.empty())
+            for (const FunctionFacts &function : functions)
             {
-                const std::string current = queue.front();
-                queue.pop_front();
-
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator directIt =
-                    directCalleesByFunction.find(current);
-                if (directIt != directCalleesByFunction.end())
+                if (active.find(function.name) == active.end())
                 {
-                    for (const std::string &callee : directIt->second)
-                    {
-                        if (active.insert(callee).second)
-                        {
-                            queue.push_back(callee);
-                        }
-                    }
-                }
-
-                const std::unordered_map<std::string, std::vector<CallSiteId>>::const_iterator indirectIt =
-                    indirectCallSiteIdsByFunction.find(current);
-                if (indirectIt != indirectCallSiteIdsByFunction.end())
-                {
-                    for (const CallSiteId callSiteId : indirectIt->second)
-                    {
-                        const std::unordered_map<CallSiteId, std::set<std::string>>::const_iterator targetsIt =
-                            stitchedIndirectCalleesByCallSite.find(callSiteId);
-                        if (targetsIt == stitchedIndirectCalleesByCallSite.end())
-                        {
-                            continue;
-                        }
-
-                        for (const std::string &callee : targetsIt->second)
-                        {
-                            if (functionMap.find(callee) != functionMap.end() &&
-                                active.insert(callee).second)
-                            {
-                                queue.push_back(callee);
-                            }
-                        }
-                    }
+                    enqueueReachable(function.name);
                 }
             }
 
@@ -4835,6 +3193,30 @@ namespace
                 return nodes;
             };
 
+            std::unordered_map<std::string, std::vector<std::string>> candidateMemoryNodesCache;
+            candidateMemoryNodesCache.reserve((trackedMemorySlots.size() + totalCallSites) * 4U + 1U);
+            std::function<const std::vector<std::string> &(const std::string &, const std::string &)> getCandidateMemoryNodes =
+                [&](const std::string &functionName, const std::string &slot) -> const std::vector<std::string> &
+            {
+                static const std::vector<std::string> kEmpty;
+
+                const std::string normalized = normalizeGlobalKey(slot);
+                if (normalized.empty() || !isFunctionPointerRelevantSlot(normalized))
+                {
+                    return kEmpty;
+                }
+
+                const std::string cacheKey = functionName + "\n" + normalized;
+                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator cachedIt =
+                    candidateMemoryNodesCache.find(cacheKey);
+                if (cachedIt != candidateMemoryNodesCache.end())
+                {
+                    return cachedIt->second;
+                }
+
+                return candidateMemoryNodesCache.emplace(cacheKey, collectCandidateMemoryNodes(functionName, normalized)).first->second;
+            };
+
             std::function<bool(const std::string &, const std::string &)> canStrongUpdateSlot =
                 [&](const std::string &functionName, const std::string &slot)
             {
@@ -4869,7 +3251,7 @@ namespace
             {
                 if (!canStrongUpdateSlot(functionName, slot))
                 {
-                    for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                    for (const std::string &node : getCandidateMemoryNodes(functionName, slot))
                     {
                         state.addPointsTo(node, target);
                     }
@@ -4878,7 +3260,7 @@ namespace
 
                 const std::string expectedValueNode = memoryNode(functionName, normalizeGlobalKey(slot));
                 const std::string expectedStorageNode = addressTakenStorageNode(functionName, normalizeGlobalKey(slot));
-                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                for (const std::string &node : getCandidateMemoryNodes(functionName, slot))
                 {
                     if (node == expectedValueNode || (!expectedStorageNode.empty() && node == expectedStorageNode))
                     {
@@ -4899,7 +3281,7 @@ namespace
                     return;
                 }
 
-                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                for (const std::string &node : getCandidateMemoryNodes(functionName, slot))
                 {
                     state.addPointsTo(node, target);
                 }
@@ -4913,7 +3295,7 @@ namespace
                     return;
                 }
 
-                for (const std::string &node : collectCandidateMemoryNodes(functionName, slot))
+                for (const std::string &node : getCandidateMemoryNodes(functionName, slot))
                 {
                     state.addCopyEdge(srcNode, node);
                 }
@@ -4940,8 +3322,8 @@ namespace
                     return;
                 }
 
-                const std::vector<std::string> rootNodes = collectCandidateMemoryNodes(functionName, root);
-                const std::vector<std::string> memberNodes = collectCandidateMemoryNodes(functionName, normalized);
+                const std::vector<std::string> &rootNodes = getCandidateMemoryNodes(functionName, root);
+                const std::vector<std::string> &memberNodes = getCandidateMemoryNodes(functionName, normalized);
                 for (const std::string &rootNode : rootNodes)
                 {
                     for (const std::string &memberNode : memberNodes)
@@ -5133,10 +3515,11 @@ namespace
                 return currentNode;
             };
 
-            std::function<std::set<std::string>(const std::string &, const std::vector<std::string> &)> expandMemcpyDestinationSlots =
+            std::function<std::vector<std::string>(const std::string &, const std::vector<std::string> &)> expandMemcpyDestinationSlots =
                 [&](const std::string &functionName, const std::vector<std::string> &initialSlots)
             {
-                std::set<std::string> expandedSlots;
+                std::vector<std::string> expandedSlots;
+                std::unordered_set<std::string> seenExpandedSlots;
                 std::deque<std::string> pending;
 
                 std::function<void(const std::string &)> enqueueSlot = [&](const std::string &slot)
@@ -5150,8 +3533,9 @@ namespace
                         return;
                     }
 
-                    if (expandedSlots.insert(normalized).second)
+                    if (seenExpandedSlots.insert(normalized).second)
                     {
+                        expandedSlots.push_back(normalized);
                         pending.push_back(normalized);
                     }
                 };
@@ -5212,9 +3596,9 @@ namespace
                 return expandedSlots;
             };
 
-            std::function<std::vector<std::string>(const std::vector<std::string> &, const std::set<std::string> &, const std::string &)> collectMemcpySourceSlots =
+            std::function<std::vector<std::string>(const std::vector<std::string> &, const std::vector<std::string> &, const std::string &)> collectMemcpySourceSlots =
                 [&](const std::vector<std::string> &initialSrcSlots,
-                    const std::set<std::string> &expandedDstSlots,
+                    const std::vector<std::string> &expandedDstSlots,
                     const std::string &expandedDstSlot)
             {
                 std::vector<std::string> resolvedSrcSlots;
@@ -5288,8 +3672,8 @@ namespace
                 const std::size_t limit = std::min(calleeParams.size(), callSite.argumentExpressions.size());
                 for (std::size_t i = 0; i < limit; ++i)
                 {
-                    const std::vector<std::string> dstNodes =
-                        collectCandidateMemoryNodes(calleeName, calleeParams[i]);
+                    const std::vector<std::string> &dstNodes =
+                        getCandidateMemoryNodes(calleeName, calleeParams[i]);
                     if (dstNodes.empty())
                     {
                         continue;
@@ -5344,7 +3728,7 @@ namespace
                         continue;
                     }
 
-                    const std::unordered_map<CallSiteId, std::set<std::string>>::const_iterator indirectIt =
+                    const std::unordered_map<CallSiteId, SmallStringList>::const_iterator indirectIt =
                         stitchedIndirectCalleesByCallSite.find(callSite.callSiteId);
                     if (indirectIt == stitchedIndirectCalleesByCallSite.end())
                     {
@@ -5715,7 +4099,7 @@ namespace
                             for (const std::string &returnedSlot : collectExpressionSlots(returnedRaw))
                             {
                                 std::unordered_set<std::string> seenReturnedNodes;
-                                for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, returnedSlot))
+                                for (const std::string &returnedNode : getCandidateMemoryNodes(function.name, returnedSlot))
                                 {
                                     if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
                                     {
@@ -5727,7 +4111,7 @@ namespace
 
                                 for (const std::string &pointeeSlot : collectPointeeAccessSlots(function.name, returnedSlot))
                                 {
-                                    for (const std::string &returnedNode : collectCandidateMemoryNodes(function.name, pointeeSlot))
+                                    for (const std::string &returnedNode : getCandidateMemoryNodes(function.name, pointeeSlot))
                                     {
                                         if (returnedNode.empty() || !seenReturnedNodes.insert(returnedNode).second)
                                         {
@@ -5754,7 +4138,7 @@ namespace
                         continue;
                     }
 
-                    const std::unordered_map<CallSiteId, std::set<std::string>>::const_iterator indirectIt =
+                    const std::unordered_map<CallSiteId, SmallStringList>::const_iterator indirectIt =
                         stitchedIndirectCalleesByCallSite.find(callSite.callSiteId);
                     if (indirectIt == stitchedIndirectCalleesByCallSite.end())
                     {
@@ -5802,15 +4186,15 @@ namespace
                                 continue;
                             }
 
-                            const std::set<std::string> allDstSlots =
+                            const std::vector<std::string> allDstSlots =
                                 expandMemcpyDestinationSlots(function.name, dstSlots);
 
                             for (const std::string &dstSlot : allDstSlots)
                             {
                                 const std::vector<std::string> resolvedSrcSlots =
                                     collectMemcpySourceSlots(srcSlots, allDstSlots, dstSlot);
-                                const std::vector<std::string> dstNodes =
-                                    collectCandidateMemoryNodes(function.name, dstSlot);
+                                const std::vector<std::string> &dstNodes =
+                                    getCandidateMemoryNodes(function.name, dstSlot);
                                 for (const std::string &dstNode : dstNodes)
                                 {
                                     if (dstNode.empty())
@@ -5880,7 +4264,7 @@ namespace
                     {
                         for (const std::string &aliasSlot : getExpandedMemorySlotAliases(throughSlot))
                         {
-                            for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                            for (const std::string &probeNode : getCandidateMemoryNodes(function.name, aliasSlot))
                             {
                                 state.markRelevant(probeNode);
                                 if (!probeNode.empty() && seenProbeNodes.insert(probeNode).second)
@@ -5894,7 +4278,7 @@ namespace
                     {
                         for (const std::string &aliasSlot : getExpandedMemorySlotAliases(calleeExprSlot))
                         {
-                            for (const std::string &probeNode : collectCandidateMemoryNodes(function.name, aliasSlot))
+                            for (const std::string &probeNode : getCandidateMemoryNodes(function.name, aliasSlot))
                             {
                                 state.markRelevant(probeNode);
                                 if (!probeNode.empty() && seenProbeNodes.insert(probeNode).second)
@@ -5913,7 +4297,7 @@ namespace
             }
             state.saturateRelevantNodes();
 
-            collapseConstraintGraphSccs(state, nodeRepresentativeByNode);
+            collapseConstraintGraphSccs(state, nodeRepresentativeByNodeId, pagNodeIdsByName, pagNodeNamesById);
 
             for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : pointsTo)
             {
@@ -5933,70 +4317,390 @@ namespace
                 }
             }
 
-            std::function<void(const std::string &, const std::string &)> materializeDynamicCopy =
-                [&](const std::string &src, const std::string &dst)
+            const auto internPagNode = [&](const std::string &name) -> PagNodeId
             {
-                const std::string canonicalSrc = canonicalConstraintNode(src, nodeRepresentativeByNode);
-                const std::string canonicalDst = canonicalConstraintNode(dst, nodeRepresentativeByNode);
-                if (!state.addSparseValueFlowEdge(canonicalSrc, canonicalDst))
+                if (name.empty())
+                {
+                    return kInvalidPagNodeId;
+                }
+
+                const std::unordered_map<std::string, PagNodeId>::const_iterator existing = pagNodeIdsByName.find(name);
+                if (existing != pagNodeIdsByName.end())
+                {
+                    return existing->second;
+                }
+
+                const PagNodeId id = static_cast<PagNodeId>(pagNodeNamesById.size());
+                pagNodeNamesById.push_back(name);
+                pagNodeIdsByName.emplace(pagNodeNamesById.back(), id);
+                return id;
+            };
+
+            const auto lookupPagNode = [&](PagNodeId id) -> const std::string &
+            {
+                static const std::string kEmpty;
+                if (id == kInvalidPagNodeId)
+                {
+                    return kEmpty;
+                }
+
+                const std::size_t index = static_cast<std::size_t>(id);
+                if (index >= pagNodeNamesById.size())
+                {
+                    return kEmpty;
+                }
+
+                return pagNodeNamesById[index];
+            };
+
+            struct DeferredLoadConstraintId
+            {
+                PagNodeId dstNode = kInvalidPagNodeId;
+            };
+
+            struct DeferredStoreConstraintId
+            {
+                PagNodeId srcNode = kInvalidPagNodeId;
+            };
+
+            struct DeferredStoreSeedId
+            {
+                PagNodeId target = kInvalidPagNodeId;
+            };
+
+            llvm::DenseMap<PagNodeId, llvm::DenseSet<PagNodeId>> pointsToByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<DeferredLoadConstraintId>> loadsByPointerByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<DeferredStoreConstraintId>> storesByPointerByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<DeferredStoreSeedId>> storeSeedTargetsByPointerByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<PagNodeId>> memTransferDstBySrcPtrByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<PagNodeId>> memTransferSrcByDstPtrByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<PagNodeId>> sparseValueFlowSuccByNodeId;
+            llvm::DenseMap<PagNodeId, std::vector<PagNodeId>> sparseValueFlowPredByNodeId;
+            llvm::DenseSet<std::uint64_t> sparseValueFlowEdgeKeysByNodeId;
+            llvm::DenseSet<PagNodeId> relevantNodesByNodeId;
+            std::deque<PagNodeId> relevantQueueByNodeId;
+            llvm::DenseSet<PagNodeId> inWorklistByNodeId;
+            std::deque<PagNodeId> worklistByNodeId;
+
+            pointsToByNodeId.reserve(pointsTo.size() * 2U + 1U);
+            loadsByPointerByNodeId.reserve(loadsByPointer.size() * 2U + 1U);
+            storesByPointerByNodeId.reserve(storesByPointer.size() * 2U + 1U);
+            storeSeedTargetsByPointerByNodeId.reserve(storeSeedTargetsByPointer.size() * 2U + 1U);
+            memTransferDstBySrcPtrByNodeId.reserve(memTransferDstBySrcPtr.size() * 2U + 1U);
+            memTransferSrcByDstPtrByNodeId.reserve(memTransferSrcByDstPtr.size() * 2U + 1U);
+            sparseValueFlowSuccByNodeId.reserve(sparseValueFlowSucc.size() * 2U + 1U);
+            sparseValueFlowPredByNodeId.reserve(sparseValueFlowPred.size() * 2U + 1U);
+            sparseValueFlowEdgeKeysByNodeId.reserve(sparseValueFlowEdgeKeys.size() * 2U + 1U);
+            relevantNodesByNodeId.reserve(relevantNodes.size() * 2U + 1U);
+            inWorklistByNodeId.reserve(inWorklist.size() * 2U + 1U);
+
+            for (const std::pair<const std::string, std::unordered_set<std::string>> &entry : pointsTo)
+            {
+                const PagNodeId nodeId = internPagNode(entry.first);
+                if (nodeId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                llvm::DenseSet<PagNodeId> &targets = pointsToByNodeId[nodeId];
+                targets.reserve(entry.second.size() + 1U);
+                for (const std::string &target : entry.second)
+                {
+                    const PagNodeId targetId = internPagNode(target);
+                    if (targetId != kInvalidPagNodeId)
+                    {
+                        targets.insert(targetId);
+                    }
+                }
+            }
+
+            for (const std::pair<const std::string, std::vector<DeferredLoadConstraint>> &entry : loadsByPointer)
+            {
+                const PagNodeId pointerId = internPagNode(entry.first);
+                if (pointerId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                std::vector<DeferredLoadConstraintId> &constraints = loadsByPointerByNodeId[pointerId];
+                constraints.reserve(entry.second.size());
+                for (const DeferredLoadConstraint &constraint : entry.second)
+                {
+                    const PagNodeId dstId = internPagNode(constraint.dstNode);
+                    if (dstId != kInvalidPagNodeId)
+                    {
+                        constraints.push_back(DeferredLoadConstraintId{dstId});
+                    }
+                }
+            }
+
+            for (const std::pair<const std::string, std::vector<DeferredStoreConstraint>> &entry : storesByPointer)
+            {
+                const PagNodeId pointerId = internPagNode(entry.first);
+                if (pointerId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                std::vector<DeferredStoreConstraintId> &constraints = storesByPointerByNodeId[pointerId];
+                constraints.reserve(entry.second.size());
+                for (const DeferredStoreConstraint &constraint : entry.second)
+                {
+                    const PagNodeId srcId = internPagNode(constraint.srcNode);
+                    if (srcId != kInvalidPagNodeId)
+                    {
+                        constraints.push_back(DeferredStoreConstraintId{srcId});
+                    }
+                }
+            }
+
+            for (const std::pair<const std::string, std::vector<DeferredStoreSeed>> &entry : storeSeedTargetsByPointer)
+            {
+                const PagNodeId pointerId = internPagNode(entry.first);
+                if (pointerId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                std::vector<DeferredStoreSeedId> &constraints = storeSeedTargetsByPointerByNodeId[pointerId];
+                constraints.reserve(entry.second.size());
+                for (const DeferredStoreSeed &constraint : entry.second)
+                {
+                    const PagNodeId targetId = internPagNode(constraint.target);
+                    if (targetId != kInvalidPagNodeId)
+                    {
+                        constraints.push_back(DeferredStoreSeedId{targetId});
+                    }
+                }
+            }
+
+            for (const std::pair<const std::string, std::vector<std::string>> &entry : memTransferDstBySrcPtr)
+            {
+                const PagNodeId srcId = internPagNode(entry.first);
+                if (srcId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                std::vector<PagNodeId> &dstIds = memTransferDstBySrcPtrByNodeId[srcId];
+                dstIds.reserve(entry.second.size());
+                for (const std::string &dst : entry.second)
+                {
+                    const PagNodeId dstId = internPagNode(dst);
+                    if (dstId != kInvalidPagNodeId)
+                    {
+                        dstIds.push_back(dstId);
+                    }
+                }
+            }
+
+            for (const std::pair<const std::string, std::vector<std::string>> &entry : memTransferSrcByDstPtr)
+            {
+                const PagNodeId dstId = internPagNode(entry.first);
+                if (dstId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                std::vector<PagNodeId> &srcIds = memTransferSrcByDstPtrByNodeId[dstId];
+                srcIds.reserve(entry.second.size());
+                for (const std::string &src : entry.second)
+                {
+                    const PagNodeId srcId = internPagNode(src);
+                    if (srcId != kInvalidPagNodeId)
+                    {
+                        srcIds.push_back(srcId);
+                    }
+                }
+            }
+
+            for (const std::pair<const std::string, std::vector<std::string>> &entry : sparseValueFlowSucc)
+            {
+                const PagNodeId srcId = internPagNode(entry.first);
+                if (srcId == kInvalidPagNodeId)
+                {
+                    continue;
+                }
+
+                std::vector<PagNodeId> &succIds = sparseValueFlowSuccByNodeId[srcId];
+                succIds.reserve(entry.second.size());
+                for (const std::string &dst : entry.second)
+                {
+                    const PagNodeId dstId = internPagNode(dst);
+                    if (dstId == kInvalidPagNodeId)
+                    {
+                        continue;
+                    }
+
+                    succIds.push_back(dstId);
+                    sparseValueFlowPredByNodeId[dstId].push_back(srcId);
+                    sparseValueFlowEdgeKeysByNodeId.insert((static_cast<std::uint64_t>(srcId) << 32U) | static_cast<std::uint64_t>(dstId));
+                }
+            }
+
+            for (const std::string &node : relevantNodes)
+            {
+                const PagNodeId nodeId = internPagNode(node);
+                if (nodeId != kInvalidPagNodeId && relevantNodesByNodeId.insert(nodeId).second)
+                {
+                    relevantQueueByNodeId.push_back(nodeId);
+                }
+            }
+
+            for (const std::string &node : worklist)
+            {
+                const PagNodeId nodeId = internPagNode(node);
+                if (nodeId != kInvalidPagNodeId && inWorklistByNodeId.insert(nodeId).second)
+                {
+                    worklistByNodeId.push_back(nodeId);
+                }
+            }
+
+            const auto queueNodeByNodeId = [&](PagNodeId nodeId)
+            {
+                if (nodeId == kInvalidPagNodeId)
                 {
                     return;
                 }
 
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcIt =
-                    pointsTo.find(canonicalConstraintNode(canonicalSrc, nodeRepresentativeByNode));
-                if (srcIt == pointsTo.end())
+                const bool hasDeferredEffects =
+                    loadsByPointerByNodeId.find(nodeId) != loadsByPointerByNodeId.end() ||
+                    storesByPointerByNodeId.find(nodeId) != storesByPointerByNodeId.end() ||
+                    storeSeedTargetsByPointerByNodeId.find(nodeId) != storeSeedTargetsByPointerByNodeId.end() ||
+                    memTransferDstBySrcPtrByNodeId.find(nodeId) != memTransferDstBySrcPtrByNodeId.end() ||
+                    memTransferSrcByDstPtrByNodeId.find(nodeId) != memTransferSrcByDstPtrByNodeId.end();
+                if (relevantNodesByNodeId.find(nodeId) == relevantNodesByNodeId.end() && !hasDeferredEffects)
                 {
                     return;
                 }
 
-                for (const std::string &target : srcIt->second)
+                if (inWorklistByNodeId.insert(nodeId).second)
                 {
-                    state.addPointsTo(canonicalConstraintNode(canonicalDst, nodeRepresentativeByNode), target);
+                    worklistByNodeId.push_back(nodeId);
+                }
+            };
+
+            const auto saturateRelevantNodesByNodeId = [&]()
+            {
+                while (!relevantQueueByNodeId.empty())
+                {
+                    const PagNodeId nodeId = relevantQueueByNodeId.front();
+                    relevantQueueByNodeId.pop_front();
+
+                    const auto predIt = sparseValueFlowPredByNodeId.find(nodeId);
+                    if (predIt == sparseValueFlowPredByNodeId.end())
+                    {
+                        continue;
+                    }
+
+                    for (const PagNodeId predId : predIt->second)
+                    {
+                        if (relevantNodesByNodeId.insert(predId).second)
+                        {
+                            const auto ptIt = pointsToByNodeId.find(predId);
+                            if (ptIt != pointsToByNodeId.end() && !ptIt->second.empty() &&
+                                inWorklistByNodeId.insert(predId).second)
+                            {
+                                worklistByNodeId.push_back(predId);
+                            }
+                            relevantQueueByNodeId.push_back(predId);
+                        }
+                    }
+                }
+            };
+
+            const auto addSparseValueFlowEdgeByNodeId = [&](PagNodeId srcId, PagNodeId dstId) -> bool
+            {
+                if (srcId == kInvalidPagNodeId || dstId == kInvalidPagNodeId)
+                {
+                    return false;
+                }
+
+                const std::uint64_t edgeKey = (static_cast<std::uint64_t>(srcId) << 32U) | static_cast<std::uint64_t>(dstId);
+                if (!sparseValueFlowEdgeKeysByNodeId.insert(edgeKey).second)
+                {
+                    return false;
+                }
+
+                sparseValueFlowSuccByNodeId[srcId].push_back(dstId);
+                sparseValueFlowPredByNodeId[dstId].push_back(srcId);
+
+                if (relevantNodesByNodeId.find(dstId) != relevantNodesByNodeId.end() &&
+                    relevantNodesByNodeId.insert(srcId).second)
+                {
+                    relevantQueueByNodeId.push_back(srcId);
+                    saturateRelevantNodesByNodeId();
+                }
+
+                return true;
+            };
+
+            const auto addPointsToByNodeId = [&](PagNodeId nodeId, PagNodeId targetId) -> bool
+            {
+                if (nodeId == kInvalidPagNodeId || targetId == kInvalidPagNodeId)
+                {
+                    return false;
+                }
+
+                llvm::DenseSet<PagNodeId> &targets = pointsToByNodeId[nodeId];
+                if (targets.empty())
+                {
+                    targets.reserve(4U);
+                }
+
+                if (!targets.insert(targetId).second)
+                {
+                    return false;
+                }
+
+                queueNodeByNodeId(nodeId);
+                return true;
+            };
+
+            const auto materializeDynamicCopyByNodeId = [&](PagNodeId srcId, PagNodeId dstId)
+            {
+                if (!addSparseValueFlowEdgeByNodeId(srcId, dstId))
+                {
+                    return;
+                }
+
+                const auto srcIt = pointsToByNodeId.find(srcId);
+                if (srcIt == pointsToByNodeId.end())
+                {
+                    return;
+                }
+
+                for (const PagNodeId targetId : srcIt->second)
+                {
+                    addPointsToByNodeId(dstId, targetId);
                 }
             };
 
             std::size_t fixedPointIterations = 0U;
-            std::unordered_map<std::string, std::unordered_set<std::string>> propagatedTargetsByNode;
-            propagatedTargetsByNode.reserve(pointsTo.size() * 2U + 1U);
-            while (!worklist.empty())
+            llvm::DenseMap<PagNodeId, llvm::DenseSet<PagNodeId>> propagatedTargetsByNodeId;
+            propagatedTargetsByNodeId.reserve(pointsToByNodeId.size() * 2U + 1U);
+            while (!worklistByNodeId.empty())
             {
                 ++fixedPointIterations;
-                const std::string queuedNode = worklist.front();
-                worklist.pop_front();
-                inWorklist.erase(queuedNode);
+                const PagNodeId nodeId = worklistByNodeId.front();
+                worklistByNodeId.pop_front();
+                inWorklistByNodeId.erase(nodeId);
 
-                const std::string node = canonicalConstraintNode(queuedNode, nodeRepresentativeByNode);
-                if (node.empty())
+                std::vector<PagNodeId> newTargets;
+                const auto nodeTargetsIt = pointsToByNodeId.find(nodeId);
+                if (nodeTargetsIt != pointsToByNodeId.end())
                 {
-                    continue;
-                }
-
-                if (node != queuedNode)
-                {
-                    if (inWorklist.insert(node).second)
-                    {
-                        worklist.push_back(node);
-                    }
-                    continue;
-                }
-
-                std::vector<std::string> newTargets;
-                const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator nodeTargetsIt =
-                    pointsTo.find(node);
-                if (nodeTargetsIt != pointsTo.end())
-                {
-                    std::unordered_set<std::string> &propagated = propagatedTargetsByNode[node];
+                    llvm::DenseSet<PagNodeId> &propagated = propagatedTargetsByNodeId[nodeId];
                     if (propagated.empty())
                     {
                         propagated.reserve(nodeTargetsIt->second.size() + 1U);
                     }
 
-                    for (const std::string &target : nodeTargetsIt->second)
+                    for (const PagNodeId targetId : nodeTargetsIt->second)
                     {
-                        if (propagated.insert(target).second)
+                        if (propagated.insert(targetId).second)
                         {
-                            newTargets.push_back(target);
+                            newTargets.push_back(targetId);
                         }
                     }
                 }
@@ -6006,120 +4710,132 @@ namespace
                     continue;
                 }
 
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator svfgSuccIt = sparseValueFlowSucc.find(node);
-                if (svfgSuccIt != sparseValueFlowSucc.end())
+                const auto svfgSuccIt = sparseValueFlowSuccByNodeId.find(nodeId);
+                if (svfgSuccIt != sparseValueFlowSuccByNodeId.end())
                 {
-                    for (const std::string &dst : svfgSuccIt->second)
+                    for (const PagNodeId dstId : svfgSuccIt->second)
                     {
-                        for (const std::string &target : newTargets)
+                        for (const PagNodeId targetId : newTargets)
                         {
-                            state.addPointsTo(dst, target);
+                            addPointsToByNodeId(dstId, targetId);
                         }
                     }
                 }
 
-                const std::unordered_map<std::string, std::vector<DeferredLoadConstraint>>::const_iterator loadIt =
-                    loadsByPointer.find(node);
-                if (loadIt != loadsByPointer.end())
+                const auto loadIt = loadsByPointerByNodeId.find(nodeId);
+                if (loadIt != loadsByPointerByNodeId.end())
                 {
-                    for (const DeferredLoadConstraint &loadConstraint : loadIt->second)
+                    for (const DeferredLoadConstraintId &loadConstraint : loadIt->second)
                     {
-                        for (const std::string &objectNode : newTargets)
+                        for (const PagNodeId objectNodeId : newTargets)
                         {
-                            materializeDynamicCopy(objectNode, loadConstraint.dstNode);
+                            materializeDynamicCopyByNodeId(objectNodeId, loadConstraint.dstNode);
                         }
                     }
                 }
 
-                const std::unordered_map<std::string, std::vector<DeferredStoreConstraint>>::const_iterator storeIt =
-                    storesByPointer.find(node);
-                if (storeIt != storesByPointer.end())
+                const auto storeIt = storesByPointerByNodeId.find(nodeId);
+                if (storeIt != storesByPointerByNodeId.end())
                 {
-                    for (const DeferredStoreConstraint &storeConstraint : storeIt->second)
+                    for (const DeferredStoreConstraintId &storeConstraint : storeIt->second)
                     {
-                        for (const std::string &objectNode : newTargets)
+                        for (const PagNodeId objectNodeId : newTargets)
                         {
-                            materializeDynamicCopy(storeConstraint.srcNode, objectNode);
+                            materializeDynamicCopyByNodeId(storeConstraint.srcNode, objectNodeId);
                         }
                     }
                 }
 
-                const std::unordered_map<std::string, std::vector<DeferredStoreSeed>>::const_iterator storeSeedIt =
-                    storeSeedTargetsByPointer.find(node);
-                if (storeSeedIt != storeSeedTargetsByPointer.end())
+                const auto storeSeedIt = storeSeedTargetsByPointerByNodeId.find(nodeId);
+                if (storeSeedIt != storeSeedTargetsByPointerByNodeId.end())
                 {
-                    for (const DeferredStoreSeed &storeSeed : storeSeedIt->second)
+                    for (const DeferredStoreSeedId &storeSeed : storeSeedIt->second)
                     {
-                        for (const std::string &objectNode : newTargets)
+                        for (const PagNodeId objectNodeId : newTargets)
                         {
-                            state.addPointsTo(objectNode, storeSeed.target);
+                            addPointsToByNodeId(objectNodeId, storeSeed.target);
                         }
                     }
                 }
 
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memDstIt =
-                    memTransferDstBySrcPtr.find(node);
-                if (memDstIt != memTransferDstBySrcPtr.end())
+                const auto memDstIt = memTransferDstBySrcPtrByNodeId.find(nodeId);
+                if (memDstIt != memTransferDstBySrcPtrByNodeId.end())
                 {
-                    for (const std::string &dstPtrNode : memDstIt->second)
+                    for (const PagNodeId dstPtrNodeId : memDstIt->second)
                     {
-                        const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
-                            pointsTo.find(dstPtrNode);
-                        if (dstTargetsIt == pointsTo.end())
+                        const auto dstTargetsIt = pointsToByNodeId.find(dstPtrNodeId);
+                        if (dstTargetsIt == pointsToByNodeId.end())
                         {
                             continue;
                         }
 
-                        for (const std::string &srcObj : newTargets)
+                        for (const PagNodeId srcObjId : newTargets)
                         {
-                            for (const std::string &dstObj : dstTargetsIt->second)
+                            for (const PagNodeId dstObjId : dstTargetsIt->second)
                             {
-                                materializeDynamicCopy(srcObj, dstObj);
+                                materializeDynamicCopyByNodeId(srcObjId, dstObjId);
                             }
                         }
                     }
                 }
 
-                const std::unordered_map<std::string, std::vector<std::string>>::const_iterator memSrcIt =
-                    memTransferSrcByDstPtr.find(node);
-                if (memSrcIt != memTransferSrcByDstPtr.end())
+                const auto memSrcIt = memTransferSrcByDstPtrByNodeId.find(nodeId);
+                if (memSrcIt != memTransferSrcByDstPtrByNodeId.end())
                 {
-                    const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator dstTargetsIt =
-                        pointsTo.find(node);
-                    if (dstTargetsIt != pointsTo.end())
+                    for (const PagNodeId srcPtrNodeId : memSrcIt->second)
                     {
-                        for (const std::string &srcPtrNode : memSrcIt->second)
+                        const auto srcTargetsIt = pointsToByNodeId.find(srcPtrNodeId);
+                        if (srcTargetsIt == pointsToByNodeId.end())
                         {
-                            const std::unordered_map<std::string, std::unordered_set<std::string>>::const_iterator srcTargetsIt =
-                                pointsTo.find(srcPtrNode);
-                            if (srcTargetsIt == pointsTo.end())
-                            {
-                                continue;
-                            }
+                            continue;
+                        }
 
-                            for (const std::string &srcObj : srcTargetsIt->second)
+                        for (const PagNodeId srcObjId : srcTargetsIt->second)
+                        {
+                            for (const PagNodeId dstObjId : newTargets)
                             {
-                                for (const std::string &dstObj : newTargets)
-                                {
-                                    materializeDynamicCopy(srcObj, dstObj);
-                                }
+                                materializeDynamicCopyByNodeId(srcObjId, dstObjId);
                             }
                         }
                     }
                 }
             }
 
+            pointsTo.clear();
+            pointsTo.reserve(pointsToByNodeId.size() * 2U + 1U);
+            for (const auto &entry : pointsToByNodeId)
+            {
+                const std::string &node = lookupPagNode(entry.first);
+                if (node.empty())
+                {
+                    continue;
+                }
+
+                std::unordered_set<std::string> targets;
+                targets.reserve(entry.second.size() + 1U);
+                for (const PagNodeId targetId : entry.second)
+                {
+                    const std::string &target = lookupPagNode(targetId);
+                    if (!target.empty())
+                    {
+                        targets.insert(target);
+                    }
+                }
+                pointsTo.emplace(node, std::move(targets));
+            }
+
             logPagFixedPointSummary(
                 fixedPointIterations,
-                pointsTo.size(),
-                sparseValueFlowEdgeKeys.size(),
-                relevantNodes.size());
+                pointsToByNodeId.size(),
+                sparseValueFlowEdgeKeysByNodeId.size(),
+                relevantNodesByNodeId.size());
 
             CallResolutionContext callResolutionContext{
                 functions,
                 functionMap,
-                nodeRepresentativeByNode,
-                knownFunctions,
+                nodeRepresentativeByNodeId,
+                pagNodeIdsByName,
+                pagNodeNamesById,
                 blacklistedFunctions,
                 pointsTo,
                 collectCandidateMemoryNodes,
@@ -6148,8 +4864,8 @@ namespace
                     continue;
                 }
 
-                std::set<std::string> &callees = stitchedIndirectCalleesByCallSite[edge.callSiteId];
-                if (callees.insert(edge.callee).second)
+                SmallStringList &callees = stitchedIndirectCalleesByCallSite[edge.callSiteId];
+                if (appendUnique(callees, edge.callee))
                 {
                     discoveredNewIndirectEdges = true;
                 }
@@ -6276,6 +4992,48 @@ namespace
         std::unordered_map<std::string, SmallStringList> resolvedTargetsByProbeNode;
         resolvedTargetsByProbeNode.reserve(context.pointsTo.size() * 2U + 1U);
 
+        std::unordered_map<std::string, std::vector<std::string>> aliasSlotsByExpressionCache;
+        aliasSlotsByExpressionCache.reserve(context.functions.size() * 16U + 1U);
+        std::unordered_map<std::string, std::vector<std::string>> candidateNodesByFunctionSlotCache;
+        candidateNodesByFunctionSlotCache.reserve(context.functions.size() * 32U + 1U);
+
+        const auto getCachedAliasSlots = [&](const std::string &slot) -> const std::vector<std::string> &
+        {
+            static const std::vector<std::string> kEmpty;
+            if (slot.empty())
+            {
+                return kEmpty;
+            }
+
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator cachedIt =
+                aliasSlotsByExpressionCache.find(slot);
+            if (cachedIt != aliasSlotsByExpressionCache.end())
+            {
+                return cachedIt->second;
+            }
+
+            return aliasSlotsByExpressionCache.emplace(slot, context.getExpandedMemorySlotAliases(slot)).first->second;
+        };
+
+        const auto getCachedCandidateNodes = [&](const std::string &functionName, const std::string &slot) -> const std::vector<std::string> &
+        {
+            static const std::vector<std::string> kEmpty;
+            if (functionName.empty() || slot.empty())
+            {
+                return kEmpty;
+            }
+
+            const std::string cacheKey = functionName + "\n" + slot;
+            const std::unordered_map<std::string, std::vector<std::string>>::const_iterator cachedIt =
+                candidateNodesByFunctionSlotCache.find(cacheKey);
+            if (cachedIt != candidateNodesByFunctionSlotCache.end())
+            {
+                return cachedIt->second;
+            }
+
+            return candidateNodesByFunctionSlotCache.emplace(cacheKey, context.collectCandidateMemoryNodes(functionName, slot)).first->second;
+        };
+
         for (std::size_t functionIndex = 0; functionIndex < context.functions.size(); ++functionIndex)
         {
             const FunctionFacts &function = context.functions[functionIndex];
@@ -6328,9 +5086,9 @@ namespace
 
                 if (!usedCachedProbeNodes && !throughSlot.empty())
                 {
-                    for (const std::string &aliasSlot : context.getExpandedMemorySlotAliases(throughSlot))
+                    for (const std::string &aliasSlot : getCachedAliasSlots(throughSlot))
                     {
-                        for (const std::string &probe : context.collectCandidateMemoryNodes(function.name, aliasSlot))
+                        for (const std::string &probe : getCachedCandidateNodes(function.name, aliasSlot))
                         {
                             if (!probe.empty() && seenProbeNodes.insert(probe).second)
                             {
@@ -6341,9 +5099,9 @@ namespace
                 }
                 if (!usedCachedProbeNodes && !calleeExprSlot.empty())
                 {
-                    for (const std::string &aliasSlot : context.getExpandedMemorySlotAliases(calleeExprSlot))
+                    for (const std::string &aliasSlot : getCachedAliasSlots(calleeExprSlot))
                     {
-                        for (const std::string &probe : context.collectCandidateMemoryNodes(function.name, aliasSlot))
+                        for (const std::string &probe : getCachedCandidateNodes(function.name, aliasSlot))
                         {
                             if (!probe.empty() && seenProbeNodes.insert(probe).second)
                             {
@@ -6356,7 +5114,11 @@ namespace
                 for (const std::string &probeNode : probeNodes)
                 {
                     const std::string canonicalProbeNode =
-                        canonicalConstraintNode(probeNode, context.nodeRepresentativeByNode);
+                        canonicalConstraintNode(
+                            probeNode,
+                            context.nodeRepresentativeByNodeId,
+                            context.pagNodeIdsByName,
+                            context.pagNodeNamesById);
                     if (canonicalProbeNode.empty())
                     {
                         continue;
