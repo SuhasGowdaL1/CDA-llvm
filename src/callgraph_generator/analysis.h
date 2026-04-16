@@ -1,5 +1,5 @@
 /**
- * @file callgraph_analysis.h
+ * @file analysis.h
  * @brief Static call graph construction API from CFG analysis JSON.
  */
 
@@ -75,4 +75,4 @@ bool generateCallGraphFromAnalysisJson(
     CallGraphStats &stats,
     std::string &errorMessage);
 
-#endif // CALLGRAPH_ANALYSIS_H
+#endif // ANALYSIS_H

@@ -1,9 +1,9 @@
 /**
- * @file callgraph_analysis.cpp
+ * @file analysis.cpp
  * @brief Flow-sensitive, context-sensitive static call graph resolver.
  */
 
-#include "callgraph_analysis.h"
+#include "analysis.h"
 
 #include <algorithm>
 #include <cctype>
@@ -2182,7 +2182,7 @@ namespace
     /**
      * @brief Run a PAG/constraint based fixed-point pointer analysis and resolve calls from points-to.
      */
-    void runPagConstraintAnalysis(
+    void resolveCallsUsingPagConstraintSolver(
         const std::vector<FunctionFacts> &functions,
         const std::set<std::string> &knownFunctions,
         const std::set<std::string> &blacklistedFunctions,
@@ -4905,16 +4905,16 @@ namespace
     }
 
     /**
-     * @brief Run flow-sensitive and context-sensitive callgraph resolution.
+     * @brief Resolve call edges by running the PAG constraint solver.
      */
-    void runContextSensitiveAnalysis(
+    void resolveCallEdgesForAnalysis(
         const std::vector<FunctionFacts> &functions,
         const std::set<std::string> &knownFunctions,
         const std::set<std::string> &blacklistedFunctions,
         std::vector<CallEdge> &resolvedEdges,
         std::vector<CallEdge> &unresolvedIndirect)
     {
-        runPagConstraintAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
+        resolveCallsUsingPagConstraintSolver(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
     }
 
     /**
@@ -6519,7 +6519,7 @@ bool generateCallGraphFromAnalysisJsonWithMode(
 
     if (mode == IndirectResolutionMode::ResolveIndirect)
     {
-        runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
+        resolveCallEdgesForAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
 
         if (!writeIndirectMappingJson(
                 indirectMappingPath,

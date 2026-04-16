@@ -1,9 +1,9 @@
 /**
- * @file cfg_generation.cpp
+ * @file generation.cpp
  * @brief Implementation of CFG extraction, callsite fact collection, and DOT emission.
  */
 
-#include "cfg_generation.h"
+#include "generation.h"
 
 #include <algorithm>
 #include <cctype>

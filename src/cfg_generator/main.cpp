@@ -1,5 +1,5 @@
 /**
- * @file cfg_generator_main.cpp
+ * @file main.cpp
  * @brief CLI entrypoint for CFG and analysis-fact generation.
  */
 
@@ -12,8 +12,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include "analysis_output.h"
-#include "cfg_generation.h"
+#include "output.h"
+#include "generation.h"
 
 namespace
 {

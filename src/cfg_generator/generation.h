@@ -1,10 +1,10 @@
 /**
- * @file cfg_generation.h
+ * @file generation.h
  * @brief CFG extraction and DOT emission interfaces.
  */
 
-#ifndef CFG_GENERATION_H
-#define CFG_GENERATION_H
+#ifndef GENERATION_H
+#define GENERATION_H
 
 #include <string>
 #include <vector>
@@ -37,4 +37,4 @@ bool generateCfgBundle(
  */
 bool emitFunctionDotFiles(const CfgBundle &bundle, const std::string &outputDirectory, std::string &errorMessage);
 
-#endif // CFG_GENERATION_H
+#endif // GENERATION_H

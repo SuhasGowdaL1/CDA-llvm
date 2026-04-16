@@ -15,16 +15,17 @@ message(STATUS "Using LLVMConfig.cmake in: ${LLVM_DIR}")
 
 # CFG Generator executable
 add_executable(cfg_generator
-    src/cfg_generator_main.cpp
-    src/analysis_output.cpp
-    src/cfg_generation.cpp
-    src/serialization.cpp
+    src/cfg_generator/main.cpp
+    src/cfg_generator/output.cpp
+    src/cfg_generator/generation.cpp
+    src/common/serialization.cpp
 )
 
 target_include_directories(cfg_generator PRIVATE
     ${LLVM_INCLUDE_DIRS}
     ${CLANG_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/cfg_generator
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 
 add_definitions(${LLVM_DEFINITIONS})
@@ -46,13 +47,14 @@ target_link_libraries(cfg_generator PRIVATE
 
 # Callgraph generator executable
 add_executable(callgraph_generator
-    src/callgraph_generator_main.cpp
-    src/callgraph_analysis.cpp
+    src/callgraph_generator/main.cpp
+    src/callgraph_generator/analysis.cpp
 )
 
 target_include_directories(callgraph_generator PRIVATE
     ${LLVM_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/callgraph_generator
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 
 target_link_libraries(callgraph_generator PRIVATE
@@ -61,13 +63,15 @@ target_link_libraries(callgraph_generator PRIVATE
 
 # Runtime log callgraph generator executable
 add_executable(runtime_callgraph_generator
-    src/runtime_callgraph_generator_main.cpp
-    src/serialization.cpp
+    src/runtime_callgraph_generator/main.cpp
+    src/runtime_callgraph_generator/runtime.cpp
+    src/common/serialization.cpp
 )
 
 target_include_directories(runtime_callgraph_generator PRIVATE
     ${LLVM_INCLUDE_DIRS}
-    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/runtime_callgraph_generator
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/common
 )
 
 target_link_libraries(runtime_callgraph_generator PRIVATE

@@ -56,6 +56,8 @@ This produces:
 						   Callgraph DOT output file (default: out/callgraph.dot)
 --callgraph-context-depth N
 						   Callgraph bounded context depth (default: 3)
+--callgraph-mode MODE      Indirect resolution mode: resolve-indirect or precomputed-indirect
+--indirect-mapping FILE    Indirect mapping JSON path (default: out/indirect-mapping.json)
 --no-callgraph-dot         Disable callgraph DOT output
 ```
 
@@ -72,6 +74,8 @@ After Docker build has created `build-linux/*` binaries:
 ./build-linux/cfg_generator --emit-dot --dot-dir out/dotfiles -o out/cfg-analysis.json examples src --include-dir include --include-dir third_party/include -- -I.
 ./build-linux/callgraph_generator -i out/cfg-analysis.json -o out/callgraph.json --dot-output out/callgraph.dot --context-depth 3
 ```
+
+Use `--mode precomputed-indirect --indirect-mapping out/indirect-mapping.json` with `callgraph_generator` to reuse a previously generated indirect-resolution mapping.
 
 You can also pass multiple source roots through `manage.sh` by repeating `--cfg-input`, for example:
 
@@ -186,8 +190,19 @@ Example:
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work cfggen:linux-build-deps -lc \
-	"./build-linux/runtime_callgraph_generator --logs input/logs.txt --entrypoints input/entrypoints.txt --static-callgraph out/callgraph.json -o out/runtime-callgraph.json --dot-output out/runtime-callgraph.dot --top-k 8"
+	"./build-linux/runtime_callgraph_generator --logs input/logs.txt --entrypoints input/entrypoints.txt --static-callgraph out/callgraph.json -o out/runtime-callgraph.json --dot-output out/runtime-callgraph.dot --timeline-html out/runtime-timeline.html --context-tree-html out/runtime-context-tree.html --top-k 8"
 ```
+
+HTML outputs:
+
+- `out/runtime-timeline.html`: Y-axis shows one bar per entrypoint context run, X-axis is event index time.
+- `out/runtime-context-tree.html`: click-through page; selecting a bar opens a dropdown call tree for that context run.
+
+Optional flags:
+
+- `--timeline-html <file>`: customize timeline page output path.
+- `--context-tree-html <file>`: customize context tree page output path.
+- `--no-html`: skip HTML generation.
 
 Behavior:
 

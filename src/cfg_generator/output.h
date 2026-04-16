@@ -1,10 +1,10 @@
 /**
- * @file analysis_output.h
+ * @file output.h
  * @brief JSON serialization API for CFG analysis artifacts.
  */
 
-#ifndef ANALYSIS_OUTPUT_H
-#define ANALYSIS_OUTPUT_H
+#ifndef OUTPUT_H
+#define OUTPUT_H
 
 #include <string>
 
@@ -19,4 +19,4 @@
  */
 bool writeCfgAnalysisJson(const std::string &path, const CfgBundle &bundle, std::string &errorMessage);
 
-#endif // ANALYSIS_OUTPUT_H
+#endif // OUTPUT_H

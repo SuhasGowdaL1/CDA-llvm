@@ -1,9 +1,9 @@
 /**
- * @file analysis_output.cpp
+ * @file output.cpp
  * @brief JSON writer for CFG analysis bundles.
  */
 
-#include "analysis_output.h"
+#include "output.h"
 
 #include <filesystem>
 #include <fstream>

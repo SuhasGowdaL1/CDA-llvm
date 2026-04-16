@@ -1,5 +1,5 @@
 /**
- * @file callgraph_generator_main.cpp
+ * @file main.cpp
  * @brief CLI entrypoint for callgraph generation from analysis JSON.
  */
 
@@ -12,7 +12,7 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/raw_ostream.h"
 
-#include "callgraph_analysis.h"
+#include "analysis.h"
 
 namespace
 {

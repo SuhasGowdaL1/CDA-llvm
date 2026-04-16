@@ -4,7 +4,8 @@
 #define LOG_ENTRY(fn) printf("%s_entry\n", fn)
 #define LOG_EXIT(fn) printf("%s_exit\n", fn)
 #define LOG_FUNC(fn) printf("%s\n", fn)
-
+void I2C_ISR() {}
+void Reset_Handler() {}
 /* ===== Shared (Ambiguous) Functions ===== */
 void process_data(void)
 {
