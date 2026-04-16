@@ -66,6 +66,20 @@ namespace
         llvm::cl::init(false),
         llvm::cl::cat(kCategory));
 
+    llvm::cl::opt<std::string> kMode(
+        "mode",
+        llvm::cl::desc("Indirect resolution mode: resolve-indirect or precomputed-indirect"),
+        llvm::cl::value_desc("mode"),
+        llvm::cl::init("resolve-indirect"),
+        llvm::cl::cat(kCategory));
+
+    llvm::cl::opt<std::string> kIndirectMapping(
+        "indirect-mapping",
+        llvm::cl::desc("Path to indirect call mapping JSON. Required for precomputed-indirect mode; optional output path in resolve-indirect mode"),
+        llvm::cl::value_desc("file"),
+        llvm::cl::init(""),
+        llvm::cl::cat(kCategory));
+
     bool loadNameListFile(const std::string &filePath, std::set<std::string> &names, std::string &error)
     {
         if (filePath.empty())
@@ -124,15 +138,37 @@ int main(int argc, const char **argv)
     CallGraphStats stats;
     std::string error;
 
+    IndirectResolutionMode resolutionMode = IndirectResolutionMode::ResolveIndirect;
+    if (kMode == "resolve-indirect")
+    {
+        resolutionMode = IndirectResolutionMode::ResolveIndirect;
+    }
+    else if (kMode == "precomputed-indirect")
+    {
+        resolutionMode = IndirectResolutionMode::PrecomputedIndirect;
+        if (kIndirectMapping.empty())
+        {
+            llvm::errs() << "error: --indirect-mapping is required in precomputed-indirect mode\n";
+            return 1;
+        }
+    }
+    else
+    {
+        llvm::errs() << "error: unsupported --mode value: " << kMode << "\n";
+        return 1;
+    }
+
     const std::string dotOutput = kNoDot ? "" : static_cast<std::string>(kDotOutput);
 
-    if (!generateCallGraphFromAnalysisJson(
+    if (!generateCallGraphFromAnalysisJsonWithMode(
             kInput,
             kOutput,
             dotOutput,
             static_cast<std::size_t>(kContextDepth),
             blacklistedFunctions,
             static_cast<bool>(kDebug),
+            resolutionMode,
+            kIndirectMapping,
             stats,
             error))
     {

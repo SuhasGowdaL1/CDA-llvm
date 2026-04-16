@@ -1385,21 +1385,21 @@ namespace
                 if (!calleeSlot.empty())
                 {
                     slots.insert(calleeSlot);
-                }
 
-                std::string normalized = callSite.calleeExpression;
-                for (std::size_t pos = normalized.find("->"); pos != std::string::npos; pos = normalized.find("->", pos + 1U))
-                {
-                    normalized.replace(pos, 2U, ".");
-                }
-                normalized = removeArrayIndices(normalized);
-                const std::size_t dotIndex = normalized.find('.');
-                if (dotIndex != std::string::npos && dotIndex > 0)
-                {
-                    const std::string baseSlot = canonicalSlot(normalized.substr(0, dotIndex));
-                    if (!baseSlot.empty())
+                    std::string normalized = callSite.calleeExpression;
+                    for (std::size_t pos = normalized.find("->"); pos != std::string::npos; pos = normalized.find("->", pos + 1U))
                     {
-                        slots.insert(baseSlot);
+                        normalized.replace(pos, 2U, ".");
+                    }
+                    normalized = removeArrayIndices(normalized);
+                    const std::size_t dotIndex = normalized.find('.');
+                    if (dotIndex != std::string::npos && dotIndex > 0)
+                    {
+                        const std::string baseSlot = canonicalSlot(normalized.substr(0, dotIndex));
+                        if (!baseSlot.empty())
+                        {
+                            slots.insert(baseSlot);
+                        }
                     }
                 }
             }
@@ -5041,8 +5041,245 @@ namespace
         };
 
         std::unordered_map<std::string, SmallStringList> exactMemberTargetsByPath;
+        std::unordered_map<std::string, SmallStringList> fallbackTargetsBySlot;
+        std::unordered_map<std::string, SmallStringList> globalAliasedBasesBySlot;
+
+        std::unordered_set<std::string> knownGlobalSlots;
+        knownGlobalSlots.reserve(context.functions.size() * 8U + 1U);
         for (const FunctionFacts &func : context.functions)
         {
+            for (const PointerAssignment &assignment : func.pointerAssignments)
+            {
+                if (!assignment.lhsIsGlobal)
+                {
+                    continue;
+                }
+
+                const std::string globalSlot = memorySlotFromExpression(assignment.lhsExpression);
+                if (globalSlot.empty())
+                {
+                    continue;
+                }
+
+                knownGlobalSlots.insert(globalSlot);
+                const std::vector<std::string> aliases = expandMemorySlotAliases(globalSlot);
+                const std::string root = memorySlotRoot(globalSlot);
+                const bool indexedSlot = globalSlot.find('[') != std::string::npos;
+                for (const std::string &alias : aliases)
+                {
+                    if (alias.empty())
+                    {
+                        continue;
+                    }
+
+                    if (indexedSlot && alias == root)
+                    {
+                        continue;
+                    }
+
+                    knownGlobalSlots.insert(alias);
+                }
+            }
+        }
+
+        const auto isKnownGlobalSlot = [&](const std::string &slot) -> bool
+        {
+            if (slot.empty())
+            {
+                return false;
+            }
+
+            const std::string root = memorySlotRoot(slot);
+            if (!root.empty() && root.rfind("g_", 0U) == 0U)
+            {
+                return true;
+            }
+
+            if (knownGlobalSlots.find(slot) != knownGlobalSlots.end())
+            {
+                return true;
+            }
+
+            for (const std::string &alias : expandMemorySlotAliases(slot))
+            {
+                if (!alias.empty() && knownGlobalSlots.find(alias) != knownGlobalSlots.end())
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        };
+
+        const auto scopedSlotKey = [&](const std::string &functionName, const std::string &slot) -> std::string
+        {
+            if (functionName.empty() || slot.empty())
+            {
+                return std::string();
+            }
+            return functionName + "\n" + slot;
+        };
+
+        for (const FunctionFacts &func : context.functions)
+        {
+            std::unordered_map<std::string, std::string> pointeeSlotByPointer;
+            pointeeSlotByPointer.reserve(func.pointerAssignments.size() * 2U + 1U);
+
+            std::unordered_map<std::string, SmallStringList> localTargetsBySlot;
+            localTargetsBySlot.reserve(func.pointerAssignments.size() * 2U + 1U);
+
+            const auto resolveStoreTargetSlot = [&](const std::string &lhsExpression) -> std::string
+            {
+                const std::string lhsTrimmed = trimLine(lhsExpression);
+                if (lhsTrimmed.empty())
+                {
+                    return std::string();
+                }
+
+                std::size_t derefDepth = 0U;
+                while (derefDepth < lhsTrimmed.size() && lhsTrimmed[derefDepth] == '*')
+                {
+                    ++derefDepth;
+                }
+
+                if (derefDepth == 0U)
+                {
+                    return std::string();
+                }
+
+                std::string slot = memorySlotFromExpression(lhsExpression);
+                if (slot.empty())
+                {
+                    return std::string();
+                }
+
+                for (std::size_t depth = 0U; depth < derefDepth; ++depth)
+                {
+                    const std::unordered_map<std::string, std::string>::const_iterator pointeeIt =
+                        pointeeSlotByPointer.find(slot);
+                    if (pointeeIt == pointeeSlotByPointer.end())
+                    {
+                        return std::string();
+                    }
+                    slot = pointeeIt->second;
+                }
+
+                return slot;
+            };
+
+            for (const PointerAssignment &assignment : func.pointerAssignments)
+            {
+                const std::string lhsSlot = memorySlotFromExpression(assignment.lhsExpression);
+                const std::string rhsSlot = memorySlotFromExpression(assignment.rhsExpression);
+                const std::string rhsTrimmed = trimLine(assignment.rhsExpression);
+                if (!lhsSlot.empty() && !rhsSlot.empty() && !rhsTrimmed.empty() && rhsTrimmed.front() == '&')
+                {
+                    pointeeSlotByPointer[lhsSlot] = rhsSlot;
+                }
+
+                if (!assignment.assignedFunction.empty() &&
+                    context.functionMap.find(assignment.assignedFunction) != context.functionMap.end())
+                {
+                    const std::string targetSlot = resolveStoreTargetSlot(assignment.lhsExpression);
+                    if (!targetSlot.empty())
+                    {
+                        appendUnique(localTargetsBySlot[targetSlot], assignment.assignedFunction);
+                        appendUnique(fallbackTargetsBySlot[scopedSlotKey(func.name, targetSlot)], assignment.assignedFunction);
+                        if (assignment.lhsIsGlobal || isKnownGlobalSlot(targetSlot))
+                        {
+                            appendUnique(fallbackTargetsBySlot[targetSlot], assignment.assignedFunction);
+                        }
+                    }
+                }
+            }
+
+            for (const FunctionFacts::BlockFact &block : func.blocks)
+            {
+                for (const std::string &line : block.lines)
+                {
+                    const std::optional<MemoryTransferOp> transferOp = parseMemoryTransferOpFromLine(line);
+                    if (!transferOp.has_value())
+                    {
+                        continue;
+                    }
+
+                    for (const std::pair<std::string, std::string> &copyPair : transferOp->copyPairs)
+                    {
+                        const std::string srcExpr = trimLine(copyPair.first);
+                        const std::string dstExpr = trimLine(copyPair.second);
+                        if (dstExpr.empty() || srcExpr.empty())
+                        {
+                            continue;
+                        }
+
+                        std::string dstSlot = memorySlotFromExpression(dstExpr);
+                        if (dstSlot.empty())
+                        {
+                            continue;
+                        }
+
+                        const std::unordered_map<std::string, std::string>::const_iterator dstPointeeIt =
+                            pointeeSlotByPointer.find(dstSlot);
+                        if (dstPointeeIt != pointeeSlotByPointer.end())
+                        {
+                            dstSlot = dstPointeeIt->second;
+                        }
+
+                        std::string srcSlot = memorySlotFromExpression(srcExpr);
+                        if (srcSlot.empty())
+                        {
+                            continue;
+                        }
+
+                        if (!(srcExpr.front() == '&'))
+                        {
+                            const std::unordered_map<std::string, std::string>::const_iterator srcPointeeIt =
+                                pointeeSlotByPointer.find(srcSlot);
+                            if (srcPointeeIt != pointeeSlotByPointer.end())
+                            {
+                                srcSlot = srcPointeeIt->second;
+                            }
+                        }
+
+                        const std::unordered_map<std::string, SmallStringList>::const_iterator localSrcIt =
+                            localTargetsBySlot.find(srcSlot);
+                        if (localSrcIt != localTargetsBySlot.end())
+                        {
+                            for (const std::string &target : localSrcIt->second)
+                            {
+                                appendUnique(localTargetsBySlot[dstSlot], target);
+                                appendUnique(fallbackTargetsBySlot[scopedSlotKey(func.name, dstSlot)], target);
+                                if (isKnownGlobalSlot(dstSlot))
+                                {
+                                    appendUnique(fallbackTargetsBySlot[dstSlot], target);
+                                }
+                            }
+                        }
+
+                        const std::unordered_map<std::string, SmallStringList>::const_iterator globalSrcIt =
+                            fallbackTargetsBySlot.find(srcSlot);
+                        if (globalSrcIt != fallbackTargetsBySlot.end())
+                        {
+                            for (const std::string &target : globalSrcIt->second)
+                            {
+                                appendUnique(localTargetsBySlot[dstSlot], target);
+                                appendUnique(fallbackTargetsBySlot[scopedSlotKey(func.name, dstSlot)], target);
+                                if (isKnownGlobalSlot(dstSlot))
+                                {
+                                    appendUnique(fallbackTargetsBySlot[dstSlot], target);
+                                }
+                            }
+                        }
+
+                        appendUnique(globalAliasedBasesBySlot[scopedSlotKey(func.name, dstSlot)], srcSlot);
+                        if (isKnownGlobalSlot(dstSlot))
+                        {
+                            appendUnique(globalAliasedBasesBySlot[dstSlot], srcSlot);
+                        }
+                    }
+                }
+            }
+
             for (const PointerAssignment &assignment : func.pointerAssignments)
             {
                 const std::string lhsExpression = trimLine(assignment.lhsExpression);
@@ -5060,7 +5297,7 @@ namespace
                     continue;
                 }
 
-                SmallStringList &targets = exactMemberTargetsByPath[memorySlotRoot(lhsBase) + "." + lhsMember];
+                SmallStringList &targets = exactMemberTargetsByPath[lhsBase + "." + lhsMember];
 
                 for (const std::string &identifier : extractIdentifiers(assignment.rhsExpression))
                 {
@@ -5121,6 +5358,92 @@ namespace
                 continue;
             }
             logPagFunctionPhase("resolve-calls", functionIndex, context.functions.size(), function);
+
+            std::unordered_map<std::string, std::string> pointeeSlotByPointer;
+            pointeeSlotByPointer.reserve(function.pointerAssignments.size() * 2U + 1U);
+            std::unordered_map<std::string, std::string> baseAliasBySlot;
+            baseAliasBySlot.reserve(function.pointerAssignments.size() * 2U + 1U);
+            for (const PointerAssignment &assignment : function.pointerAssignments)
+            {
+                const std::string rhsTrimmed = trimLine(assignment.rhsExpression);
+                if (assignment.lhsIsGlobal || assignment.rhsTakesFunctionAddress || !assignment.assignedFunction.empty())
+                {
+                    // Still allow pointer-to-slot bindings from '&' assignments.
+                }
+
+                const std::string lhsSlot = memorySlotFromExpression(assignment.lhsExpression);
+                const std::string rhsSlot = memorySlotFromExpression(assignment.rhsExpression);
+                if (!lhsSlot.empty() && !rhsSlot.empty() && !rhsTrimmed.empty() && rhsTrimmed.front() == '&')
+                {
+                    pointeeSlotByPointer[lhsSlot] = rhsSlot;
+                }
+
+                if (assignment.lhsIsGlobal || assignment.rhsTakesFunctionAddress || !assignment.assignedFunction.empty())
+                {
+                    continue;
+                }
+
+                if (lhsSlot.empty() || rhsSlot.empty() || lhsSlot == rhsSlot)
+                {
+                    continue;
+                }
+
+                baseAliasBySlot[lhsSlot] = rhsSlot;
+            }
+
+            for (const FunctionFacts::BlockFact &block : function.blocks)
+            {
+                for (const std::string &line : block.lines)
+                {
+                    const std::optional<MemoryTransferOp> transferOp = parseMemoryTransferOpFromLine(line);
+                    if (!transferOp.has_value())
+                    {
+                        continue;
+                    }
+
+                    for (const std::pair<std::string, std::string> &copyPair : transferOp->copyPairs)
+                    {
+                        const std::string srcExpr = trimLine(copyPair.first);
+                        const std::string dstExpr = trimLine(copyPair.second);
+                        if (srcExpr.empty() || dstExpr.empty())
+                        {
+                            continue;
+                        }
+
+                        std::string srcSlot = memorySlotFromExpression(srcExpr);
+                        std::string dstSlot = memorySlotFromExpression(dstExpr);
+                        if (srcSlot.empty() || dstSlot.empty())
+                        {
+                            continue;
+                        }
+
+                        if (srcExpr.front() != '&')
+                        {
+                            const std::unordered_map<std::string, std::string>::const_iterator srcPointeeIt =
+                                pointeeSlotByPointer.find(srcSlot);
+                            if (srcPointeeIt != pointeeSlotByPointer.end())
+                            {
+                                srcSlot = srcPointeeIt->second;
+                            }
+                        }
+
+                        if (dstExpr.front() != '&')
+                        {
+                            const std::unordered_map<std::string, std::string>::const_iterator dstPointeeIt =
+                                pointeeSlotByPointer.find(dstSlot);
+                            if (dstPointeeIt != pointeeSlotByPointer.end())
+                            {
+                                dstSlot = dstPointeeIt->second;
+                            }
+                        }
+
+                        if (!srcSlot.empty() && !dstSlot.empty() && srcSlot != dstSlot)
+                        {
+                            baseAliasBySlot[dstSlot] = srcSlot;
+                        }
+                    }
+                }
+            }
 
             for (const CallSite &callSite : function.callSites)
             {
@@ -5235,10 +5558,9 @@ namespace
                     if (memberDot != std::string::npos && memberDot + 1U < callSite.calleeExpression.size())
                     {
                         const std::string memberName = callSite.calleeExpression.substr(memberDot + 1U);
-                        const std::string callMemberPath =
-                            memorySlotRoot(trimLine(callSite.calleeExpression.substr(0U, memberDot))) +
-                            "." +
-                            memberName;
+                        const std::string callBase =
+                            memorySlotFromExpression(trimLine(callSite.calleeExpression.substr(0U, memberDot)));
+                        const std::string callMemberPath = callBase + "." + memberName;
 
                         const std::unordered_map<std::string, SmallStringList>::const_iterator exactMemberIt =
                             exactMemberTargetsByPath.find(callMemberPath);
@@ -5250,8 +5572,76 @@ namespace
                             }
                         }
 
-                        if (resolvedTargets.empty() && !memberName.empty())
+                        if (resolvedTargets.empty() && !callBase.empty())
                         {
+                            const std::unordered_map<std::string, std::string>::const_iterator aliasBaseIt =
+                                baseAliasBySlot.find(callBase);
+                            if (aliasBaseIt != baseAliasBySlot.end())
+                            {
+                                const std::string aliasedMemberPath = aliasBaseIt->second + "." + memberName;
+                                const std::unordered_map<std::string, SmallStringList>::const_iterator aliasedMemberIt =
+                                    exactMemberTargetsByPath.find(aliasedMemberPath);
+                                if (aliasedMemberIt != exactMemberTargetsByPath.end())
+                                {
+                                    for (const std::string &target : aliasedMemberIt->second)
+                                    {
+                                        appendUnique(resolvedTargets, target);
+                                    }
+                                }
+                            }
+
+                            if (resolvedTargets.empty())
+                            {
+                                const std::unordered_map<std::string, SmallStringList>::const_iterator globalAliasIt =
+                                    globalAliasedBasesBySlot.find(scopedSlotKey(function.name, callBase));
+                                if (globalAliasIt != globalAliasedBasesBySlot.end())
+                                {
+                                    for (const std::string &aliasedBase : globalAliasIt->second)
+                                    {
+                                        const std::string aliasedMemberPath = aliasedBase + "." + memberName;
+                                        const std::unordered_map<std::string, SmallStringList>::const_iterator aliasedMemberIt =
+                                            exactMemberTargetsByPath.find(aliasedMemberPath);
+                                        if (aliasedMemberIt == exactMemberTargetsByPath.end())
+                                        {
+                                            continue;
+                                        }
+
+                                        for (const std::string &target : aliasedMemberIt->second)
+                                        {
+                                            appendUnique(resolvedTargets, target);
+                                        }
+                                    }
+                                }
+
+                                if (resolvedTargets.empty() && isKnownGlobalSlot(callBase))
+                                {
+                                    const std::unordered_map<std::string, SmallStringList>::const_iterator unscopedGlobalAliasIt =
+                                        globalAliasedBasesBySlot.find(callBase);
+                                    if (unscopedGlobalAliasIt != globalAliasedBasesBySlot.end())
+                                    {
+                                        for (const std::string &aliasedBase : unscopedGlobalAliasIt->second)
+                                        {
+                                            const std::string aliasedMemberPath = aliasedBase + "." + memberName;
+                                            const std::unordered_map<std::string, SmallStringList>::const_iterator aliasedMemberIt =
+                                                exactMemberTargetsByPath.find(aliasedMemberPath);
+                                            if (aliasedMemberIt == exactMemberTargetsByPath.end())
+                                            {
+                                                continue;
+                                            }
+
+                                            for (const std::string &target : aliasedMemberIt->second)
+                                            {
+                                                appendUnique(resolvedTargets, target);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if (resolvedTargets.empty() && !memberName.empty() && !callBase.empty())
+                        {
+                            const std::string callRoot = memorySlotRoot(callBase);
                             const std::string memberSuffix = "." + memberName;
                             for (const std::pair<const std::string, SmallStringList> &entry : exactMemberTargetsByPath)
                             {
@@ -5261,10 +5651,86 @@ namespace
                                     continue;
                                 }
 
+                                const std::string entryBase =
+                                    entry.first.substr(0U, entry.first.size() - memberSuffix.size());
+                                if (memorySlotRoot(entryBase) != callRoot)
+                                {
+                                    continue;
+                                }
+
                                 for (const std::string &target : entry.second)
                                 {
                                     appendUnique(resolvedTargets, target);
                                 }
+                            }
+
+                            const bool hasWildcardIndexedBase =
+                                callBase.find("[*]") != std::string::npos ||
+                                callSite.calleeExpression.find('[') != std::string::npos;
+                            if (resolvedTargets.empty() && hasWildcardIndexedBase)
+                            {
+                                for (const std::pair<const std::string, SmallStringList> &entry : exactMemberTargetsByPath)
+                                {
+                                    if (entry.first.size() < memberSuffix.size() ||
+                                        entry.first.compare(entry.first.size() - memberSuffix.size(), memberSuffix.size(), memberSuffix) != 0)
+                                    {
+                                        continue;
+                                    }
+
+                                    for (const std::string &target : entry.second)
+                                    {
+                                        appendUnique(resolvedTargets, target);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (resolvedTargets.empty())
+                {
+                    const std::string scopedThroughSlot = scopedSlotKey(function.name, throughSlot);
+                    const std::unordered_map<std::string, SmallStringList>::const_iterator throughIt =
+                        fallbackTargetsBySlot.find(scopedThroughSlot);
+                    if (throughIt != fallbackTargetsBySlot.end())
+                    {
+                        for (const std::string &target : throughIt->second)
+                        {
+                            appendUnique(resolvedTargets, target);
+                        }
+                    }
+                    else if (isKnownGlobalSlot(throughSlot))
+                    {
+                        const std::unordered_map<std::string, SmallStringList>::const_iterator globalThroughIt =
+                            fallbackTargetsBySlot.find(throughSlot);
+                        if (globalThroughIt != fallbackTargetsBySlot.end())
+                        {
+                            for (const std::string &target : globalThroughIt->second)
+                            {
+                                appendUnique(resolvedTargets, target);
+                            }
+                        }
+                    }
+
+                    const std::string scopedCalleeExprSlot = scopedSlotKey(function.name, calleeExprSlot);
+                    const std::unordered_map<std::string, SmallStringList>::const_iterator calleeExprIt =
+                        fallbackTargetsBySlot.find(scopedCalleeExprSlot);
+                    if (calleeExprIt != fallbackTargetsBySlot.end())
+                    {
+                        for (const std::string &target : calleeExprIt->second)
+                        {
+                            appendUnique(resolvedTargets, target);
+                        }
+                    }
+                    else if (isKnownGlobalSlot(calleeExprSlot))
+                    {
+                        const std::unordered_map<std::string, SmallStringList>::const_iterator globalCalleeExprIt =
+                            fallbackTargetsBySlot.find(calleeExprSlot);
+                        if (globalCalleeExprIt != fallbackTargetsBySlot.end())
+                        {
+                            for (const std::string &target : globalCalleeExprIt->second)
+                            {
+                                appendUnique(resolvedTargets, target);
                             }
                         }
                     }
@@ -5521,6 +5987,448 @@ namespace
         return true;
     }
 
+    struct IndirectCallSignature
+    {
+        std::string caller;
+        std::string calleeExprNorm;
+        std::string throughNorm;
+        std::size_t argCount = 0U;
+        std::string member;
+    };
+
+    std::string normalizeIndirectExpression(const std::string &expression)
+    {
+        std::string normalized = trimLine(expression);
+        if (normalized.empty())
+        {
+            return normalized;
+        }
+
+        for (std::size_t pos = normalized.find("->"); pos != std::string::npos; pos = normalized.find("->", pos + 1U))
+        {
+            normalized.replace(pos, 2U, ".");
+        }
+
+        std::string compact;
+        compact.reserve(normalized.size());
+        for (std::size_t i = 0; i < normalized.size(); ++i)
+        {
+            const char ch = normalized[i];
+            if (std::isspace(static_cast<unsigned char>(ch)) != 0)
+            {
+                continue;
+            }
+
+            if (ch != '[')
+            {
+                compact.push_back(ch);
+                continue;
+            }
+
+            std::size_t end = i + 1U;
+            int depth = 1;
+            while (end < normalized.size() && depth > 0)
+            {
+                if (normalized[end] == '[')
+                {
+                    ++depth;
+                }
+                else if (normalized[end] == ']')
+                {
+                    --depth;
+                }
+                ++end;
+            }
+
+            if (depth != 0)
+            {
+                compact.push_back(ch);
+                continue;
+            }
+
+            compact.append("[*]");
+            i = end - 1U;
+        }
+
+        return compact;
+    }
+
+    std::string memberSuffixFromNormalizedExpression(const std::string &normalizedExpr)
+    {
+        const std::size_t dotPos = normalizedExpr.rfind('.');
+        if (dotPos == std::string::npos || dotPos + 1U >= normalizedExpr.size())
+        {
+            return "";
+        }
+
+        const std::string suffix = normalizedExpr.substr(dotPos + 1U);
+        if (suffix.empty())
+        {
+            return "";
+        }
+
+        for (char ch : suffix)
+        {
+            if (std::isalnum(static_cast<unsigned char>(ch)) == 0 && ch != '_')
+            {
+                return "";
+            }
+        }
+
+        return suffix;
+    }
+
+    IndirectCallSignature makeIndirectCallSignature(const std::string &caller, const CallSite &callSite)
+    {
+        IndirectCallSignature signature;
+        signature.caller = caller;
+        signature.calleeExprNorm = normalizeIndirectExpression(callSite.calleeExpression);
+
+        const std::string throughSlot = memorySlotFromExpression(callSite.throughIdentifier);
+        if (!throughSlot.empty())
+        {
+            signature.throughNorm = normalizeIndirectExpression(throughSlot);
+        }
+        else
+        {
+            signature.throughNorm = normalizeIndirectExpression(callSite.throughIdentifier);
+        }
+
+        signature.argCount = callSite.argumentExpressions.size();
+        signature.member = memberSuffixFromNormalizedExpression(signature.calleeExprNorm);
+        return signature;
+    }
+
+    std::string makeIndirectCallSignatureKey(const IndirectCallSignature &signature)
+    {
+        return signature.caller + "|" +
+               signature.calleeExprNorm + "|" +
+               signature.throughNorm + "|" +
+               std::to_string(signature.argCount) + "|" +
+               signature.member;
+    }
+
+    bool writeIndirectMappingJson(
+        const std::string &mappingPath,
+        const std::string &analysisJsonPath,
+        const std::vector<FunctionFacts> &functions,
+        const std::vector<CallEdge> &resolvedEdges,
+        std::string &errorMessage)
+    {
+        if (mappingPath.empty())
+        {
+            return true;
+        }
+
+        std::unordered_map<CallSiteId, SmallStringList> targetsByCallSiteId;
+        targetsByCallSiteId.reserve(resolvedEdges.size() * 2U + 1U);
+        for (const CallEdge &edge : resolvedEdges)
+        {
+            if (edge.kind != "indirect" || edge.callSiteId == kInvalidCallSiteId || edge.callee.empty())
+            {
+                continue;
+            }
+
+            appendUnique(targetsByCallSiteId[edge.callSiteId], edge.callee);
+        }
+
+        struct MappingEntry
+        {
+            IndirectCallSignature signature;
+            SmallStringList targets;
+        };
+
+        std::vector<MappingEntry> entries;
+        std::unordered_set<std::string> seenEntryKeys;
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (!callSite.directCallee.empty())
+                {
+                    continue;
+                }
+
+                MappingEntry entry;
+                entry.signature = makeIndirectCallSignature(function.name, callSite);
+                const std::string key = makeIndirectCallSignatureKey(entry.signature);
+                if (!seenEntryKeys.insert(key).second)
+                {
+                    continue;
+                }
+
+                if (callSite.callSiteId != kInvalidCallSiteId)
+                {
+                    const std::unordered_map<CallSiteId, SmallStringList>::const_iterator targetsIt =
+                        targetsByCallSiteId.find(callSite.callSiteId);
+                    if (targetsIt != targetsByCallSiteId.end())
+                    {
+                        entry.targets = targetsIt->second;
+                    }
+                }
+
+                entries.push_back(std::move(entry));
+            }
+        }
+
+        llvm::json::Object root;
+        root["kind"] = "indirect-call-mapping";
+        root["schemaVersion"] = static_cast<std::int64_t>(2);
+        root["generatedFrom"] = analysisJsonPath;
+
+        std::size_t resolvedCount = 0U;
+        llvm::json::Array entriesJson;
+        for (const MappingEntry &entry : entries)
+        {
+            llvm::json::Object signatureObj;
+            signatureObj["caller"] = entry.signature.caller;
+            signatureObj["calleeExprNorm"] = entry.signature.calleeExprNorm;
+            signatureObj["throughNorm"] = entry.signature.throughNorm;
+            signatureObj["argCount"] = static_cast<std::int64_t>(entry.signature.argCount);
+            signatureObj["member"] = entry.signature.member;
+
+            llvm::json::Array targetsJson;
+            for (const std::string &target : entry.targets)
+            {
+                targetsJson.push_back(target);
+            }
+
+            if (!entry.targets.empty())
+            {
+                ++resolvedCount;
+            }
+
+            llvm::json::Object entryObj;
+            entryObj["signature"] = std::move(signatureObj);
+            entryObj["targets"] = std::move(targetsJson);
+            entriesJson.push_back(std::move(entryObj));
+        }
+        root["entries"] = std::move(entriesJson);
+
+        llvm::json::Object summary;
+        summary["totalCallsites"] = static_cast<std::int64_t>(entries.size());
+        summary["resolvedCallsites"] = static_cast<std::int64_t>(resolvedCount);
+        summary["unresolvedCallsites"] = static_cast<std::int64_t>(entries.size() - resolvedCount);
+        root["summary"] = std::move(summary);
+
+        std::error_code ec;
+        llvm::raw_fd_ostream outputStream(mappingPath, ec);
+        if (ec)
+        {
+            errorMessage = "cannot open indirect mapping output: " + mappingPath;
+            return false;
+        }
+
+        outputStream << llvm::formatv("{0:2}", llvm::json::Value(std::move(root)));
+        outputStream << "\n";
+        outputStream.flush();
+        return true;
+    }
+
+    bool loadIndirectMappingJson(
+        const std::string &mappingPath,
+        std::unordered_map<std::string, SmallStringList> &targetsBySignature,
+        std::string &errorMessage)
+    {
+        targetsBySignature.clear();
+
+        std::ifstream input(mappingPath);
+        if (!input)
+        {
+            errorMessage = "cannot open indirect mapping json: " + mappingPath;
+            return false;
+        }
+
+        std::string jsonText((std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+        llvm::Expected<llvm::json::Value> parsed = llvm::json::parse(jsonText);
+        if (!parsed)
+        {
+            errorMessage = "failed to parse indirect mapping json";
+            return false;
+        }
+
+        const llvm::json::Object *root = parsed->getAsObject();
+        if (root == nullptr)
+        {
+            errorMessage = "indirect mapping json root must be an object";
+            return false;
+        }
+
+        const std::optional<llvm::StringRef> kind = root->getString("kind");
+        if (!kind.has_value() || kind->str() != "indirect-call-mapping")
+        {
+            errorMessage = "invalid indirect mapping kind";
+            return false;
+        }
+
+        const std::optional<std::int64_t> schemaVersion = root->getInteger("schemaVersion");
+        if (!schemaVersion.has_value() || *schemaVersion != 2)
+        {
+            errorMessage = "unsupported indirect mapping schemaVersion";
+            return false;
+        }
+
+        const llvm::json::Array *entries = root->getArray("entries");
+        if (entries == nullptr)
+        {
+            errorMessage = "indirect mapping json missing entries array";
+            return false;
+        }
+
+        targetsBySignature.reserve(entries->size() * 2U + 1U);
+        for (const llvm::json::Value &entryValue : *entries)
+        {
+            const llvm::json::Object *entryObject = entryValue.getAsObject();
+            if (entryObject == nullptr)
+            {
+                continue;
+            }
+
+            const llvm::json::Object *signatureObject = entryObject->getObject("signature");
+            if (signatureObject == nullptr)
+            {
+                continue;
+            }
+
+            IndirectCallSignature signature;
+            if (const std::optional<llvm::StringRef> caller = signatureObject->getString("caller"))
+            {
+                signature.caller = caller->str();
+            }
+            if (const std::optional<llvm::StringRef> calleeExprNorm = signatureObject->getString("calleeExprNorm"))
+            {
+                signature.calleeExprNorm = calleeExprNorm->str();
+            }
+            if (const std::optional<llvm::StringRef> throughNorm = signatureObject->getString("throughNorm"))
+            {
+                signature.throughNorm = throughNorm->str();
+            }
+            if (const std::optional<std::int64_t> argCount = signatureObject->getInteger("argCount"))
+            {
+                signature.argCount = static_cast<std::size_t>(std::max<std::int64_t>(0, *argCount));
+            }
+            if (const std::optional<llvm::StringRef> member = signatureObject->getString("member"))
+            {
+                signature.member = member->str();
+            }
+
+            const std::string signatureKey = makeIndirectCallSignatureKey(signature);
+            SmallStringList &targets = targetsBySignature[signatureKey];
+
+            const llvm::json::Array *targetsArray = entryObject->getArray("targets");
+            if (targetsArray == nullptr)
+            {
+                continue;
+            }
+
+            for (const llvm::json::Value &targetValue : *targetsArray)
+            {
+                const std::optional<llvm::StringRef> target = targetValue.getAsString();
+                if (target.has_value())
+                {
+                    appendUnique(targets, target->str());
+                }
+            }
+        }
+
+        return true;
+    }
+
+    void buildResolvedEdgesFromPrecomputedMapping(
+        const std::vector<FunctionFacts> &functions,
+        const std::set<std::string> &knownFunctions,
+        const std::set<std::string> &blacklistedFunctions,
+        const std::unordered_map<std::string, SmallStringList> &targetsBySignature,
+        std::vector<CallEdge> &resolvedEdges,
+        std::vector<CallEdge> &unresolvedIndirect)
+    {
+        resolvedEdges.clear();
+        unresolvedIndirect.clear();
+
+        std::unordered_map<std::string, const FunctionFacts *> functionMap;
+        functionMap.reserve(functions.size() * 2U + 1U);
+        for (const FunctionFacts &function : functions)
+        {
+            functionMap[function.name] = &function;
+        }
+
+        for (const FunctionFacts &function : functions)
+        {
+            for (const CallSite &callSite : function.callSites)
+            {
+                if (!callSite.directCallee.empty())
+                {
+                    if (isBlacklistedFunction(callSite.directCallee, blacklistedFunctions))
+                    {
+                        continue;
+                    }
+
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = callSite.directCallee;
+                    edge.callSiteId = callSite.callSiteId;
+                    edge.kind = "direct";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(std::move(edge));
+                    continue;
+                }
+
+                const std::string signatureKey = makeIndirectCallSignatureKey(makeIndirectCallSignature(function.name, callSite));
+                const std::unordered_map<std::string, SmallStringList>::const_iterator targetsIt = targetsBySignature.find(signatureKey);
+
+                bool hasResolvedTarget = false;
+                if (targetsIt != targetsBySignature.end())
+                {
+                    for (const std::string &callee : targetsIt->second)
+                    {
+                        if (callee.empty() || knownFunctions.find(callee) == knownFunctions.end() ||
+                            isBlacklistedFunction(callee, blacklistedFunctions))
+                        {
+                            continue;
+                        }
+
+                        const std::unordered_map<std::string, const FunctionFacts *>::const_iterator calleeIt = functionMap.find(callee);
+                        if (calleeIt != functionMap.end() && !hasCompatibleArgumentProfile(callSite, *calleeIt->second))
+                        {
+                            continue;
+                        }
+
+                        CallEdge edge;
+                        edge.caller = function.name;
+                        edge.callee = callee;
+                        edge.callSiteId = callSite.callSiteId;
+                        edge.kind = "indirect";
+                        edge.location = callSite.location;
+                        edge.calleeExpression = callSite.calleeExpression;
+                        edge.throughIdentifier = callSite.throughIdentifier;
+                        resolvedEdges.push_back(std::move(edge));
+                        hasResolvedTarget = true;
+                    }
+                }
+
+                if (!hasResolvedTarget)
+                {
+                    CallEdge edge;
+                    edge.caller = function.name;
+                    edge.callee = "__unknown_indirect_target__";
+                    edge.callSiteId = callSite.callSiteId;
+                    edge.kind = "indirect-unknown";
+                    edge.location = callSite.location;
+                    edge.calleeExpression = callSite.calleeExpression;
+                    edge.throughIdentifier = callSite.throughIdentifier;
+                    resolvedEdges.push_back(edge);
+
+                    CallEdge unresolvedEdge = edge;
+                    unresolvedEdge.callee.clear();
+                    unresolvedIndirect.push_back(std::move(unresolvedEdge));
+                    logUnresolvedCall(unresolvedIndirect.back());
+                }
+            }
+        }
+    }
+
     bool writeCallGraphDot(
         const std::string &outputDotPath,
         const CallGraphArtifacts &artifacts,
@@ -5559,16 +6467,18 @@ namespace
 } // namespace
 
 /**
- * @brief Generate callgraph outputs from analysis JSON.
+ * @brief Generate callgraph outputs from analysis JSON with mode-aware indirect resolution.
  * @return true on success, false on failure.
  */
-bool generateCallGraphFromAnalysisJson(
+bool generateCallGraphFromAnalysisJsonWithMode(
     const std::string &analysisJsonPath,
     const std::string &outputJsonPath,
     const std::string &outputDotPath,
     std::size_t contextDepth,
     const std::set<std::string> &blacklistedFunctions,
     bool debugLoggingEnabled,
+    IndirectResolutionMode mode,
+    const std::string &indirectMappingPath,
     CallGraphStats &stats,
     std::string &errorMessage)
 {
@@ -5607,7 +6517,36 @@ bool generateCallGraphFromAnalysisJson(
     std::vector<CallEdge> resolvedEdges;
     std::vector<CallEdge> unresolvedIndirect;
 
-    runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
+    if (mode == IndirectResolutionMode::ResolveIndirect)
+    {
+        runContextSensitiveAnalysis(functions, knownFunctions, blacklistedFunctions, resolvedEdges, unresolvedIndirect);
+
+        if (!writeIndirectMappingJson(
+                indirectMappingPath,
+                analysisJsonPath,
+                functions,
+                resolvedEdges,
+                errorMessage))
+        {
+            return false;
+        }
+    }
+    else
+    {
+        std::unordered_map<std::string, SmallStringList> targetsBySignature;
+        if (!loadIndirectMappingJson(indirectMappingPath, targetsBySignature, errorMessage))
+        {
+            return false;
+        }
+
+        buildResolvedEdgesFromPrecomputedMapping(
+            functions,
+            knownFunctions,
+            blacklistedFunctions,
+            targetsBySignature,
+            resolvedEdges,
+            unresolvedIndirect);
+    }
     CallGraphArtifacts artifacts = buildCallGraphArtifacts(resolvedEdges, knownFunctions, contextDepth, unresolvedIndirect);
 
     if (!writeCallGraphJson(
@@ -5634,4 +6573,31 @@ bool generateCallGraphFromAnalysisJson(
     stats.contextEdgeCount = artifacts.contextEdgeKeys.size();
 
     return true;
+}
+
+/**
+ * @brief Backward-compatible wrapper that preserves existing resolve-indirect behavior.
+ * @return true on success, false on failure.
+ */
+bool generateCallGraphFromAnalysisJson(
+    const std::string &analysisJsonPath,
+    const std::string &outputJsonPath,
+    const std::string &outputDotPath,
+    std::size_t contextDepth,
+    const std::set<std::string> &blacklistedFunctions,
+    bool debugLoggingEnabled,
+    CallGraphStats &stats,
+    std::string &errorMessage)
+{
+    return generateCallGraphFromAnalysisJsonWithMode(
+        analysisJsonPath,
+        outputJsonPath,
+        outputDotPath,
+        contextDepth,
+        blacklistedFunctions,
+        debugLoggingEnabled,
+        IndirectResolutionMode::ResolveIndirect,
+        "",
+        stats,
+        errorMessage);
 }

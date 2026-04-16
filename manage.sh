@@ -15,6 +15,8 @@ DOT_DIR="out/dotfiles"
 CALLGRAPH_OUTPUT="out/callgraph.json"
 CALLGRAPH_DOT_OUTPUT="out/callgraph.dot"
 CALLGRAPH_CONTEXT_DEPTH=3
+CALLGRAPH_MODE="resolve-indirect"
+CALLGRAPH_INDIRECT_MAPPING="out/indirect-mapping.json"
 DO_BUILD_IMAGE=0
 DO_FORMAT=0
 DO_DOT=0
@@ -76,6 +78,8 @@ Options:
                              Callgraph DOT output file (default: out/callgraph.dot)
   --callgraph-context-depth N
                              Callgraph bounded context depth (default: 3)
+  --callgraph-mode MODE      Indirect resolution mode: resolve-indirect or precomputed-indirect
+  --indirect-mapping FILE    Indirect mapping JSON path (default: out/indirect-mapping.json)
   --callgraph-debug          Enable non-error callgraph debug tracing
   --no-callgraph-dot         Disable callgraph DOT output
   -h, --help                 Show help
@@ -213,6 +217,13 @@ generate_callgraph() {
     cmd="$cmd --blacklist-file $(printf '%q' "$BLACKLIST_FILE")"
   fi
 
+  cmd="$cmd --mode $(printf '%q' "$CALLGRAPH_MODE")"
+  if [[ "$CALLGRAPH_MODE" == "resolve-indirect" ]]; then
+    cmd="$cmd --indirect-mapping $(printf '%q' "$CALLGRAPH_INDIRECT_MAPPING")"
+  else
+    cmd="$cmd --indirect-mapping $(printf '%q' "$CALLGRAPH_INDIRECT_MAPPING")"
+  fi
+
   if [[ "$DO_CALLGRAPH_DEBUG" -eq 1 ]]; then
     cmd="$cmd --debug"
   fi
@@ -300,6 +311,14 @@ while [[ $# -gt 0 ]]; do
       CALLGRAPH_CONTEXT_DEPTH="$2"
       shift 2
       ;;
+    --callgraph-mode)
+      CALLGRAPH_MODE="$2"
+      shift 2
+      ;;
+    --indirect-mapping)
+      CALLGRAPH_INDIRECT_MAPPING="$2"
+      shift 2
+      ;;
     --callgraph-debug)
       DO_CALLGRAPH_DEBUG=1
       shift
@@ -337,6 +356,10 @@ if [[ -f "$ROOT_DIR/$BUILD_DIR/cfg_generator" ]]; then
   if [[ "$DO_CALLGRAPH" -eq 1 ]]; then
     if [[ ! -f "$ROOT_DIR/$BUILD_DIR/callgraph_generator" ]]; then
       echo "callgraph_generator not found in $BUILD_DIR"
+      exit 1
+    fi
+    if [[ "$CALLGRAPH_MODE" == "precomputed-indirect" && ! -f "$ROOT_DIR/$CALLGRAPH_INDIRECT_MAPPING" ]]; then
+      echo "error: indirect mapping file not found: $CALLGRAPH_INDIRECT_MAPPING"
       exit 1
     fi
     generate_callgraph
