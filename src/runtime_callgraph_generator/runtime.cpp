@@ -842,13 +842,33 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
     for (std::size_t i = path.inferredStack.size(); i > 0U; --i)
     {
         InferredFrame &frame = path.inferredStack[i - 1U];
+        const bool isTopInferredFrame = (i == path.inferredStack.size());
+        const bool mirrorsExplicitTop =
+            isTopInferredFrame &&
+            !path.explicitFrames.empty() &&
+            frame.functionName == path.explicitFrames.back().functionName;
+
+        // Entry-marked calls can create a mirrored inferred top frame for the same function.
+        // Do not let that mirrored frame block attribution of sibling calls in the explicit frame.
+        if (mirrorsExplicitTop)
+        {
+            ++depth;
+            continue;
+        }
+
         if (frameCanCallToken(frame, token, cfgByFunction))
         {
             callers.push_back(ActiveCaller{frame.functionName, true, i - 1U, depth});
         }
 
         const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
-        if (!remainingCalls.has_value() || *remainingCalls != 0U)
+        if (!remainingCalls.has_value())
+        {
+            ++depth;
+            continue;
+        }
+
+        if (*remainingCalls != 0U)
         {
             return callers;
         }
