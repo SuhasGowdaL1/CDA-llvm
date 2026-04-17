@@ -251,6 +251,10 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
     InferredFrame &frame,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
+std::vector<std::string> collectImmediateExpectedCallees(
+    InferredFrame &frame,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
+
 // Path analysis
 std::string pathTieBreakerKey(const PathState &path);
 void pruneTopK(std::vector<PathState> &paths, std::size_t topK);

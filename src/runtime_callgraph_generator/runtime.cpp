@@ -1059,6 +1059,42 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
     return std::nullopt;
 }
 
+std::vector<std::string> collectImmediateExpectedCallees(
+    InferredFrame &frame,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+{
+    std::vector<std::string> expected;
+
+    const auto cfgIt = cfgByFunction.find(frame.functionName);
+    if (cfgIt == cfgByFunction.end())
+    {
+        return expected;
+    }
+
+    const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+    ensureClosureComputed(frame, functionCfg);
+    for (const InferredFrame::ProgramPoint &point : frame.activePoints)
+    {
+        const auto blockIt = functionCfg.blocks.find(point.blockId);
+        if (blockIt == functionCfg.blocks.end())
+        {
+            continue;
+        }
+
+        const RuntimeCfgBlock &block = blockIt->second;
+        if (point.callIndex >= block.callees.size())
+        {
+            continue;
+        }
+
+        expected.push_back(block.callees[point.callIndex]);
+    }
+
+    std::sort(expected.begin(), expected.end());
+    expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
+    return expected;
+}
+
 // ============================================================================
 // Path analysis
 // ============================================================================

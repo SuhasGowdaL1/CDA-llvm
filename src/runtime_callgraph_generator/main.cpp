@@ -263,6 +263,102 @@ int main(int argc, const char **argv)
             example.assignmentSummary = summarizeRecentAssignments(candidate);
             invalidationExamplesForEvent.push_back(std::move(example));
         };
+        const auto joinNames = [](const std::vector<std::string> &names) -> std::string
+        {
+            if (names.empty())
+            {
+                return "<none>";
+            }
+
+            std::ostringstream out;
+            for (std::size_t i = 0U; i < names.size(); ++i)
+            {
+                if (i != 0U)
+                {
+                    out << ", ";
+                }
+                out << names[i];
+            }
+            return out.str();
+        };
+        const auto describeNoCfgCaller = [&](PathState &candidate) -> std::string
+        {
+            cleanupInferredStack(candidate);
+
+            for (std::size_t i = candidate.inferredStack.size(); i > 0U; --i)
+            {
+                InferredFrame &frame = candidate.inferredStack[i - 1U];
+                const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
+                const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
+                if (remainingCalls.has_value() && *remainingCalls == 0U)
+                {
+                    continue;
+                }
+
+                if (!expected.empty())
+                {
+                    return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}', which next expects one of [{3}]",
+                                         event.lineNumber,
+                                         event.baseName,
+                                         frame.functionName,
+                                         joinNames(expected))
+                        .str();
+                }
+
+                if (!remainingCalls.has_value())
+                {
+                    return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}', whose CFG completion state could not be proven",
+                                         event.lineNumber,
+                                         event.baseName,
+                                         frame.functionName)
+                        .str();
+                }
+
+                return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}'",
+                                     event.lineNumber,
+                                     event.baseName,
+                                     frame.functionName)
+                    .str();
+            }
+
+            if (!candidate.explicitFrames.empty())
+            {
+                InferredFrame &frame = candidate.explicitFrames.back();
+                const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
+                if (!expected.empty())
+                {
+                    return llvm::formatv("line {0}: top active context '{1}' could not call token '{2}'; next CFG-observable callees are [{3}]",
+                                         event.lineNumber,
+                                         frame.functionName,
+                                         event.baseName,
+                                         joinNames(expected))
+                        .str();
+                }
+
+                const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
+                if (remainingCalls.has_value() && *remainingCalls == 0U)
+                {
+                    return llvm::formatv("line {0}: top active context '{1}' had no remaining CFG calls, so token '{2}' cannot belong to it",
+                                         event.lineNumber,
+                                         frame.functionName,
+                                         event.baseName)
+                        .str();
+                }
+            }
+
+            if (candidate.contextStack.empty())
+            {
+                return llvm::formatv("line {0}: token '{1}' appeared with no active context",
+                                     event.lineNumber,
+                                     event.baseName)
+                    .str();
+            }
+
+            return llvm::formatv("line {0}: token '{1}' had no CFG-feasible active caller",
+                                 event.lineNumber,
+                                 event.baseName)
+                .str();
+        };
         const auto describeExitIncompatibility = [&](PathState &candidate) -> std::optional<std::string>
         {
             cleanupInferredStack(candidate);
@@ -480,12 +576,7 @@ int main(int argc, const char **argv)
 
             if (activeCallers.empty())
             {
-                noteInvalidation(
-                    llvm::formatv("line {0}: token '{1}' had no CFG-feasible active caller",
-                                  event.lineNumber,
-                                  event.baseName)
-                        .str(),
-                    prepared);
+                noteInvalidation(describeNoCfgCaller(prepared), prepared);
                 continue;
             }
 
