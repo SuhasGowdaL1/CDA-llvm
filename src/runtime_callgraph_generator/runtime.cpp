@@ -7,9 +7,14 @@
 
 #include <algorithm>
 #include <cctype>
+#include <deque>
 #include <fstream>
+#include <limits>
+#include <queue>
 #include <sstream>
 
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -26,6 +31,18 @@ bool EdgeKey::operator<(const EdgeKey &other) const
         return caller < other.caller;
     }
     return callee < other.callee;
+}
+
+bool EdgeKey::operator==(const EdgeKey &other) const
+{
+    return caller == other.caller && callee == other.callee;
+}
+
+std::size_t EdgeKeyHash::operator()(const EdgeKey &key) const
+{
+    const std::size_t h1 = std::hash<std::string>{}(key.caller);
+    const std::size_t h2 = std::hash<std::string>{}(key.callee);
+    return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6U) + (h1 >> 2U));
 }
 
 // ============================================================================
@@ -194,9 +211,15 @@ bool parseEvents(
 
     std::size_t lineNo = 0U;
     std::string raw;
+    constexpr std::size_t kProgressEveryLines = 10000U;
     while (std::getline(input, raw))
     {
         ++lineNo;
+        if (lineNo % kProgressEveryLines == 0U)
+        {
+            llvm::errs() << "[runtime] parsed " << lineNo << " log lines, kept " << events.size() << " events\r";
+        }
+
         const std::string token = trimCopy(raw);
         if (token.empty() || token[0] == '#')
         {
@@ -205,7 +228,6 @@ bool parseEvents(
 
         Event event;
         event.lineNumber = lineNo;
-        event.rawToken = token;
         event.kind = EventKind::Plain;
         event.baseName = token;
 
@@ -216,6 +238,7 @@ bool parseEvents(
             {
                 event.kind = EventKind::Entry;
                 event.baseName = base;
+                event.rawToken = token;
             }
         }
         else if (endsWith(token, "_exit"))
@@ -225,18 +248,21 @@ bool parseEvents(
             {
                 event.kind = EventKind::Exit;
                 event.baseName = base;
+                event.rawToken = token;
             }
         }
 
         events.push_back(std::move(event));
     }
 
+    llvm::errs() << "[runtime] parsed " << lineNo << " log lines, kept " << events.size() << " events\n";
+
     return true;
 }
 
 bool loadStaticEdges(
     const std::string &callgraphPath,
-    std::unordered_map<std::string, std::set<std::string>> &callersByCallee,
+    std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
     std::string &error)
 {
     std::ifstream input(callgraphPath);
@@ -298,7 +324,8 @@ bool loadStaticEdges(
 
 bool loadCfgDirectCallOrder(
     const std::string &cfgAnalysisPath,
-    std::unordered_map<std::string, std::vector<std::string>> &orderedCalleesByFunction,
+    const std::set<std::string> &blacklistedFunctions,
+    std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
     std::string &error)
 {
     std::ifstream input(cfgAnalysisPath);
@@ -356,14 +383,13 @@ bool loadCfgDirectCallOrder(
             continue;
         }
 
-        struct CallSiteRef
+        struct CallSiteTarget
         {
-            std::string directCallee;
-            std::int64_t line = 0;
-            std::int64_t column = 0;
+            std::string callee;
         };
 
-        std::vector<CallSiteRef> refs;
+        std::unordered_map<std::string, CallSiteTarget> callSiteTargetById;
+        callSiteTargetById.reserve(callSites->size());
         for (const llvm::json::Value &callSiteValue : *callSites)
         {
             const llvm::json::Object *callSiteObj = callSiteValue.getAsObject();
@@ -372,49 +398,119 @@ bool loadCfgDirectCallOrder(
                 continue;
             }
 
-            const std::optional<llvm::StringRef> directCallee = callSiteObj->getString("directCallee");
-            if (!directCallee.has_value() || directCallee->empty())
+            const std::optional<llvm::StringRef> callSiteId = callSiteObj->getString("callSiteId");
+            if (!callSiteId.has_value() || callSiteId->empty())
             {
                 continue;
             }
 
-            std::int64_t line = 0;
-            std::int64_t column = 0;
-            const llvm::json::Object *location = callSiteObj->getObject("location");
-            if (location != nullptr)
+            const std::optional<llvm::StringRef> directCallee = callSiteObj->getString("directCallee");
+            const std::optional<bool> isIndirect = callSiteObj->getBoolean("isIndirect");
+
+            CallSiteTarget target;
+            if (directCallee.has_value() && !directCallee->empty())
             {
-                if (const std::optional<std::int64_t> value = location->getInteger("line"))
+                if (blacklistedFunctions.find(directCallee->str()) != blacklistedFunctions.end())
                 {
-                    line = *value;
+                    continue;
                 }
-                if (const std::optional<std::int64_t> value = location->getInteger("column"))
-                {
-                    column = *value;
-                }
+                target.callee = directCallee->str();
+            }
+            else if (isIndirect.value_or(false))
+            {
+                target.callee = "<indirect-call>";
+            }
+            else
+            {
+                continue;
             }
 
-            refs.push_back(CallSiteRef{directCallee->str(), line, column});
+            callSiteTargetById[callSiteId->str()] = std::move(target);
         }
 
-        std::sort(refs.begin(), refs.end(), [](const CallSiteRef &lhs, const CallSiteRef &rhs)
-                  {
-            if (lhs.line != rhs.line)
-            {
-                return lhs.line < rhs.line;
-            }
-            if (lhs.column != rhs.column)
-            {
-                return lhs.column < rhs.column;
-            }
-            return lhs.directCallee < rhs.directCallee; });
-
-        std::vector<std::string> ordered;
-        ordered.reserve(refs.size());
-        for (const CallSiteRef &ref : refs)
+        RuntimeFunctionCfg functionCfg;
+        const llvm::json::Array *blocks = functionObj->getArray("blocks");
+        const std::optional<std::int64_t> entryBlockId = functionObj->getInteger("entryBlockId");
+        const std::optional<std::int64_t> exitBlockId = functionObj->getInteger("exitBlockId");
+        if (blocks == nullptr || !entryBlockId.has_value() || *entryBlockId < 0 || !exitBlockId.has_value() || *exitBlockId < 0)
         {
-            ordered.push_back(ref.directCallee);
+            error = "missing full CFG blocks/entryBlockId/exitBlockId for function: " + functionName->str();
+            return false;
         }
-        orderedCalleesByFunction[functionName->str()] = std::move(ordered);
+
+        functionCfg.entryBlockId = static_cast<std::uint32_t>(*entryBlockId);
+        functionCfg.exitBlockId = static_cast<std::uint32_t>(*exitBlockId);
+
+        for (const llvm::json::Value &blockValue : *blocks)
+        {
+            const llvm::json::Object *blockObj = blockValue.getAsObject();
+            if (blockObj == nullptr)
+            {
+                continue;
+            }
+
+            const std::optional<std::int64_t> blockId = blockObj->getInteger("id");
+            if (!blockId.has_value() || *blockId < 0)
+            {
+                continue;
+            }
+
+            RuntimeCfgBlock block;
+            block.id = static_cast<std::uint32_t>(*blockId);
+
+            if (const llvm::json::Array *lineCallSiteIds = blockObj->getArray("lineCallSiteIds"))
+            {
+                for (const llvm::json::Value &lineValue : *lineCallSiteIds)
+                {
+                    const llvm::json::Array *callSiteIds = lineValue.getAsArray();
+                    if (callSiteIds == nullptr)
+                    {
+                        continue;
+                    }
+
+                    for (const llvm::json::Value &callSiteIdValue : *callSiteIds)
+                    {
+                        const std::optional<llvm::StringRef> callSiteId = callSiteIdValue.getAsString();
+                        if (!callSiteId.has_value() || callSiteId->empty())
+                        {
+                            continue;
+                        }
+
+                        const auto targetIt = callSiteTargetById.find(callSiteId->str());
+                        if (targetIt != callSiteTargetById.end())
+                        {
+                            block.callees.push_back(targetIt->second.callee);
+                        }
+                    }
+                }
+            }
+
+            if (const llvm::json::Array *successors = blockObj->getArray("successors"))
+            {
+                for (const llvm::json::Value &successorValue : *successors)
+                {
+                    if (const std::optional<std::int64_t> successor = successorValue.getAsInteger())
+                    {
+                        if (*successor >= 0)
+                        {
+                            block.successors.push_back(static_cast<std::uint32_t>(*successor));
+                        }
+                    }
+                }
+                std::sort(block.successors.begin(), block.successors.end());
+                block.successors.erase(std::unique(block.successors.begin(), block.successors.end()), block.successors.end());
+            }
+
+            functionCfg.blocks[block.id] = std::move(block);
+        }
+
+        if (functionCfg.blocks.empty() || functionCfg.blocks.find(functionCfg.entryBlockId) == functionCfg.blocks.end())
+        {
+            error = "invalid full CFG block graph for function: " + functionName->str();
+            return false;
+        }
+
+        cfgByFunction[functionName->str()] = std::move(functionCfg);
     }
 
     return true;
@@ -424,8 +520,258 @@ bool loadCfgDirectCallOrder(
 // Path state management
 // ============================================================================
 
+namespace
+{
+    constexpr std::size_t kMaxEpsilonTransitionExpansions = 4096U;
+
+    void computeEpsilonClosure(
+        llvm::SmallVectorImpl<InferredFrame::ProgramPoint> &points,
+        const RuntimeFunctionCfg &functionCfg);
+
+    std::uint64_t encodeProgramPoint(const InferredFrame::ProgramPoint &point)
+    {
+        return (static_cast<std::uint64_t>(point.blockId) << 32U) |
+               static_cast<std::uint64_t>(point.callIndex);
+    }
+
+    InferredFrame::ProgramPoint decodeProgramPoint(std::uint64_t encoded)
+    {
+        InferredFrame::ProgramPoint point;
+        point.blockId = static_cast<std::uint32_t>(encoded >> 32U);
+        point.callIndex = static_cast<std::uint32_t>(encoded & 0xFFFFFFFFULL);
+        return point;
+    }
+
+    bool seedFrameForFunction(
+        InferredFrame &frame,
+        const std::string &functionName,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+    {
+        frame.functionName = functionName;
+        frame.activePoints.clear();
+
+        const auto cfgIt = cfgByFunction.find(functionName);
+        if (cfgIt == cfgByFunction.end())
+        {
+            return false;
+        }
+
+        const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+        if (functionCfg.blocks.empty())
+        {
+            return false;
+        }
+
+        if (functionCfg.blocks.find(functionCfg.entryBlockId) == functionCfg.blocks.end())
+        {
+            return false;
+        }
+
+        frame.activePoints.push_back(InferredFrame::ProgramPoint{functionCfg.entryBlockId, 0U});
+        frame.closureComputed = false;
+        frame.tokenCacheValid = false;
+        frame.lastCheckedToken.clear();
+        frame.lastCheckedTokenFeasible = false;
+        return true;
+    }
+
+    void ensureClosureComputed(
+        InferredFrame &frame,
+        const RuntimeFunctionCfg &functionCfg)
+    {
+        if (frame.closureComputed)
+        {
+            return;
+        }
+
+        computeEpsilonClosure(frame.activePoints, functionCfg);
+        frame.closureComputed = true;
+    }
+
+    void normalizePoints(llvm::SmallVectorImpl<InferredFrame::ProgramPoint> &points)
+    {
+        std::sort(points.begin(), points.end());
+        points.erase(std::unique(points.begin(), points.end(), [](const InferredFrame::ProgramPoint &lhs, const InferredFrame::ProgramPoint &rhs)
+                                 { return lhs.blockId == rhs.blockId && lhs.callIndex == rhs.callIndex; }),
+                     points.end());
+    }
+
+    void computeEpsilonClosure(
+        llvm::SmallVectorImpl<InferredFrame::ProgramPoint> &points,
+        const RuntimeFunctionCfg &functionCfg)
+    {
+        normalizePoints(points);
+
+        llvm::DenseSet<std::uint64_t> visited;
+        llvm::SmallVector<std::uint64_t, 16> queue;
+        visited.reserve(points.size() * 2U + 1U);
+        queue.reserve(points.size());
+        for (const InferredFrame::ProgramPoint &point : points)
+        {
+            const std::uint64_t encoded = encodeProgramPoint(point);
+            if (visited.insert(encoded).second)
+            {
+                queue.push_back(encoded);
+            }
+        }
+
+        std::size_t queueIndex = 0U;
+        std::size_t expansions = 0U;
+        while (queueIndex < queue.size() && expansions < kMaxEpsilonTransitionExpansions)
+        {
+            ++expansions;
+
+            const InferredFrame::ProgramPoint point = decodeProgramPoint(queue[queueIndex++]);
+
+            const auto blockIt = functionCfg.blocks.find(point.blockId);
+            if (blockIt == functionCfg.blocks.end())
+            {
+                continue;
+            }
+
+            const RuntimeCfgBlock &block = blockIt->second;
+            const std::uint32_t callCount = static_cast<std::uint32_t>(block.callees.size());
+            if (point.callIndex < callCount)
+            {
+                continue;
+            }
+
+            for (const std::uint32_t successor : block.successors)
+            {
+                if (functionCfg.blocks.find(successor) == functionCfg.blocks.end())
+                {
+                    continue;
+                }
+
+                const InferredFrame::ProgramPoint successorPoint{successor, 0U};
+                const std::uint64_t encodedSuccessor = encodeProgramPoint(successorPoint);
+                if (visited.insert(encodedSuccessor).second)
+                {
+                    queue.push_back(encodedSuccessor);
+                }
+            }
+        }
+
+        points.clear();
+        points.reserve(visited.size());
+        for (const std::uint64_t encoded : visited)
+        {
+            points.push_back(decodeProgramPoint(encoded));
+        }
+        normalizePoints(points);
+    }
+
+    bool frameCanCallToken(
+        InferredFrame &frame,
+        const std::string &token,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+    {
+        if (frame.tokenCacheValid && frame.lastCheckedToken == token)
+        {
+            return frame.lastCheckedTokenFeasible;
+        }
+
+        const auto cfgIt = cfgByFunction.find(frame.functionName);
+        if (cfgIt == cfgByFunction.end())
+        {
+            frame.tokenCacheValid = true;
+            frame.lastCheckedToken = token;
+            frame.lastCheckedTokenFeasible = false;
+            return false;
+        }
+
+        const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+        ensureClosureComputed(frame, functionCfg);
+        for (const InferredFrame::ProgramPoint &point : frame.activePoints)
+        {
+            const auto blockIt = functionCfg.blocks.find(point.blockId);
+            if (blockIt == functionCfg.blocks.end())
+            {
+                continue;
+            }
+
+            const RuntimeCfgBlock &block = blockIt->second;
+            if (point.callIndex >= block.callees.size())
+            {
+                continue;
+            }
+
+            const std::string &expectedCallee = block.callees[point.callIndex];
+            if (expectedCallee == token || expectedCallee == "<indirect-call>")
+            {
+                frame.tokenCacheValid = true;
+                frame.lastCheckedToken = token;
+                frame.lastCheckedTokenFeasible = true;
+                return true;
+            }
+        }
+
+        frame.tokenCacheValid = true;
+        frame.lastCheckedToken = token;
+        frame.lastCheckedTokenFeasible = false;
+        return false;
+    }
+
+    bool consumeTokenInFrame(
+        InferredFrame &frame,
+        const std::string &token,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+    {
+        const auto cfgIt = cfgByFunction.find(frame.functionName);
+        if (cfgIt == cfgByFunction.end())
+        {
+            return false;
+        }
+
+        const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+        ensureClosureComputed(frame, functionCfg);
+
+        llvm::SmallVector<InferredFrame::ProgramPoint, 8> nextPoints;
+        for (const InferredFrame::ProgramPoint &point : frame.activePoints)
+        {
+            const auto blockIt = functionCfg.blocks.find(point.blockId);
+            if (blockIt == functionCfg.blocks.end())
+            {
+                continue;
+            }
+
+            const RuntimeCfgBlock &block = blockIt->second;
+            if (point.callIndex >= block.callees.size())
+            {
+                continue;
+            }
+
+            const std::string &expectedCallee = block.callees[point.callIndex];
+            if (expectedCallee != token && expectedCallee != "<indirect-call>")
+            {
+                continue;
+            }
+
+            nextPoints.push_back(InferredFrame::ProgramPoint{point.blockId, point.callIndex + 1U});
+        }
+
+        if (nextPoints.empty())
+        {
+            return false;
+        }
+
+        computeEpsilonClosure(nextPoints, functionCfg);
+        frame.activePoints = std::move(nextPoints);
+        frame.closureComputed = true;
+        frame.tokenCacheValid = false;
+        frame.lastCheckedToken.clear();
+        frame.lastCheckedTokenFeasible = false;
+        return true;
+    }
+}
+
 void cleanupInferredStack(PathState &path)
 {
+    while (path.explicitFrames.size() > path.contextStack.size())
+    {
+        path.explicitFrames.pop_back();
+    }
+
     while (!path.inferredStack.empty() && path.inferredStack.back().explicitDepthAnchor > path.contextStack.size())
     {
         path.inferredStack.pop_back();
@@ -434,6 +780,11 @@ void cleanupInferredStack(PathState &path)
 
 void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth)
 {
+    if (depth < path.explicitFrames.size())
+    {
+        path.explicitFrames.resize(depth);
+    }
+
     while (!path.inferredStack.empty() && path.inferredStack.back().explicitDepthAnchor >= depth)
     {
         path.inferredStack.pop_back();
@@ -443,16 +794,74 @@ void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth)
 std::vector<std::string> buildActiveCallerOrder(const PathState &path)
 {
     std::vector<std::string> callers;
-    callers.reserve(path.inferredStack.size() + path.contextStack.size());
+    callers.reserve(path.inferredStack.size() + path.explicitFrames.size());
 
     for (std::size_t i = path.inferredStack.size(); i > 0U; --i)
     {
         callers.push_back(path.inferredStack[i - 1U].functionName);
     }
 
-    for (std::size_t i = path.contextStack.size(); i > 0U; --i)
+    for (std::size_t i = path.explicitFrames.size(); i > 0U; --i)
     {
-        callers.push_back(path.contextStack[i - 1U]);
+        callers.push_back(path.explicitFrames[i - 1U].functionName);
+    }
+
+    return callers;
+}
+
+std::vector<ActiveCaller> buildActiveCallers(const PathState &path)
+{
+    std::vector<ActiveCaller> callers;
+    callers.reserve(path.inferredStack.size() + path.explicitFrames.size());
+
+    std::size_t depth = 0U;
+    for (std::size_t i = path.inferredStack.size(); i > 0U; --i)
+    {
+        callers.push_back(ActiveCaller{path.inferredStack[i - 1U].functionName, true, i - 1U, depth++});
+    }
+
+    for (std::size_t i = path.explicitFrames.size(); i > 0U; --i)
+    {
+        callers.push_back(ActiveCaller{path.explicitFrames[i - 1U].functionName, false, i - 1U, depth++});
+    }
+
+    return callers;
+}
+
+std::vector<ActiveCaller> buildFeasibleActiveCallers(
+    PathState &path,
+    const std::string &token,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+{
+    cleanupInferredStack(path);
+
+    std::vector<ActiveCaller> callers;
+    callers.reserve(path.inferredStack.size() + path.explicitFrames.size());
+
+    std::size_t depth = 0U;
+    for (std::size_t i = path.inferredStack.size(); i > 0U; --i)
+    {
+        InferredFrame &frame = path.inferredStack[i - 1U];
+        if (frameCanCallToken(frame, token, cfgByFunction))
+        {
+            callers.push_back(ActiveCaller{frame.functionName, true, i - 1U, depth});
+        }
+
+        const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
+        if (!remainingCalls.has_value() || *remainingCalls != 0U)
+        {
+            return callers;
+        }
+        ++depth;
+    }
+
+    if (!path.explicitFrames.empty())
+    {
+        InferredFrame &frame = path.explicitFrames.back();
+        if (frameCanCallToken(frame, token, cfgByFunction))
+        {
+            callers.push_back(ActiveCaller{frame.functionName, false, path.explicitFrames.size() - 1U, depth});
+        }
     }
 
     return callers;
@@ -461,83 +870,58 @@ std::vector<std::string> buildActiveCallerOrder(const PathState &path)
 void alignInferredFrameForToken(
     PathState &path,
     const std::string &token,
-    const std::unordered_map<std::string, std::vector<std::string>> &orderedCalleesByFunction)
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
 {
     cleanupInferredStack(path);
     while (!path.inferredStack.empty())
     {
         InferredFrame &top = path.inferredStack.back();
-        const std::unordered_map<std::string, std::vector<std::string>>::const_iterator functionIt =
-            orderedCalleesByFunction.find(top.functionName);
-        if (functionIt == orderedCalleesByFunction.end() || functionIt->second.empty())
+        if (!frameCanCallToken(top, token, cfgByFunction))
         {
             path.inferredStack.pop_back();
             continue;
         }
-
-        const std::vector<std::string> &orderedCallees = functionIt->second;
-        if (top.nextExpectedCallIndex >= orderedCallees.size())
-        {
-            path.inferredStack.pop_back();
-            continue;
-        }
-
-        std::size_t scan = top.nextExpectedCallIndex;
-        while (scan < orderedCallees.size() && orderedCallees[scan] != token)
-        {
-            ++scan;
-        }
-
-        if (scan == orderedCallees.size())
-        {
-            path.inferredStack.pop_back();
-            continue;
-        }
-
-        top.nextExpectedCallIndex = scan;
         break;
     }
 }
 
 void updateInferredStackAfterAssignment(
     PathState &path,
-    const std::string &chosenCaller,
+    const ActiveCaller &chosenCaller,
     const std::string &chosenCallee,
     const std::set<std::string> &entrypoints,
-    const std::unordered_map<std::string, std::vector<std::string>> &orderedCalleesByFunction)
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
 {
     cleanupInferredStack(path);
 
-    if (!path.inferredStack.empty() && path.inferredStack.back().functionName == chosenCaller)
+    if (chosenCaller.isInferred)
     {
-        InferredFrame &top = path.inferredStack.back();
-        const std::unordered_map<std::string, std::vector<std::string>>::const_iterator functionIt =
-            orderedCalleesByFunction.find(top.functionName);
-        if (functionIt != orderedCalleesByFunction.end())
+        if (chosenCaller.frameIndex < path.inferredStack.size())
         {
-            const std::vector<std::string> &orderedCallees = functionIt->second;
-            if (top.nextExpectedCallIndex < orderedCallees.size() && orderedCallees[top.nextExpectedCallIndex] == chosenCallee)
-            {
-                ++top.nextExpectedCallIndex;
-            }
-            else
-            {
-                std::size_t scan = top.nextExpectedCallIndex;
-                while (scan < orderedCallees.size() && orderedCallees[scan] != chosenCallee)
-                {
-                    ++scan;
-                }
-                if (scan < orderedCallees.size())
-                {
-                    top.nextExpectedCallIndex = scan + 1U;
-                }
-            }
-
-            if (top.nextExpectedCallIndex >= orderedCallees.size())
-            {
-                path.inferredStack.pop_back();
-            }
+            path.inferredStack.resize(chosenCaller.frameIndex + 1U);
         }
+    }
+    else
+    {
+        path.inferredStack.clear();
+    }
+
+    InferredFrame *callerFrame = nullptr;
+    if (chosenCaller.isInferred)
+    {
+        if (chosenCaller.frameIndex < path.inferredStack.size())
+        {
+            callerFrame = &path.inferredStack[chosenCaller.frameIndex];
+        }
+    }
+    else if (chosenCaller.frameIndex < path.explicitFrames.size())
+    {
+        callerFrame = &path.explicitFrames[chosenCaller.frameIndex];
+    }
+
+    if (callerFrame != nullptr)
+    {
+        (void)consumeTokenInFrame(*callerFrame, chosenCallee, cfgByFunction);
     }
 
     // Keep explicit-frame events authoritative: entrypoints with explicit markers should not be inferred.
@@ -546,33 +930,248 @@ void updateInferredStackAfterAssignment(
         return;
     }
 
-    const std::unordered_map<std::string, std::vector<std::string>>::const_iterator calleeIt =
-        orderedCalleesByFunction.find(chosenCallee);
-    if (calleeIt == orderedCalleesByFunction.end() || calleeIt->second.empty())
+    InferredFrame frame;
+    if (!seedFrameForFunction(frame, chosenCallee, cfgByFunction))
     {
         return;
     }
 
-    InferredFrame frame;
     frame.functionName = chosenCallee;
-    frame.nextExpectedCallIndex = 0U;
     frame.explicitDepthAnchor = path.contextStack.size();
     path.inferredStack.push_back(std::move(frame));
+}
+
+bool frameHasRemainingCallSites(
+    InferredFrame &frame,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+{
+    const auto cfgIt = cfgByFunction.find(frame.functionName);
+    if (cfgIt == cfgByFunction.end())
+    {
+        return false;
+    }
+
+    const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+    ensureClosureComputed(frame, functionCfg);
+    for (const InferredFrame::ProgramPoint &point : frame.activePoints)
+    {
+        const auto blockIt = functionCfg.blocks.find(point.blockId);
+        if (blockIt == functionCfg.blocks.end())
+        {
+            continue;
+        }
+
+        const RuntimeCfgBlock &block = blockIt->second;
+        if (point.callIndex < block.callees.size())
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+std::optional<std::size_t> minimumRemainingCallsToExit(
+    InferredFrame &frame,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+{
+    const auto cfgIt = cfgByFunction.find(frame.functionName);
+    if (cfgIt == cfgByFunction.end())
+    {
+        return std::nullopt;
+    }
+
+    const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+    ensureClosureComputed(frame, functionCfg);
+
+    using QueueEntry = std::pair<std::size_t, std::uint64_t>;
+    std::priority_queue<QueueEntry, std::vector<QueueEntry>, std::greater<QueueEntry>> worklist;
+    std::unordered_map<std::uint64_t, std::size_t> bestDistance;
+    bestDistance.reserve(frame.activePoints.size() * 4U + 4U);
+
+    for (const InferredFrame::ProgramPoint &point : frame.activePoints)
+    {
+        const std::uint64_t encoded = encodeProgramPoint(point);
+        const auto inserted = bestDistance.emplace(encoded, 0U);
+        if (inserted.second)
+        {
+            worklist.push({0U, encoded});
+        }
+    }
+
+    while (!worklist.empty())
+    {
+        const QueueEntry current = worklist.top();
+        worklist.pop();
+
+        const auto bestIt = bestDistance.find(current.second);
+        if (bestIt == bestDistance.end() || bestIt->second != current.first)
+        {
+            continue;
+        }
+
+        const InferredFrame::ProgramPoint point = decodeProgramPoint(current.second);
+        const auto blockIt = functionCfg.blocks.find(point.blockId);
+        if (blockIt == functionCfg.blocks.end())
+        {
+            continue;
+        }
+
+        const RuntimeCfgBlock &block = blockIt->second;
+        const std::size_t callCount = block.callees.size();
+        if (point.blockId == functionCfg.exitBlockId && static_cast<std::size_t>(point.callIndex) >= callCount)
+        {
+            return current.first;
+        }
+
+        if (static_cast<std::size_t>(point.callIndex) < callCount)
+        {
+            const InferredFrame::ProgramPoint nextPoint{point.blockId, point.callIndex + 1U};
+            const std::uint64_t encodedNext = encodeProgramPoint(nextPoint);
+            const std::size_t nextDistance = current.first + 1U;
+            const auto nextIt = bestDistance.find(encodedNext);
+            if (nextIt == bestDistance.end() || nextDistance < nextIt->second)
+            {
+                bestDistance[encodedNext] = nextDistance;
+                worklist.push({nextDistance, encodedNext});
+            }
+            continue;
+        }
+
+        for (const std::uint32_t successor : block.successors)
+        {
+            if (functionCfg.blocks.find(successor) == functionCfg.blocks.end())
+            {
+                continue;
+            }
+
+            const InferredFrame::ProgramPoint nextPoint{successor, 0U};
+            const std::uint64_t encodedNext = encodeProgramPoint(nextPoint);
+            const auto nextIt = bestDistance.find(encodedNext);
+            if (nextIt == bestDistance.end() || current.first < nextIt->second)
+            {
+                bestDistance[encodedNext] = current.first;
+                worklist.push({current.first, encodedNext});
+            }
+        }
+    }
+
+    return std::nullopt;
 }
 
 // ============================================================================
 // Path analysis
 // ============================================================================
 
+namespace
+{
+    void appendProgramPointKey(std::string &key, const InferredFrame::ProgramPoint &point)
+    {
+        key += std::to_string(point.blockId);
+        key += "@";
+        key += std::to_string(point.callIndex);
+    }
+
+    void appendFrameKey(std::string &key, const InferredFrame &frame)
+    {
+        key += frame.functionName;
+        key += "#";
+        key += std::to_string(frame.explicitDepthAnchor);
+        key += "[";
+        for (std::size_t i = 0U; i < frame.activePoints.size(); ++i)
+        {
+            if (i != 0U)
+            {
+                key += ",";
+            }
+            appendProgramPointKey(key, frame.activePoints[i]);
+        }
+        key += "]";
+    }
+
+    int compareProgramPoint(const InferredFrame::ProgramPoint &lhs, const InferredFrame::ProgramPoint &rhs)
+    {
+        if (lhs.blockId != rhs.blockId)
+        {
+            return lhs.blockId < rhs.blockId ? -1 : 1;
+        }
+        if (lhs.callIndex != rhs.callIndex)
+        {
+            return lhs.callIndex < rhs.callIndex ? -1 : 1;
+        }
+        return 0;
+    }
+
+    int compareFrameState(const InferredFrame &lhs, const InferredFrame &rhs)
+    {
+        if (lhs.functionName != rhs.functionName)
+        {
+            return lhs.functionName < rhs.functionName ? -1 : 1;
+        }
+        if (lhs.explicitDepthAnchor != rhs.explicitDepthAnchor)
+        {
+            return lhs.explicitDepthAnchor < rhs.explicitDepthAnchor ? -1 : 1;
+        }
+
+        const std::size_t pointCount = std::min(lhs.activePoints.size(), rhs.activePoints.size());
+        for (std::size_t i = 0U; i < pointCount; ++i)
+        {
+            const int pointCompare = compareProgramPoint(lhs.activePoints[i], rhs.activePoints[i]);
+            if (pointCompare != 0)
+            {
+                return pointCompare;
+            }
+        }
+
+        if (lhs.activePoints.size() != rhs.activePoints.size())
+        {
+            return lhs.activePoints.size() < rhs.activePoints.size() ? -1 : 1;
+        }
+
+        return 0;
+    }
+
+    int compareFrameLists(const std::vector<InferredFrame> &lhs, const std::vector<InferredFrame> &rhs)
+    {
+        const std::size_t frameCount = std::min(lhs.size(), rhs.size());
+        for (std::size_t i = 0U; i < frameCount; ++i)
+        {
+            const int frameCompare = compareFrameState(lhs[i], rhs[i]);
+            if (frameCompare != 0)
+            {
+                return frameCompare;
+            }
+        }
+
+        if (lhs.size() != rhs.size())
+        {
+            return lhs.size() < rhs.size() ? -1 : 1;
+        }
+
+        return 0;
+    }
+}
+
 std::string pathTieBreakerKey(const PathState &path)
 {
     std::string key;
-    key.reserve(path.assignments.size() * 8U + path.contextStack.size() * 8U);
+    key.reserve(path.assignments.size() * 8U +
+                path.contextStack.size() * 8U +
+                (path.inferredStack.size() + path.explicitFrames.size()) * 24U);
     for (const Assignment &assignment : path.assignments)
     {
         key += assignment.chosenCaller;
         key += "->";
         key += assignment.token;
+        key += "@";
+        if (assignment.chosenCallerDepth.has_value())
+        {
+            key += std::to_string(*assignment.chosenCallerDepth);
+        }
+        else
+        {
+            key += "n";
+        }
         key += ";";
     }
     key += "|stack:";
@@ -581,23 +1180,108 @@ std::string pathTieBreakerKey(const PathState &path)
         key += frame;
         key += ";";
     }
+    key += "|inferred:";
+    for (const InferredFrame &frame : path.inferredStack)
+    {
+        appendFrameKey(key, frame);
+        key += ";";
+    }
+    key += "|explicit:";
+    for (const InferredFrame &frame : path.explicitFrames)
+    {
+        appendFrameKey(key, frame);
+        key += ";";
+    }
     return key;
+}
+
+bool pathTieBreakerLess(const PathState &lhs, const PathState &rhs)
+{
+    const std::size_t assignmentCount = std::min(lhs.assignments.size(), rhs.assignments.size());
+    for (std::size_t i = 0U; i < assignmentCount; ++i)
+    {
+        if (lhs.assignments[i].chosenCaller != rhs.assignments[i].chosenCaller)
+        {
+            return lhs.assignments[i].chosenCaller < rhs.assignments[i].chosenCaller;
+        }
+        if (lhs.assignments[i].token != rhs.assignments[i].token)
+        {
+            return lhs.assignments[i].token < rhs.assignments[i].token;
+        }
+        if (lhs.assignments[i].chosenCallerDepth != rhs.assignments[i].chosenCallerDepth)
+        {
+            if (!lhs.assignments[i].chosenCallerDepth.has_value())
+            {
+                return true;
+            }
+            if (!rhs.assignments[i].chosenCallerDepth.has_value())
+            {
+                return false;
+            }
+            return *lhs.assignments[i].chosenCallerDepth < *rhs.assignments[i].chosenCallerDepth;
+        }
+    }
+
+    if (lhs.assignments.size() != rhs.assignments.size())
+    {
+        return lhs.assignments.size() < rhs.assignments.size();
+    }
+
+    const std::size_t stackCount = std::min(lhs.contextStack.size(), rhs.contextStack.size());
+    for (std::size_t i = 0U; i < stackCount; ++i)
+    {
+        if (lhs.contextStack[i] != rhs.contextStack[i])
+        {
+            return lhs.contextStack[i] < rhs.contextStack[i];
+        }
+    }
+
+    if (lhs.contextStack.size() != rhs.contextStack.size())
+    {
+        return lhs.contextStack.size() < rhs.contextStack.size();
+    }
+
+    const int inferredCompare = compareFrameLists(lhs.inferredStack, rhs.inferredStack);
+    if (inferredCompare != 0)
+    {
+        return inferredCompare < 0;
+    }
+
+    const int explicitCompare = compareFrameLists(lhs.explicitFrames, rhs.explicitFrames);
+    if (explicitCompare != 0)
+    {
+        return explicitCompare < 0;
+    }
+
+    return false;
 }
 
 void pruneTopK(std::vector<PathState> &paths, std::size_t topK)
 {
-    std::sort(paths.begin(), paths.end(), [](const PathState &lhs, const PathState &rhs)
-              {
+    if (paths.size() <= topK)
+    {
+        std::sort(paths.begin(), paths.end(), [](const PathState &lhs, const PathState &rhs)
+                  {
+            if (lhs.score != rhs.score)
+            {
+                return lhs.score < rhs.score;
+            }
+            return pathTieBreakerLess(lhs, rhs); });
+        return;
+    }
+
+    const auto cmp = [](const PathState &lhs, const PathState &rhs)
+    {
         if (lhs.score != rhs.score)
         {
             return lhs.score < rhs.score;
         }
-        return pathTieBreakerKey(lhs) < pathTieBreakerKey(rhs); });
+        return pathTieBreakerLess(lhs, rhs);
+    };
 
-    if (paths.size() > topK)
-    {
-        paths.resize(topK);
-    }
+    std::nth_element(paths.begin(), paths.begin() + static_cast<std::ptrdiff_t>(topK), paths.end(), cmp);
+    paths.resize(topK);
+    std::sort(paths.begin(), paths.end(), cmp);
 }
 
 void addEdge(PathState &path, const std::string &caller, const std::string &callee)
@@ -641,7 +1325,25 @@ llvm::json::Object pathToJson(const PathState &path, std::size_t rank)
     object["score"] = path.score;
 
     llvm::json::Array edges;
+    std::vector<std::pair<EdgeKey, std::size_t>> sortedEdges;
+    sortedEdges.reserve(path.edgeCounts.size());
     for (const std::pair<const EdgeKey, std::size_t> &entry : path.edgeCounts)
+    {
+        sortedEdges.push_back({entry.first, entry.second});
+    }
+    std::sort(sortedEdges.begin(), sortedEdges.end(), [](const auto &lhs, const auto &rhs)
+              {
+        if (lhs.first.caller != rhs.first.caller)
+        {
+            return lhs.first.caller < rhs.first.caller;
+        }
+        if (lhs.first.callee != rhs.first.callee)
+        {
+            return lhs.first.callee < rhs.first.callee;
+        }
+        return lhs.second < rhs.second; });
+
+    for (const std::pair<EdgeKey, std::size_t> &entry : sortedEdges)
     {
         llvm::json::Object edge;
         edge["caller"] = entry.first.caller;
@@ -1003,7 +1705,7 @@ bool writeTimelineHtml(
          << "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>\n"
          << "  <title>Runtime Context Timeline</title>\n"
          << "  <style>\n"
-         << "    :root { --bg:#0f131b; --panel:#151b25; --panel-2:#1b2433; --ink:#e6edf8; --muted:#95a3ba; --border:#2a3446; --grid:#263043; --split:#2f3b52; --label:#c7d2e5; }\n"
+         << "    :root { --bg:#0f131b; --panel:#151b25; --panel-2:#1b2433; --ink:#e6edf8; --muted:#95a3ba; --border:#2a3446; --grid:#263043; --split:#2f3b52; --label:#c7d2e5; --label-col:240px; }\n"
          << "    body { margin:0; font-family:'IBM Plex Sans','Segoe UI',sans-serif; background: radial-gradient(circle at 0% 0%, #1a2232 0%, #101622 42%, #0d121a 100%); color:var(--ink); }\n"
          << "    .wrap { max-width: 1420px; margin: 22px auto; padding: 0 14px; }\n"
          << "    .card { background: linear-gradient(180deg,var(--panel),#121925); border: 1px solid var(--border); border-radius: 14px; padding: 14px 14px 12px; box-shadow: 0 20px 40px rgba(4,8,14,0.65); }\n"
@@ -1021,16 +1723,18 @@ bool writeTimelineHtml(
          << "    .sidebar-actions { display:flex; gap:6px; margin-bottom:8px; }\n"
          << "    .side-btn { border:1px solid #33425b; background:#172131; color:#c4d3ea; border-radius:7px; font-size:0.74rem; padding:4px 8px; cursor:pointer; }\n"
          << "    .side-btn:hover { background:#1c2a3f; }\n"
-         << "    .ctx-row { display:flex; align-items:center; gap:8px; color:#bfcde4; font-size:0.8rem; margin:6px 0; }\n"
+         << "    .ctx-row { display:flex; align-items:center; gap:8px; color:#bfcde4; font-size:0.8rem; margin:0; height:36px; box-sizing:border-box; border-bottom:1px solid rgba(38,48,67,0.35); white-space:nowrap; overflow:hidden; }\n"
          << "    .ctx-row input { accent-color:#22d3ee; }\n"
-         << "    .swatch { width:10px; height:10px; border-radius:2px; border:1px solid rgba(10,15,24,0.75); }\n"
+         << "    .ctx-label { overflow:hidden; text-overflow:ellipsis; }\n"
+         << "    #ctxList { padding-top:0; }\n"
+         << "    .swatch { width:10px; height:10px; border-radius:2px; border:1px solid rgba(232,241,255,0.55); box-shadow:0 0 0 1px rgba(10,15,24,0.5); }\n"
          << "    .lane-bg { position:absolute; left:0; right:0; height:36px; background: linear-gradient(90deg,var(--panel-2),#172031); }\n"
-         << "    .lane-label { position:absolute; left:10px; width:190px; font-size:0.78rem; color:var(--label); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }\n"
-         << "    .lane-line { position:absolute; left:202px; right:0; height:1px; background:var(--grid); }\n"
-         << "    .y-split { position:absolute; top:0; bottom:0; left:200px; width:2px; background:var(--split); }\n"
+         << "    .lane-label { position:absolute; left:12px; width:var(--label-col); font-size:0.78rem; color:var(--label); font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }\n"
+         << "    .lane-line { position:absolute; left:calc(var(--label-col) + 24px); right:0; height:1px; background:var(--grid); }\n"
+         << "    .y-split { position:absolute; top:0; bottom:0; left:calc(var(--label-col) + 22px); width:2px; background:var(--split); }\n"
          << "    .x-grid { position:absolute; top:0; bottom:0; width:1px; background:var(--grid); }\n"
          << "    .x-tick { position:absolute; top:4px; transform: translateX(-50%); font-size:0.7rem; color:#8e9db6; font-family:'IBM Plex Mono',monospace; }\n"
-         << "    .bar { position:absolute; height:18px; cursor:pointer; border:1px solid rgba(10,15,24,0.75); box-shadow: 0 0 0 1px rgba(0,0,0,0.25), 0 4px 10px rgba(0,0,0,0.45); transition: transform .08s ease, filter .08s ease; }\n"
+         << "    .bar { position:absolute; height:18px; cursor:pointer; border:1px solid rgba(232,241,255,0.52); box-shadow: inset 0 0 0 1px rgba(8,12,20,0.35), 0 0 0 1px rgba(0,0,0,0.25), 0 4px 10px rgba(0,0,0,0.45); transition: transform .08s ease, filter .08s ease; }\n"
          << "    .bar:hover { transform: translateY(-1px); filter:brightness(1.08); }\n"
          << "    .cap-round-left { border-top-left-radius: 11px; border-bottom-left-radius: 11px; }\n"
          << "    .cap-round-right { border-top-right-radius: 11px; border-bottom-right-radius: 11px; }\n"
@@ -1089,22 +1793,22 @@ bool writeTimelineHtml(
          << "      }\n"
          << "      meta.textContent = `Context runs: ${contexts.length} | Entrypoints: ${entrypointOrder.length} | Events: ${eventCount}`;\n"
          << "      const treePageName = '" << escapedTreePageName << "';\n"
-         << "      const barGradients = [\n"
-         << "        'linear-gradient(90deg,#22d3ee,#60a5fa)',\n"
-         << "        'linear-gradient(90deg,#34d399,#10b981)',\n"
-         << "        'linear-gradient(90deg,#f59e0b,#f97316)',\n"
-         << "        'linear-gradient(90deg,#f472b6,#a78bfa)',\n"
-         << "        'linear-gradient(90deg,#84cc16,#14b8a6)'\n"
-         << "      ];\n"
+         << "      function colorForEntrypoint(index) {\n"
+         << "        let hueA = (index * 137.508) % 360;\n"
+         << "        if (hueA >= 200 && hueA <= 245) { hueA = (hueA + 72) % 360; }\n"
+         << "        const hueB = (hueA + 28) % 360;\n"
+         << "        return {\n"
+         << "          bar: `linear-gradient(90deg,hsl(${hueA} 90% 64%),hsl(${hueB} 88% 54%))`,\n"
+         << "          label: `hsl(${hueA} 90% 82%)`\n"
+         << "        };\n"
+         << "      }\n"
          << "      const laneHeight = 36;\n"
-         << "      const topOffset = 24;\n"
-         << "      const labelWidth = 200;\n"
          << "      const rightPad = 24;\n"
          << "      const enabledByEntrypoint = new Map();\n"
          << "      for (const ep of entrypointOrder) { enabledByEntrypoint.set(ep, true); }\n"
-         << "      const colorIndexByEntrypoint = new Map();\n"
+         << "      const colorsByEntrypoint = new Map();\n"
          << "      for (let i = 0; i < entrypointOrder.length; i += 1) {\n"
-         << "        colorIndexByEntrypoint.set(entrypointOrder[i], i);\n"
+         << "        colorsByEntrypoint.set(entrypointOrder[i], colorForEntrypoint(i));\n"
          << "      }\n"
          << "      function clearTimeline() { while (timeline.firstChild) { timeline.removeChild(timeline.firstChild); } }\n"
          << "      function renderSidebar() {\n"
@@ -1122,9 +1826,12 @@ bool writeTimelineHtml(
          << "          });\n"
          << "          const swatch = document.createElement('span');\n"
          << "          swatch.className = 'swatch';\n"
-         << "          swatch.style.background = barGradients[i % barGradients.length];\n"
+         << "          const colors = colorsByEntrypoint.get(ep) || colorForEntrypoint(i);\n"
+         << "          swatch.style.background = colors.bar;\n"
          << "          const text = document.createElement('span');\n"
+         << "          text.className = 'ctx-label';\n"
          << "          text.textContent = ep;\n"
+         << "          text.title = ep;\n"
          << "          row.appendChild(cb);\n"
          << "          row.appendChild(swatch);\n"
          << "          row.appendChild(text);\n"
@@ -1140,13 +1847,19 @@ bool writeTimelineHtml(
          << "      }\n"
          << "      function render() {\n"
          << "        clearTimeline();\n"
-         << "        const visibleEntrypoints = entrypointOrder.filter(ep => enabledByEntrypoint.get(ep));\n"
+         << "        const listTop = ctxList ? ctxList.getBoundingClientRect().top : 0;\n"
+         << "        const timelineTop = timeline.getBoundingClientRect().top;\n"
+         << "        const topOffset = Math.max(0, Math.round(listTop - timelineTop));\n"
+         << "        const labelWidth = 0;\n"
+         << "        const plotOriginX = labelWidth + 24;\n"
+         << "        timeline.style.setProperty('--label-col', labelWidth + 'px');\n"
+         << "        const visibleEntrypoints = entrypointOrder;\n"
          << "        const visibleLaneByEntrypoint = new Map();\n"
          << "        for (let i = 0; i < visibleEntrypoints.length; i += 1) {\n"
          << "          visibleLaneByEntrypoint.set(visibleEntrypoints[i], i);\n"
          << "        }\n"
          << "        const chartHeight = Math.max(160, topOffset + visibleEntrypoints.length * laneHeight + 20);\n"
-         << "        const pxPerEvent = 18;\n"
+         << "        const pxPerEvent = eventCount > 800 ? 3 : (eventCount > 400 ? 5 : (eventCount > 200 ? 7 : 11));\n"
          << "        const plotWidth = Math.max(760, eventCount * pxPerEvent);\n"
          << "        timeline.style.width = (labelWidth + plotWidth + rightPad) + 'px';\n"
          << "        timeline.style.height = chartHeight + 'px';\n"
@@ -1155,7 +1868,7 @@ bool writeTimelineHtml(
          << "        timeline.appendChild(split);\n"
          << "        for (let i = 0; i <= 10; i += 1) {\n"
          << "          const p = i / 10;\n"
-         << "          const x = labelWidth + Math.round(plotWidth * p);\n"
+         << "          const x = plotOriginX + Math.round(plotWidth * p);\n"
          << "          const grid = document.createElement('div');\n"
          << "          grid.className = 'x-grid';\n"
          << "          grid.style.left = x + 'px';\n"
@@ -1176,13 +1889,9 @@ bool writeTimelineHtml(
          << "          line.className = 'lane-line';\n"
          << "          line.style.top = (rowTop + 35) + 'px';\n"
          << "          timeline.appendChild(line);\n"
-         << "          const label = document.createElement('div');\n"
-         << "          label.className = 'lane-label';\n"
-         << "          label.style.top = (rowTop + 9) + 'px';\n"
-         << "          label.textContent = visibleEntrypoints[lane];\n"
-         << "          timeline.appendChild(label);\n"
          << "        }\n"
          << "        for (const ctx of contexts) {\n"
+         << "          if (!enabledByEntrypoint.get(String(ctx.entrypoint || 'unknown'))) { continue; }\n"
          << "          const lane = visibleLaneByEntrypoint.get(String(ctx.entrypoint || 'unknown'));\n"
          << "          if (lane === undefined) { continue; }\n"
          << "          const rowTop = topOffset + lane * laneHeight;\n"
@@ -1192,7 +1901,7 @@ bool writeTimelineHtml(
          << "          for (const segment of segments) {\n"
          << "            const start = Number(segment.startEventIndex || 0);\n"
          << "            const end = Math.max(start, Number(segment.endEventIndex || start));\n"
-         << "            const left = labelWidth + Math.round((start / eventCount) * plotWidth);\n"
+         << "            const left = plotOriginX + Math.round((start / eventCount) * plotWidth);\n"
          << "            const width = Math.max(Math.round(((end - start + 1) / eventCount) * plotWidth), 3);\n"
          << "            const bar = document.createElement('div');\n"
          << "            bar.className = 'bar';\n"
@@ -1201,8 +1910,8 @@ bool writeTimelineHtml(
          << "            bar.style.top = (rowTop + 10) + 'px';\n"
          << "            bar.style.left = left + 'px';\n"
          << "            bar.style.width = width + 'px';\n"
-         << "            const colorIndex = Number(colorIndexByEntrypoint.get(String(ctx.entrypoint || 'unknown')) || 0);\n"
-         << "            bar.style.background = barGradients[colorIndex % barGradients.length];\n"
+         << "            const colors = colorsByEntrypoint.get(String(ctx.entrypoint || 'unknown')) || colorForEntrypoint(0);\n"
+         << "            bar.style.background = colors.bar;\n"
          << "            bar.title = `${ctx.entrypoint} #${ctx.ordinal} | events ${start}-${end}`;\n"
          << "            bar.addEventListener('click', function(){\n"
          << "              const url = treePageName\n"
@@ -1223,6 +1932,7 @@ bool writeTimelineHtml(
          << "      }\n"
          << "      renderSidebar();\n"
          << "      render();\n"
+         << "      window.addEventListener('resize', render);\n"
          << "      shell.scrollLeft = Math.max(0, timeline.clientWidth - shell.clientWidth) > 0 ? 0 : shell.scrollLeft;\n"
          << "      if (Array.isArray(data.warnings) && data.warnings.length > 0) {\n"
          << "        warnings.textContent = 'Warnings: ' + data.warnings.join(' | ');\n"
@@ -1391,8 +2101,8 @@ bool writeContextTreeHtml(
 
 bool writeDot(
     const std::string &dotPath,
-    const std::set<std::string> &nodes,
-    const std::map<EdgeKey, std::size_t> &edgeCounts,
+    const std::unordered_set<std::string> &nodes,
+    const std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> &edgeCounts,
     std::string &error)
 {
     std::ofstream out(dotPath);
@@ -1405,12 +2115,32 @@ bool writeDot(
     out << "digraph RuntimeExecutionCallGraph {\n";
     out << "  rankdir=LR;\n";
 
-    for (const std::string &node : nodes)
+    std::vector<std::string> sortedNodes(nodes.begin(), nodes.end());
+    std::sort(sortedNodes.begin(), sortedNodes.end());
+    for (const std::string &node : sortedNodes)
     {
         out << "  \"" << escapeDot(node) << "\";\n";
     }
 
+    std::vector<std::pair<EdgeKey, std::size_t>> sortedEdges;
+    sortedEdges.reserve(edgeCounts.size());
     for (const std::pair<const EdgeKey, std::size_t> &entry : edgeCounts)
+    {
+        sortedEdges.push_back({entry.first, entry.second});
+    }
+    std::sort(sortedEdges.begin(), sortedEdges.end(), [](const auto &lhs, const auto &rhs)
+              {
+        if (lhs.first.caller != rhs.first.caller)
+        {
+            return lhs.first.caller < rhs.first.caller;
+        }
+        if (lhs.first.callee != rhs.first.callee)
+        {
+            return lhs.first.callee < rhs.first.callee;
+        }
+        return lhs.second < rhs.second; });
+
+    for (const std::pair<EdgeKey, std::size_t> &entry : sortedEdges)
     {
         out << "  \"" << escapeDot(entry.first.caller) << "\" -> \"" << escapeDot(entry.first.callee)
             << "\" [label=\"" << entry.second << "\"];\n";

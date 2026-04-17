@@ -24,6 +24,7 @@ RUNTIME_DOT_OUTPUT="out/runtime-callgraph.dot"
 RUNTIME_TIMELINE_HTML="out/runtime-timeline.html"
 RUNTIME_CONTEXT_TREE_HTML="out/runtime-context-tree.html"
 RUNTIME_TOP_K=8
+RUNTIME_LOOKAHEAD_PLAIN_EVENTS=8
 DO_BUILD_IMAGE=0
 DO_FORMAT=0
 DO_DOT=0
@@ -102,6 +103,8 @@ Options:
   --runtime-context-tree-html FILE
                              Runtime context tree HTML output (default: out/runtime-context-tree.html)
   --runtime-top-k N          Keep top K runtime candidate paths (default: 8)
+  --runtime-lookahead-plain-events N
+                             Future plain events used by runtime Viterbi-style lookahead (default: 8)
   --no-runtime-dot           Disable runtime DOT output
   --no-runtime-html          Disable runtime HTML outputs
   -h, --help                 Show help
@@ -258,7 +261,7 @@ generate_callgraph() {
 }
 
 generate_runtime_callgraph() {
-  local cmd="./$BUILD_DIR/runtime_callgraph_generator --logs $(printf '%q' "$RUNTIME_LOGS") --entrypoints $(printf '%q' "$RUNTIME_ENTRYPOINTS") --static-callgraph $(printf '%q' "$CALLGRAPH_OUTPUT") --cfg-analysis $(printf '%q' "$CFG_OUTPUT") -o $(printf '%q' "$RUNTIME_OUTPUT") --top-k $(printf '%q' "$RUNTIME_TOP_K")"
+  local cmd="./$BUILD_DIR/runtime_callgraph_generator --logs $(printf '%q' "$RUNTIME_LOGS") --entrypoints $(printf '%q' "$RUNTIME_ENTRYPOINTS") --static-callgraph $(printf '%q' "$CALLGRAPH_OUTPUT") --cfg-analysis $(printf '%q' "$CFG_OUTPUT") -o $(printf '%q' "$RUNTIME_OUTPUT") --top-k $(printf '%q' "$RUNTIME_TOP_K") --lookahead-plain-events $(printf '%q' "$RUNTIME_LOOKAHEAD_PLAIN_EVENTS")"
 
   if [[ "$DO_RUNTIME_DOT" -eq 1 ]]; then
     cmd="$cmd --dot-output $(printf '%q' "$RUNTIME_DOT_OUTPUT")"
@@ -401,6 +404,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --runtime-top-k)
       RUNTIME_TOP_K="$2"
+      shift 2
+      ;;
+    --runtime-lookahead-plain-events)
+      RUNTIME_LOOKAHEAD_PLAIN_EVENTS="$2"
       shift 2
       ;;
     --no-runtime-dot)

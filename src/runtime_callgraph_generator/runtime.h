@@ -9,10 +9,14 @@
 #include <map>
 #include <optional>
 #include <set>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Support/JSON.h"
 
 /**
@@ -45,6 +49,12 @@ struct EdgeKey
     std::string callee;
 
     bool operator<(const EdgeKey &other) const;
+    bool operator==(const EdgeKey &other) const;
+};
+
+struct EdgeKeyHash
+{
+    std::size_t operator()(const EdgeKey &key) const;
 };
 
 /**
@@ -68,8 +78,58 @@ struct Assignment
 struct InferredFrame
 {
     std::string functionName;
-    std::size_t nextExpectedCallIndex = 0U;
+    struct ProgramPoint
+    {
+        std::uint32_t blockId = 0U;
+        std::uint32_t callIndex = 0U;
+
+        bool operator<(const ProgramPoint &other) const
+        {
+            if (blockId != other.blockId)
+            {
+                return blockId < other.blockId;
+            }
+            return callIndex < other.callIndex;
+        }
+    };
+
+    llvm::SmallVector<ProgramPoint, 4> activePoints;
+    bool closureComputed = false;
+    bool tokenCacheValid = false;
+    std::string lastCheckedToken;
+    bool lastCheckedTokenFeasible = false;
     std::size_t explicitDepthAnchor = 0U;
+};
+
+/**
+ * @brief Basic-block CFG details for one function.
+ */
+struct RuntimeCfgBlock
+{
+    std::uint32_t id = 0U;
+    std::vector<std::string> callees;
+    std::vector<std::uint32_t> successors;
+};
+
+/**
+ * @brief Runtime-call matching model derived from CFG analysis.
+ */
+struct RuntimeFunctionCfg
+{
+    std::uint32_t entryBlockId = 0U;
+    std::uint32_t exitBlockId = 0U;
+    llvm::DenseMap<std::uint32_t, RuntimeCfgBlock> blocks;
+};
+
+/**
+ * @brief Active caller frame descriptor used during one token assignment.
+ */
+struct ActiveCaller
+{
+    std::string functionName;
+    bool isInferred = false;
+    std::size_t frameIndex = 0U;
+    std::size_t depth = 0U;
 };
 
 /**
@@ -78,9 +138,10 @@ struct InferredFrame
 struct PathState
 {
     std::vector<std::string> contextStack;
+    std::vector<InferredFrame> explicitFrames;
     std::vector<InferredFrame> inferredStack;
-    std::map<EdgeKey, std::size_t> edgeCounts;
-    std::set<std::string> nodes;
+    std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> edgeCounts;
+    std::unordered_set<std::string> nodes;
     std::vector<Assignment> assignments;
     std::vector<std::string> warnings;
     double score = 0.0;
@@ -151,30 +212,44 @@ bool parseEvents(
 
 bool loadStaticEdges(
     const std::string &callgraphPath,
-    std::unordered_map<std::string, std::set<std::string>> &callersByCallee,
+    std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
     std::string &error);
 
 bool loadCfgDirectCallOrder(
     const std::string &cfgAnalysisPath,
-    std::unordered_map<std::string, std::vector<std::string>> &orderedCalleesByFunction,
+    const std::set<std::string> &blacklistedFunctions,
+    std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
     std::string &error);
 
 // Path state management
 void cleanupInferredStack(PathState &path);
 void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
 std::vector<std::string> buildActiveCallerOrder(const PathState &path);
+std::vector<ActiveCaller> buildActiveCallers(const PathState &path);
+std::vector<ActiveCaller> buildFeasibleActiveCallers(
+    PathState &path,
+    const std::string &token,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
 void alignInferredFrameForToken(
     PathState &path,
     const std::string &token,
-    const std::unordered_map<std::string, std::vector<std::string>> &orderedCalleesByFunction);
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
 void updateInferredStackAfterAssignment(
     PathState &path,
-    const std::string &chosenCaller,
+    const ActiveCaller &chosenCaller,
     const std::string &chosenCallee,
     const std::set<std::string> &entrypoints,
-    const std::unordered_map<std::string, std::vector<std::string>> &orderedCalleesByFunction);
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
+
+bool frameHasRemainingCallSites(
+    InferredFrame &frame,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
+
+std::optional<std::size_t> minimumRemainingCallsToExit(
+    InferredFrame &frame,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
 // Path analysis
 std::string pathTieBreakerKey(const PathState &path);
@@ -216,8 +291,8 @@ bool writeContextTreeHtml(
 
 bool writeDot(
     const std::string &dotPath,
-    const std::set<std::string> &nodes,
-    const std::map<EdgeKey, std::size_t> &edgeCounts,
+    const std::unordered_set<std::string> &nodes,
+    const std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> &edgeCounts,
     std::string &error);
 
 #endif // RUNTIME_H
