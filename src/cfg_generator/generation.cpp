@@ -1926,6 +1926,7 @@ namespace
     {
         BlockLineCollection result;
         std::set<const clang::Stmt *> seenStatements;
+        std::unordered_set<std::string> emittedCallSiteIds;
         std::vector<clang::SourceRange> containerRanges;
 
         for (const clang::CFGElement &element : block)
@@ -1987,8 +1988,24 @@ namespace
                 continue;
             }
 
-            const std::vector<std::string> stmtCallSiteIds =
+            std::vector<std::string> stmtCallSiteIds =
                 collectStatementCallSiteIds(stmt, context, functionName, knownCallSiteIds);
+
+            // A single semantic call can surface multiple statement views (e.g. ternary
+            // lowering), which can repeat the same callsite ID in one block.
+            if (!stmtCallSiteIds.empty())
+            {
+                std::vector<std::string> filteredCallSiteIds;
+                filteredCallSiteIds.reserve(stmtCallSiteIds.size());
+                for (const std::string &callSiteId : stmtCallSiteIds)
+                {
+                    if (emittedCallSiteIds.insert(callSiteId).second)
+                    {
+                        filteredCallSiteIds.push_back(callSiteId);
+                    }
+                }
+                stmtCallSiteIds.swap(filteredCallSiteIds);
+            }
 
             // Preserve all statements in encounter order, including same-line siblings.
             if (result.lines.empty() ||

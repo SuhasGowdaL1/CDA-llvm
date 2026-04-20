@@ -180,7 +180,7 @@ bool loadNameList(
         const std::size_t commentPos = line.find('#');
         if (commentPos != std::string::npos)
         {
-            line = line.substr(0, commentPos);
+            line.resize(commentPos);
         }
         const std::string trimmed = trimCopy(line);
         if (!trimmed.empty())
@@ -476,7 +476,8 @@ bool loadCfgDirectCallOrder(
                             continue;
                         }
 
-                        const auto targetIt = callSiteTargetById.find(callSiteId->str());
+                        const std::string callSiteIdText = callSiteId->str();
+                        const auto targetIt = callSiteTargetById.find(callSiteIdText);
                         if (targetIt != callSiteTargetById.end())
                         {
                             block.callees.push_back(targetIt->second.callee);
@@ -522,8 +523,6 @@ bool loadCfgDirectCallOrder(
 
 namespace
 {
-    constexpr std::size_t kMaxEpsilonTransitionExpansions = 4096U;
-
     void computeEpsilonClosure(
         llvm::SmallVectorImpl<InferredFrame::ProgramPoint> &points,
         const RuntimeFunctionCfg &functionCfg);
@@ -616,11 +615,8 @@ namespace
         }
 
         std::size_t queueIndex = 0U;
-        std::size_t expansions = 0U;
-        while (queueIndex < queue.size() && expansions < kMaxEpsilonTransitionExpansions)
+        while (queueIndex < queue.size())
         {
-            ++expansions;
-
             const InferredFrame::ProgramPoint point = decodeProgramPoint(queue[queueIndex++]);
 
             const auto blockIt = functionCfg.blocks.find(point.blockId);
@@ -654,10 +650,12 @@ namespace
 
         points.clear();
         points.reserve(visited.size());
-        for (const std::uint64_t encoded : visited)
-        {
-            points.push_back(decodeProgramPoint(encoded));
-        }
+        std::transform(
+            visited.begin(),
+            visited.end(),
+            std::back_inserter(points),
+            [](std::uint64_t encoded)
+            { return decodeProgramPoint(encoded); });
         normalizePoints(points);
     }
 
@@ -809,25 +807,6 @@ std::vector<std::string> buildActiveCallerOrder(const PathState &path)
     return callers;
 }
 
-std::vector<ActiveCaller> buildActiveCallers(const PathState &path)
-{
-    std::vector<ActiveCaller> callers;
-    callers.reserve(path.inferredStack.size() + path.explicitFrames.size());
-
-    std::size_t depth = 0U;
-    for (std::size_t i = path.inferredStack.size(); i > 0U; --i)
-    {
-        callers.push_back(ActiveCaller{path.inferredStack[i - 1U].functionName, true, i - 1U, depth++});
-    }
-
-    for (std::size_t i = path.explicitFrames.size(); i > 0U; --i)
-    {
-        callers.push_back(ActiveCaller{path.explicitFrames[i - 1U].functionName, false, i - 1U, depth++});
-    }
-
-    return callers;
-}
-
 std::vector<ActiveCaller> buildFeasibleActiveCallers(
     PathState &path,
     const std::string &token,
@@ -887,24 +866,6 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
     return callers;
 }
 
-void alignInferredFrameForToken(
-    PathState &path,
-    const std::string &token,
-    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
-{
-    cleanupInferredStack(path);
-    while (!path.inferredStack.empty())
-    {
-        InferredFrame &top = path.inferredStack.back();
-        if (!frameCanCallToken(top, token, cfgByFunction))
-        {
-            path.inferredStack.pop_back();
-            continue;
-        }
-        break;
-    }
-}
-
 void updateInferredStackAfterAssignment(
     PathState &path,
     const ActiveCaller &chosenCaller,
@@ -959,36 +920,6 @@ void updateInferredStackAfterAssignment(
     frame.functionName = chosenCallee;
     frame.explicitDepthAnchor = path.contextStack.size();
     path.inferredStack.push_back(std::move(frame));
-}
-
-bool frameHasRemainingCallSites(
-    InferredFrame &frame,
-    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
-{
-    const auto cfgIt = cfgByFunction.find(frame.functionName);
-    if (cfgIt == cfgByFunction.end())
-    {
-        return false;
-    }
-
-    const RuntimeFunctionCfg &functionCfg = cfgIt->second;
-    ensureClosureComputed(frame, functionCfg);
-    for (const InferredFrame::ProgramPoint &point : frame.activePoints)
-    {
-        const auto blockIt = functionCfg.blocks.find(point.blockId);
-        if (blockIt == functionCfg.blocks.end())
-        {
-            continue;
-        }
-
-        const RuntimeCfgBlock &block = blockIt->second;
-        if (point.callIndex < block.callees.size())
-        {
-            return true;
-        }
-    }
-
-    return false;
 }
 
 std::optional<std::size_t> minimumRemainingCallsToExit(
@@ -1121,30 +1052,6 @@ std::vector<std::string> collectImmediateExpectedCallees(
 
 namespace
 {
-    void appendProgramPointKey(std::string &key, const InferredFrame::ProgramPoint &point)
-    {
-        key += std::to_string(point.blockId);
-        key += "@";
-        key += std::to_string(point.callIndex);
-    }
-
-    void appendFrameKey(std::string &key, const InferredFrame &frame)
-    {
-        key += frame.functionName;
-        key += "#";
-        key += std::to_string(frame.explicitDepthAnchor);
-        key += "[";
-        for (std::size_t i = 0U; i < frame.activePoints.size(); ++i)
-        {
-            if (i != 0U)
-            {
-                key += ",";
-            }
-            appendProgramPointKey(key, frame.activePoints[i]);
-        }
-        key += "]";
-    }
-
     int compareProgramPoint(const InferredFrame::ProgramPoint &lhs, const InferredFrame::ProgramPoint &rhs)
     {
         if (lhs.blockId != rhs.blockId)
@@ -1206,49 +1113,6 @@ namespace
 
         return 0;
     }
-}
-
-std::string pathTieBreakerKey(const PathState &path)
-{
-    std::string key;
-    key.reserve(path.assignments.size() * 8U +
-                path.contextStack.size() * 8U +
-                (path.inferredStack.size() + path.explicitFrames.size()) * 24U);
-    for (const Assignment &assignment : path.assignments)
-    {
-        key += assignment.chosenCaller;
-        key += "->";
-        key += assignment.token;
-        key += "@";
-        if (assignment.chosenCallerDepth.has_value())
-        {
-            key += std::to_string(*assignment.chosenCallerDepth);
-        }
-        else
-        {
-            key += "n";
-        }
-        key += ";";
-    }
-    key += "|stack:";
-    for (const std::string &frame : path.contextStack)
-    {
-        key += frame;
-        key += ";";
-    }
-    key += "|inferred:";
-    for (const InferredFrame &frame : path.inferredStack)
-    {
-        appendFrameKey(key, frame);
-        key += ";";
-    }
-    key += "|explicit:";
-    for (const InferredFrame &frame : path.explicitFrames)
-    {
-        appendFrameKey(key, frame);
-        key += ";";
-    }
-    return key;
 }
 
 bool pathTieBreakerLess(const PathState &lhs, const PathState &rhs)
@@ -1366,10 +1230,10 @@ llvm::json::Object assignmentToJson(const Assignment &assignment)
     object["deltaScore"] = assignment.deltaScore;
 
     llvm::json::Array candidates;
-    for (const std::string &candidate : assignment.candidates)
-    {
-        candidates.push_back(candidate);
-    }
+    std::copy(
+        assignment.candidates.begin(),
+        assignment.candidates.end(),
+        std::back_inserter(candidates));
     object["candidates"] = std::move(candidates);
     return object;
 }
@@ -1383,10 +1247,12 @@ llvm::json::Object pathToJson(const PathState &path, std::size_t rank)
     llvm::json::Array edges;
     std::vector<std::pair<EdgeKey, std::size_t>> sortedEdges;
     sortedEdges.reserve(path.edgeCounts.size());
-    for (const std::pair<const EdgeKey, std::size_t> &entry : path.edgeCounts)
-    {
-        sortedEdges.push_back({entry.first, entry.second});
-    }
+    std::transform(
+        path.edgeCounts.begin(),
+        path.edgeCounts.end(),
+        std::back_inserter(sortedEdges),
+        [](const auto &entry)
+        { return std::make_pair(entry.first, entry.second); });
     std::sort(sortedEdges.begin(), sortedEdges.end(), [](const auto &lhs, const auto &rhs)
               {
         if (lhs.first.caller != rhs.first.caller)
@@ -1410,17 +1276,19 @@ llvm::json::Object pathToJson(const PathState &path, std::size_t rank)
     object["edges"] = std::move(edges);
 
     llvm::json::Array assignments;
-    for (const Assignment &assignment : path.assignments)
-    {
-        assignments.push_back(assignmentToJson(assignment));
-    }
+    std::transform(
+        path.assignments.begin(),
+        path.assignments.end(),
+        std::back_inserter(assignments),
+        [](const Assignment &assignment)
+        { return assignmentToJson(assignment); });
     object["assignments"] = std::move(assignments);
 
     llvm::json::Array warnings;
-    for (const std::string &warning : path.warnings)
-    {
-        warnings.push_back(warning);
-    }
+    std::copy(
+        path.warnings.begin(),
+        path.warnings.end(),
+        std::back_inserter(warnings));
     object["warnings"] = std::move(warnings);
 
     return object;
@@ -1466,17 +1334,19 @@ llvm::json::Object contextRunToJson(const ContextRun &run, std::size_t lane)
     object["segments"] = std::move(segments);
 
     llvm::json::Array calls;
-    for (const ContextCall &call : run.calls)
-    {
-        calls.push_back(contextCallToJson(call));
-    }
+    std::transform(
+        run.calls.begin(),
+        run.calls.end(),
+        std::back_inserter(calls),
+        [](const ContextCall &call)
+        { return contextCallToJson(call); });
     object["calls"] = std::move(calls);
 
     llvm::json::Array warnings;
-    for (const std::string &warning : run.warnings)
-    {
-        warnings.push_back(warning);
-    }
+    std::copy(
+        run.warnings.begin(),
+        run.warnings.end(),
+        std::back_inserter(warnings));
     object["warnings"] = std::move(warnings);
     return object;
 }
@@ -1688,10 +1558,10 @@ llvm::json::Object buildVisualizationData(
     root["eventCount"] = static_cast<std::int64_t>(events.size());
 
     llvm::json::Array priority;
-    for (const std::string &entrypoint : entrypointPriority)
-    {
-        priority.push_back(entrypoint);
-    }
+    std::copy(
+        entrypointPriority.begin(),
+        entrypointPriority.end(),
+        std::back_inserter(priority));
     root["entrypointPriority"] = std::move(priority);
 
     llvm::json::Array contexts;
@@ -1703,10 +1573,7 @@ llvm::json::Object buildVisualizationData(
     }
     for (const ContextRun &run : runs)
     {
-        if (laneByEntrypoint.find(run.entrypoint) == laneByEntrypoint.end())
-        {
-            laneByEntrypoint.emplace(run.entrypoint, laneByEntrypoint.size());
-        }
+        laneByEntrypoint.try_emplace(run.entrypoint, laneByEntrypoint.size());
     }
     for (std::size_t lane = 0U; lane < runs.size(); ++lane)
     {
@@ -1717,10 +1584,10 @@ llvm::json::Object buildVisualizationData(
     root["contexts"] = std::move(contexts);
 
     llvm::json::Array ws;
-    for (const std::string &warning : warnings)
-    {
-        ws.push_back(warning);
-    }
+    std::copy(
+        warnings.begin(),
+        warnings.end(),
+        std::back_inserter(ws));
     root["warnings"] = std::move(ws);
 
     return root;
@@ -2180,10 +2047,12 @@ bool writeDot(
 
     std::vector<std::pair<EdgeKey, std::size_t>> sortedEdges;
     sortedEdges.reserve(edgeCounts.size());
-    for (const std::pair<const EdgeKey, std::size_t> &entry : edgeCounts)
-    {
-        sortedEdges.push_back({entry.first, entry.second});
-    }
+    std::transform(
+        edgeCounts.begin(),
+        edgeCounts.end(),
+        std::back_inserter(sortedEdges),
+        [](const auto &entry)
+        { return std::make_pair(entry.first, entry.second); });
     std::sort(sortedEdges.begin(), sortedEdges.end(), [](const auto &lhs, const auto &rhs)
               {
         if (lhs.first.caller != rhs.first.caller)

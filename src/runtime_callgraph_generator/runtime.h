@@ -225,13 +225,7 @@ bool loadCfgDirectCallOrder(
 void cleanupInferredStack(PathState &path);
 void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
 std::vector<std::string> buildActiveCallerOrder(const PathState &path);
-std::vector<ActiveCaller> buildActiveCallers(const PathState &path);
 std::vector<ActiveCaller> buildFeasibleActiveCallers(
-    PathState &path,
-    const std::string &token,
-    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
-
-void alignInferredFrameForToken(
     PathState &path,
     const std::string &token,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
@@ -243,10 +237,6 @@ void updateInferredStackAfterAssignment(
     const std::set<std::string> &entrypoints,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
-bool frameHasRemainingCallSites(
-    InferredFrame &frame,
-    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
-
 std::optional<std::size_t> minimumRemainingCallsToExit(
     InferredFrame &frame,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
@@ -256,7 +246,6 @@ std::vector<std::string> collectImmediateExpectedCallees(
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
 // Path analysis
-std::string pathTieBreakerKey(const PathState &path);
 void pruneTopK(std::vector<PathState> &paths, std::size_t topK);
 void addEdge(PathState &path, const std::string &caller, const std::string &callee);
 
