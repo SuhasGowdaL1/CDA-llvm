@@ -460,6 +460,8 @@ bool loadCfgDirectCallOrder(
 
             if (const llvm::json::Array *lineCallSiteIds = blockObj->getArray("lineCallSiteIds"))
             {
+                std::unordered_set<std::string> seenCallSiteIds;
+                seenCallSiteIds.reserve(lineCallSiteIds->size() * 2U + 1U);
                 for (const llvm::json::Value &lineValue : *lineCallSiteIds)
                 {
                     const llvm::json::Array *callSiteIds = lineValue.getAsArray();
@@ -477,6 +479,11 @@ bool loadCfgDirectCallOrder(
                         }
 
                         const std::string callSiteIdText = callSiteId->str();
+                        if (!seenCallSiteIds.insert(callSiteIdText).second)
+                        {
+                            continue;
+                        }
+
                         const auto targetIt = callSiteTargetById.find(callSiteIdText);
                         if (targetIt != callSiteTargetById.end())
                         {

@@ -141,6 +141,7 @@ namespace
     struct ConditionalStoreInfo
     {
         std::string left;
+        std::string right;
         std::string variable;
         std::string trueExpression;
         std::string falseExpression;
@@ -161,13 +162,29 @@ namespace
     bool parseConditionalStoreLine(const std::string &line, ConditionalStoreInfo &info)
     {
         const std::string trimmed = trimCopy(line);
-        if (trimmed.empty() || trimmed.back() != ';')
+        if (trimmed.empty())
         {
             return false;
         }
 
-        const std::string withoutSemicolon = trimCopy(trimmed.substr(0, trimmed.size() - 1U));
-        const std::size_t equalIndex = findTopLevelChar(withoutSemicolon, '=');
+        const std::string withoutSemicolon =
+            !trimmed.empty() && trimmed.back() == ';'
+                ? trimCopy(trimmed.substr(0, trimmed.size() - 1U))
+                : trimmed;
+
+        std::size_t equalIndex = findTopLevelChar(withoutSemicolon, '=');
+        while (equalIndex != std::string::npos)
+        {
+            const char prev = equalIndex > 0U ? withoutSemicolon[equalIndex - 1U] : '\0';
+            const char next = equalIndex + 1U < withoutSemicolon.size() ? withoutSemicolon[equalIndex + 1U] : '\0';
+            const bool isComparisonEquals = next == '=' || prev == '=' || prev == '!' || prev == '<' || prev == '>';
+            if (!isComparisonEquals)
+            {
+                break;
+            }
+            equalIndex = findTopLevelChar(withoutSemicolon, '=', equalIndex + 1U);
+        }
+
         if (equalIndex == std::string::npos)
         {
             return false;
@@ -220,6 +237,7 @@ namespace
         }
 
         info.left = left;
+        info.right = right;
         info.variable = left.substr(begin, end - begin);
         info.trueExpression = trueExpression;
         info.falseExpression = falseExpression;
@@ -428,11 +446,33 @@ namespace
             updatedLines.reserve(block.lines.size());
             updatedLineCallSiteIds.reserve(block.lines.size());
 
+            // Some CFG forms include both:
+            //   (<cond>) ? t : f
+            //   var = (<cond>) ? t : f
+            // in the same block. Keep only the assignment form for store rewriting.
+            std::unordered_set<std::string> conditionalStoreRhsInBlock;
+            conditionalStoreRhsInBlock.reserve(block.lines.size());
+            for (const std::string &candidateLine : block.lines)
+            {
+                ConditionalStoreInfo candidateStoreInfo;
+                if (parseConditionalStoreLine(candidateLine, candidateStoreInfo))
+                {
+                    conditionalStoreRhsInBlock.insert(trimCopy(candidateStoreInfo.right));
+                }
+            }
+
             for (std::size_t lineIndex = 0; lineIndex < block.lines.size(); ++lineIndex)
             {
                 const std::string &line = block.lines[lineIndex];
                 const std::vector<std::string> &lineCallSiteIds =
                     lineIndex < block.lineCallSiteIds.size() ? block.lineCallSiteIds[lineIndex] : std::vector<std::string>{};
+                const std::string trimmedLine = trimCopy(line);
+
+                if (conditionalStoreRhsInBlock.find(trimmedLine) != conditionalStoreRhsInBlock.end())
+                {
+                    continue;
+                }
+
                 ConditionalStoreInfo storeInfo;
                 if (!parseConditionalStoreLine(line, storeInfo))
                 {
@@ -706,6 +746,35 @@ namespace
             }
         };
 
+        std::function<bool(const std::string &)> isBareCallLikeLine = [](const std::string &line)
+        {
+            const std::string trimmed = trimCopy(line);
+            if (trimmed.empty())
+            {
+                return false;
+            }
+
+            if (trimmed.find('(') == std::string::npos || trimmed.back() != ')')
+            {
+                return false;
+            }
+
+            return trimmed.find('=') == std::string::npos &&
+                   trimmed.find('?') == std::string::npos &&
+                   trimmed.find(':') == std::string::npos;
+        };
+
+        std::function<bool(const std::string &)> isConditionWrapperLine = [](const std::string &line)
+        {
+            const std::string trimmed = trimCopy(line);
+            return trimmed.find("==") != std::string::npos ||
+                   trimmed.find("!=") != std::string::npos ||
+                   trimmed.find("<") != std::string::npos ||
+                   trimmed.find(">") != std::string::npos ||
+                   trimmed.find("&&") != std::string::npos ||
+                   trimmed.find("||") != std::string::npos;
+        };
+
         std::function<bool(const std::string &)> isLiteralOnlyLine = [](const std::string &line)
         {
             const std::string trimmed = trimCopy(line);
@@ -741,6 +810,60 @@ namespace
             }
             block.lines.swap(filtered);
             block.lineCallSiteIds.swap(filteredIds);
+
+            // Fold AST-split call condition pairs:
+            //   callee(args)
+            //   callee(args) == ...
+            // into only the condition line while retaining the callsite IDs.
+            for (std::size_t i = 0U; i + 1U < block.lines.size();)
+            {
+                const std::string current = trimCopy(block.lines[i]);
+                const std::string next = trimCopy(block.lines[i + 1U]);
+
+                // Fold duplicated ternary forms:
+                //   (<cond>) ? x : y
+                //   a = (<cond>) ? x : y
+                // Keep assignment line and carry callsite IDs to it.
+                ConditionalStoreInfo nextStoreInfo;
+                if (parseConditionalStoreLine(next, nextStoreInfo) && current == nextStoreInfo.right)
+                {
+                    if (i + 1U < block.lineCallSiteIds.size() &&
+                        i < block.lineCallSiteIds.size() &&
+                        block.lineCallSiteIds[i + 1U].empty())
+                    {
+                        block.lineCallSiteIds[i + 1U] = block.lineCallSiteIds[i];
+                    }
+
+                    block.lines.erase(block.lines.begin() + static_cast<std::ptrdiff_t>(i));
+                    if (i < block.lineCallSiteIds.size())
+                    {
+                        block.lineCallSiteIds.erase(block.lineCallSiteIds.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                    continue;
+                }
+
+                if (isBareCallLikeLine(current) &&
+                    isConditionWrapperLine(next) &&
+                    next.find(current) != std::string::npos)
+                {
+                    if (i + 1U < block.lineCallSiteIds.size() &&
+                        i < block.lineCallSiteIds.size() &&
+                        block.lineCallSiteIds[i + 1U].empty())
+                    {
+                        block.lineCallSiteIds[i + 1U] = block.lineCallSiteIds[i];
+                    }
+
+                    block.lines.erase(block.lines.begin() + static_cast<std::ptrdiff_t>(i));
+                    if (i < block.lineCallSiteIds.size())
+                    {
+                        block.lineCallSiteIds.erase(block.lineCallSiteIds.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                    continue;
+                }
+
+                ++i;
+            }
+
             alignBlockCallSiteIds(block);
         }
 
