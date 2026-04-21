@@ -138,6 +138,111 @@ namespace
         return std::string::npos;
     }
 
+    /**
+     * @brief Remove redundant outer parentheses that wrap an entire expression.
+     */
+    std::string stripRedundantOuterParens(std::string text)
+    {
+        text = trimCopy(text);
+        while (text.size() >= 2U && text.front() == '(' && text.back() == ')')
+        {
+            int depthParen = 0;
+            int depthBracket = 0;
+            int depthBrace = 0;
+            bool inSingleQuote = false;
+            bool inDoubleQuote = false;
+            bool wrapsEntireExpression = true;
+
+            for (std::size_t i = 0; i < text.size(); ++i)
+            {
+                const char ch = text[i];
+                const char prev = i > 0U ? text[i - 1U] : '\0';
+
+                if (inSingleQuote)
+                {
+                    if (ch == '\'' && prev != '\\')
+                    {
+                        inSingleQuote = false;
+                    }
+                    continue;
+                }
+
+                if (inDoubleQuote)
+                {
+                    if (ch == '"' && prev != '\\')
+                    {
+                        inDoubleQuote = false;
+                    }
+                    continue;
+                }
+
+                if (ch == '\'')
+                {
+                    inSingleQuote = true;
+                    continue;
+                }
+                if (ch == '"')
+                {
+                    inDoubleQuote = true;
+                    continue;
+                }
+
+                if (ch == '(')
+                {
+                    ++depthParen;
+                    continue;
+                }
+                if (ch == ')' && depthParen > 0)
+                {
+                    --depthParen;
+                    if (depthParen == 0 && i + 1U < text.size())
+                    {
+                        wrapsEntireExpression = false;
+                        break;
+                    }
+                    continue;
+                }
+                if (ch == '[')
+                {
+                    ++depthBracket;
+                    continue;
+                }
+                if (ch == ']' && depthBracket > 0)
+                {
+                    --depthBracket;
+                    continue;
+                }
+                if (ch == '{')
+                {
+                    ++depthBrace;
+                    continue;
+                }
+                if (ch == '}' && depthBrace > 0)
+                {
+                    --depthBrace;
+                    continue;
+                }
+            }
+
+            if (!wrapsEntireExpression || depthParen != 0 || depthBracket != 0 || depthBrace != 0)
+            {
+                break;
+            }
+
+            text = trimCopy(text.substr(1U, text.size() - 2U));
+        }
+
+        return text;
+    }
+
+    /**
+     * @brief Normalize ternary text for duplicate detection.
+     */
+    std::string normalizeTernaryExpressionText(const std::string &text)
+    {
+        return normalizeWhitespace(stripRedundantOuterParens(text));
+    }
+
     struct ConditionalStoreInfo
     {
         std::string left;
@@ -197,20 +302,21 @@ namespace
             return false;
         }
 
-        const std::size_t questionIndex = findTopLevelChar(right, '?');
+        const std::string ternaryRight = stripRedundantOuterParens(right);
+        const std::size_t questionIndex = findTopLevelChar(ternaryRight, '?');
         if (questionIndex == std::string::npos)
         {
             return false;
         }
 
-        const std::size_t colonIndex = findTopLevelChar(right, ':', questionIndex + 1U);
+        const std::size_t colonIndex = findTopLevelChar(ternaryRight, ':', questionIndex + 1U);
         if (colonIndex == std::string::npos)
         {
             return false;
         }
 
-        const std::string trueExpression = trimCopy(right.substr(questionIndex + 1U, colonIndex - (questionIndex + 1U)));
-        const std::string falseExpression = trimCopy(right.substr(colonIndex + 1U));
+        const std::string trueExpression = trimCopy(ternaryRight.substr(questionIndex + 1U, colonIndex - (questionIndex + 1U)));
+        const std::string falseExpression = trimCopy(ternaryRight.substr(colonIndex + 1U));
         if (trueExpression.empty() || falseExpression.empty())
         {
             return false;
@@ -237,7 +343,7 @@ namespace
         }
 
         info.left = left;
-        info.right = right;
+        info.right = normalizeTernaryExpressionText(ternaryRight);
         info.variable = left.substr(begin, end - begin);
         info.trueExpression = trueExpression;
         info.falseExpression = falseExpression;
@@ -457,7 +563,7 @@ namespace
                 ConditionalStoreInfo candidateStoreInfo;
                 if (parseConditionalStoreLine(candidateLine, candidateStoreInfo))
                 {
-                    conditionalStoreRhsInBlock.insert(trimCopy(candidateStoreInfo.right));
+                    conditionalStoreRhsInBlock.insert(normalizeTernaryExpressionText(candidateStoreInfo.right));
                 }
             }
 
@@ -467,8 +573,9 @@ namespace
                 const std::vector<std::string> &lineCallSiteIds =
                     lineIndex < block.lineCallSiteIds.size() ? block.lineCallSiteIds[lineIndex] : std::vector<std::string>{};
                 const std::string trimmedLine = trimCopy(line);
+                const std::string normalizedLine = normalizeTernaryExpressionText(trimmedLine);
 
-                if (conditionalStoreRhsInBlock.find(trimmedLine) != conditionalStoreRhsInBlock.end())
+                if (conditionalStoreRhsInBlock.find(normalizedLine) != conditionalStoreRhsInBlock.end())
                 {
                     continue;
                 }
@@ -775,6 +882,20 @@ namespace
                    trimmed.find("||") != std::string::npos;
         };
 
+        std::function<bool(const std::string &)> isBareTernaryLine = [](const std::string &line)
+        {
+            const std::string trimmed = trimCopy(line);
+            if (trimmed.empty())
+            {
+                return false;
+            }
+
+            // Match expression-only ternary nodes emitted by AST/CFG splitting.
+            return trimmed.find('?') != std::string::npos &&
+                   trimmed.find(':') != std::string::npos &&
+                   trimmed.find('=') == std::string::npos;
+        };
+
         std::function<bool(const std::string &)> isLiteralOnlyLine = [](const std::string &line)
         {
             const std::string trimmed = trimCopy(line);
@@ -791,6 +912,32 @@ namespace
                 }
             }
             return true;
+        };
+
+        std::function<std::string(const std::string &)> stripWhitespace = [](const std::string &text)
+        {
+            std::string stripped;
+            stripped.reserve(text.size());
+            for (char ch : text)
+            {
+                if (std::isspace(static_cast<unsigned char>(ch)) == 0)
+                {
+                    stripped.push_back(ch);
+                }
+            }
+            return stripped;
+        };
+
+        std::function<bool(const std::string &, const std::string &)> containsIgnoringWhitespace =
+            [&](const std::string &container, const std::string &value)
+        {
+            const std::string strippedContainer = stripWhitespace(container);
+            const std::string strippedValue = stripWhitespace(value);
+            if (strippedContainer.empty() || strippedValue.empty())
+            {
+                return false;
+            }
+            return strippedContainer.find(strippedValue) != std::string::npos;
         };
 
         for (SerializedBlock &block : function.blocks)
@@ -825,7 +972,8 @@ namespace
                 //   a = (<cond>) ? x : y
                 // Keep assignment line and carry callsite IDs to it.
                 ConditionalStoreInfo nextStoreInfo;
-                if (parseConditionalStoreLine(next, nextStoreInfo) && current == nextStoreInfo.right)
+                if (parseConditionalStoreLine(next, nextStoreInfo) &&
+                    normalizeTernaryExpressionText(current) == normalizeTernaryExpressionText(nextStoreInfo.right))
                 {
                     if (i + 1U < block.lineCallSiteIds.size() &&
                         i < block.lineCallSiteIds.size() &&
@@ -844,7 +992,30 @@ namespace
 
                 if (isBareCallLikeLine(current) &&
                     isConditionWrapperLine(next) &&
-                    next.find(current) != std::string::npos)
+                    containsIgnoringWhitespace(next, current))
+                {
+                    if (i + 1U < block.lineCallSiteIds.size() &&
+                        i < block.lineCallSiteIds.size() &&
+                        block.lineCallSiteIds[i + 1U].empty())
+                    {
+                        block.lineCallSiteIds[i + 1U] = block.lineCallSiteIds[i];
+                    }
+
+                    block.lines.erase(block.lines.begin() + static_cast<std::ptrdiff_t>(i));
+                    if (i < block.lineCallSiteIds.size())
+                    {
+                        block.lineCallSiteIds.erase(block.lineCallSiteIds.begin() + static_cast<std::ptrdiff_t>(i));
+                    }
+                    continue;
+                }
+
+                // Fold AST-split ternary condition pairs:
+                //   cond ? t : f
+                //   ((cond ? t : f) & mask) != 0
+                // Keep wrapper condition and carry callsite IDs if needed.
+                if (isBareTernaryLine(current) &&
+                    isConditionWrapperLine(next) &&
+                    containsIgnoringWhitespace(next, current))
                 {
                     if (i + 1U < block.lineCallSiteIds.size() &&
                         i < block.lineCallSiteIds.size() &&
@@ -1995,49 +2166,47 @@ namespace
 
         const clang::SourceManager &sourceManager = context.getSourceManager();
 
-        std::function<void(const clang::Stmt *)> visit = [&](const clang::Stmt *node)
+        // Use the CFG statement node itself (top-level expression) instead of a recursive walk.
+        // Recursive traversal duplicates callsite IDs across parent conditional expressions and
+        // child call-expression blocks that LLVM CFG already models separately.
+        const clang::Stmt *node = statement;
+        if (const clang::Expr *expr = llvm::dyn_cast<clang::Expr>(statement))
         {
-            if (node == nullptr)
-            {
-                return;
-            }
+            node = expr->IgnoreParenImpCasts()->IgnoreImplicit();
+        }
 
-            for (const clang::Stmt *child : node->children())
-            {
-                visit(child);
-            }
+        const clang::CallExpr *call = llvm::dyn_cast<clang::CallExpr>(node);
+        if (call == nullptr)
+        {
+            return callSiteIds;
+        }
 
-            if (const clang::CallExpr *call = llvm::dyn_cast<clang::CallExpr>(node))
-            {
-                CallSiteRecord callSite;
-                const clang::SourceLocation location = sourceManager.getSpellingLoc(call->getExprLoc());
-                callSite.location = buildSourceLocationRecord(location, sourceManager);
-                callSite.calleeExpression = extractStatementText(call->getCallee(), context);
+        CallSiteRecord callSite;
+        const clang::SourceLocation location = sourceManager.getSpellingLoc(call->getExprLoc());
+        callSite.location = buildSourceLocationRecord(location, sourceManager);
+        callSite.calleeExpression = extractStatementText(call->getCallee(), context);
 
-                if (const clang::FunctionDecl *callee = call->getDirectCallee())
-                {
-                    callSite.directCallee = callee->getQualifiedNameAsString();
-                }
-                else
-                {
-                    callSite.isIndirect = true;
-                    callSite.throughIdentifier = extractReferencedIdentifier(call->getCallee());
-                }
+        if (const clang::FunctionDecl *callee = call->getDirectCallee())
+        {
+            callSite.directCallee = callee->getQualifiedNameAsString();
+        }
+        else
+        {
+            callSite.isIndirect = true;
+            callSite.throughIdentifier = extractReferencedIdentifier(call->getCallee());
+        }
 
-                for (const clang::Expr *argument : call->arguments())
-                {
-                    callSite.argumentExpressions.push_back(extractStatementText(argument, context));
-                }
+        for (const clang::Expr *argument : call->arguments())
+        {
+            callSite.argumentExpressions.push_back(extractStatementText(argument, context));
+        }
 
-                const std::string stableId = buildStableCallSiteId(functionName, callSite);
-                if (knownCallSiteIds.find(stableId) != knownCallSiteIds.end())
-                {
-                    callSiteIds.push_back(stableId);
-                }
-            }
-        };
+        const std::string stableId = buildStableCallSiteId(functionName, callSite);
+        if (knownCallSiteIds.find(stableId) != knownCallSiteIds.end())
+        {
+            callSiteIds.push_back(stableId);
+        }
 
-        visit(statement);
         return callSiteIds;
     }
 
@@ -2048,8 +2217,19 @@ namespace
         const std::unordered_set<std::string> &knownCallSiteIds)
     {
         BlockLineCollection result;
+
+        struct BlockLineEntry
+        {
+            const clang::Stmt *statement = nullptr;
+            clang::SourceRange sourceRange;
+            std::string text;
+            std::vector<std::string> callSiteIds;
+        };
+
+        std::vector<BlockLineEntry> entries;
+        entries.reserve(static_cast<std::size_t>(block.size()));
+
         std::set<const clang::Stmt *> seenStatements;
-        std::unordered_set<std::string> emittedCallSiteIds;
         std::vector<clang::SourceRange> containerRanges;
 
         for (const clang::CFGElement &element : block)
@@ -2114,29 +2294,107 @@ namespace
             std::vector<std::string> stmtCallSiteIds =
                 collectStatementCallSiteIds(stmt, context, functionName, knownCallSiteIds);
 
-            // A single semantic call can surface multiple statement views (e.g. ternary
-            // lowering), which can repeat the same callsite ID in one block.
-            if (!stmtCallSiteIds.empty())
+            entries.push_back(BlockLineEntry{
+                stmt,
+                stmt->getSourceRange(),
+                stmtText,
+                std::move(stmtCallSiteIds)});
+        }
+
+        const clang::SourceManager &sourceManager = context.getSourceManager();
+
+        const auto sharesAnyCallSiteId = [](const std::vector<std::string> &lhs, const std::vector<std::string> &rhs) -> bool
+        {
+            if (lhs.empty() || rhs.empty())
             {
-                std::vector<std::string> filteredCallSiteIds;
-                filteredCallSiteIds.reserve(stmtCallSiteIds.size());
-                for (const std::string &callSiteId : stmtCallSiteIds)
+                return false;
+            }
+
+            const std::vector<std::string> *smaller = &lhs;
+            const std::vector<std::string> *larger = &rhs;
+            if (lhs.size() > rhs.size())
+            {
+                smaller = &rhs;
+                larger = &lhs;
+            }
+
+            std::unordered_set<std::string> lookup;
+            lookup.reserve(larger->size() * 2U + 1U);
+            for (const std::string &id : *larger)
+            {
+                lookup.insert(id);
+            }
+
+            for (const std::string &id : *smaller)
+            {
+                if (lookup.find(id) != lookup.end())
                 {
-                    if (emittedCallSiteIds.insert(callSiteId).second)
-                    {
-                        filteredCallSiteIds.push_back(callSiteId);
-                    }
+                    return true;
                 }
-                stmtCallSiteIds.swap(filteredCallSiteIds);
+            }
+
+            return false;
+        };
+
+        std::vector<bool> removeEntry(entries.size(), false);
+        for (std::size_t i = 0U; i < entries.size(); ++i)
+        {
+            if (entries[i].statement == nullptr || !llvm::isa<clang::Expr>(entries[i].statement))
+            {
+                continue;
+            }
+
+            for (std::size_t j = 0U; j < entries.size(); ++j)
+            {
+                if (i == j || entries[j].statement == nullptr)
+                {
+                    continue;
+                }
+
+                if (!containsSpellingRange(entries[j].sourceRange, entries[i].sourceRange, sourceManager))
+                {
+                    continue;
+                }
+
+                if (containsSpellingRange(entries[i].sourceRange, entries[j].sourceRange, sourceManager))
+                {
+                    continue;
+                }
+
+                if (sharesAnyCallSiteId(entries[i].callSiteIds, entries[j].callSiteIds))
+                {
+                    removeEntry[i] = true;
+                    break;
+                }
+            }
+        }
+
+        std::unordered_set<std::string> emittedCallSiteIds;
+        emittedCallSiteIds.reserve(entries.size() * 2U + 1U);
+        for (std::size_t i = 0U; i < entries.size(); ++i)
+        {
+            if (removeEntry[i])
+            {
+                continue;
+            }
+
+            std::vector<std::string> filteredCallSiteIds;
+            filteredCallSiteIds.reserve(entries[i].callSiteIds.size());
+            for (const std::string &callSiteId : entries[i].callSiteIds)
+            {
+                if (emittedCallSiteIds.insert(callSiteId).second)
+                {
+                    filteredCallSiteIds.push_back(callSiteId);
+                }
             }
 
             // Preserve all statements in encounter order, including same-line siblings.
             if (result.lines.empty() ||
-                result.lines.back() != stmtText ||
-                result.lineCallSiteIds.back() != stmtCallSiteIds)
+                result.lines.back() != entries[i].text ||
+                result.lineCallSiteIds.back() != filteredCallSiteIds)
             {
-                result.lines.push_back(stmtText);
-                result.lineCallSiteIds.push_back(stmtCallSiteIds);
+                result.lines.push_back(entries[i].text);
+                result.lineCallSiteIds.push_back(std::move(filteredCallSiteIds));
             }
         }
 
