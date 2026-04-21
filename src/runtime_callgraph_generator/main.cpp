@@ -280,6 +280,38 @@ int main(int argc, const char **argv)
             }
             return out.str();
         };
+        const auto callerMatchesStaticCallee = [&](const std::string &callerName, const std::string &calleeName) -> bool
+        {
+            const auto staticCallersForCallee = [&](const std::string &candidateCallee) -> const std::unordered_set<std::string> *
+            {
+                const auto staticIt = callersByCallee.find(candidateCallee);
+                if (staticIt == callersByCallee.end())
+                {
+                    return nullptr;
+                }
+                return &staticIt->second;
+            };
+
+            const std::unordered_set<std::string> *directCallers = staticCallersForCallee(calleeName);
+            if (directCallers != nullptr)
+            {
+                // If we have resolved static targets for this callee token, only accept exact matches.
+                return directCallers->find(callerName) != directCallers->end();
+            }
+
+            // Only if there is no resolved static target set for this callee token,
+            // fall back to callers that have an unresolved indirect edge.
+            if (calleeName != "<indirect-call>")
+            {
+                const std::unordered_set<std::string> *indirectCallers = staticCallersForCallee("<indirect-call>");
+                if (indirectCallers != nullptr)
+                {
+                    return indirectCallers->find(callerName) != indirectCallers->end();
+                }
+            }
+
+            return false;
+        };
         const auto describeNoCfgCaller = [&](PathState &candidate) -> std::string
         {
             cleanupInferredStack(candidate);
@@ -428,36 +460,14 @@ int main(int argc, const char **argv)
                 PathState prepared = std::move(path);
                 cleanupInferredStack(prepared);
 
-                // If this entrypoint was already tracked as an inferred frame at the current
-                // explicit depth, preserve its CFG progress so resumed contexts continue.
-                std::optional<InferredFrame> resumedFrameState;
-                for (std::size_t i = prepared.inferredStack.size(); i > 0U; --i)
-                {
-                    const InferredFrame &frame = prepared.inferredStack[i - 1U];
-                    if (frame.explicitDepthAnchor < prepared.contextStack.size())
-                    {
-                        break;
-                    }
+                // Entry markers always begin a new explicit context. If they interrupt an active
+                // context, suspend its inferred stack until an exit unwinds back to this depth.
+                suspendInferredFramesAtOrAboveDepth(prepared, prepared.contextStack.size());
 
-                    if (frame.explicitDepthAnchor != prepared.contextStack.size())
-                    {
-                        continue;
-                    }
-
-                    if (frame.functionName == event.baseName)
-                    {
-                        resumedFrameState = frame;
-                        break;
-                    }
-                }
-
-                discardInferredFramesAtOrAboveDepth(prepared, prepared.contextStack.size());
-
-                const auto staticIt = callersByCallee.find(event.baseName);
                 // Only treat entry markers as observed calls when a static caller matches.
                 std::vector<ActiveCaller> entryActiveCallers = buildFeasibleActiveCallers(prepared, event.baseName, cfgByFunction);
                 std::vector<ActiveCaller> entryStaticCandidates;
-                if (!entryActiveCallers.empty() && staticIt != callersByCallee.end())
+                if (!entryActiveCallers.empty())
                 {
                     std::copy_if(
                         entryActiveCallers.begin(),
@@ -465,7 +475,7 @@ int main(int argc, const char **argv)
                         std::back_inserter(entryStaticCandidates),
                         [&](const ActiveCaller &candidate)
                         {
-                            return staticIt->second.find(candidate.functionName) != staticIt->second.end();
+                            return callerMatchesStaticCallee(candidate.functionName, event.baseName);
                         });
                 }
 
@@ -493,26 +503,19 @@ int main(int argc, const char **argv)
                     entryStaticCandidates.resize(branchLimit);
                 }
 
-                const auto appendEntryFrame = [&](PathState &next, const std::optional<InferredFrame> &resumedState)
+                const auto appendEntryFrame = [&](PathState &next)
                 {
                     next.nodes.insert(event.baseName);
                     next.contextStack.push_back(event.baseName);
 
                     InferredFrame explicitFrame;
-                    if (resumedState.has_value())
+                    explicitFrame.functionName = event.baseName;
+                    const auto cfgIt = cfgByFunction.find(event.baseName);
+                    if (cfgIt != cfgByFunction.end() &&
+                        !cfgIt->second.blocks.empty() &&
+                        cfgIt->second.blocks.find(cfgIt->second.entryBlockId) != cfgIt->second.blocks.end())
                     {
-                        explicitFrame = *resumedState;
-                    }
-                    else
-                    {
-                        explicitFrame.functionName = event.baseName;
-                        const auto cfgIt = cfgByFunction.find(event.baseName);
-                        if (cfgIt != cfgByFunction.end() &&
-                            !cfgIt->second.blocks.empty() &&
-                            cfgIt->second.blocks.find(cfgIt->second.entryBlockId) != cfgIt->second.blocks.end())
-                        {
-                            explicitFrame.activePoints.push_back(InferredFrame::ProgramPoint{cfgIt->second.entryBlockId, 0U});
-                        }
+                        explicitFrame.activePoints.push_back(InferredFrame::ProgramPoint{cfgIt->second.entryBlockId, 0U});
                     }
 
                     explicitFrame.functionName = event.baseName;
@@ -524,7 +527,7 @@ int main(int argc, const char **argv)
                 if (entryStaticCandidates.empty())
                 {
                     PathState next = std::move(prepared);
-                    appendEntryFrame(next, resumedFrameState);
+                    appendEntryFrame(next);
                     nextPaths.push_back(std::move(next));
                     continue;
                 }
@@ -539,7 +542,7 @@ int main(int argc, const char **argv)
                         event.baseName,
                         entrypoints,
                         cfgByFunction);
-                    appendEntryFrame(next, resumedFrameState);
+                    appendEntryFrame(next);
                     nextPaths.push_back(std::move(next));
                 }
                 continue;
@@ -570,6 +573,7 @@ int main(int argc, const char **argv)
 
                     next.contextStack.pop_back();
                     cleanupInferredStack(next);
+                    (void)restoreSuspendedInferredFramesForDepth(next, next.contextStack.size());
                     nextPaths.push_back(std::move(next));
                     continue;
                 }
@@ -598,6 +602,7 @@ int main(int argc, const char **argv)
                 }
 
                 cleanupInferredStack(next);
+                (void)restoreSuspendedInferredFramesForDepth(next, next.contextStack.size());
 
                 nextPaths.push_back(std::move(next));
                 continue;
@@ -615,18 +620,14 @@ int main(int argc, const char **argv)
 
             std::vector<ActiveCaller> staticCandidates;
 
-            const auto staticIt = callersByCallee.find(event.baseName);
-            if (staticIt != callersByCallee.end())
-            {
-                std::copy_if(
-                    activeCallers.begin(),
-                    activeCallers.end(),
-                    std::back_inserter(staticCandidates),
-                    [&](const ActiveCaller &candidate)
-                    {
-                        return staticIt->second.find(candidate.functionName) != staticIt->second.end();
-                    });
-            }
+            std::copy_if(
+                activeCallers.begin(),
+                activeCallers.end(),
+                std::back_inserter(staticCandidates),
+                [&](const ActiveCaller &candidate)
+                {
+                    return callerMatchesStaticCallee(candidate.functionName, event.baseName);
+                });
 
             if (staticCandidates.empty())
             {
@@ -677,10 +678,16 @@ int main(int argc, const char **argv)
 
             if (candidates.size() > 1U && kLookaheadPlainEvents > 0U)
             {
+                // Explore a deeper same-context horizon so feasibility branching can
+                // disambiguate cases where the first few plain events are symmetric.
+                const std::size_t lookaheadPlainLimit =
+                    std::max<std::size_t>(static_cast<std::size_t>(kLookaheadPlainEvents), 32U);
+                const std::vector<ActiveCaller> originalCandidates = candidates;
                 struct LookaheadCandidate
                 {
                     ActiveCaller caller;
-                    double penalty = 0.0;
+                    bool feasible = true;
+                    std::size_t frontierWidth = static_cast<std::size_t>(-1);
                 };
 
                 std::vector<LookaheadCandidate> lookaheadCandidates;
@@ -690,7 +697,7 @@ int main(int argc, const char **argv)
                     candidates.end(),
                     std::back_inserter(lookaheadCandidates),
                     [](const ActiveCaller &candidate)
-                    { return LookaheadCandidate{candidate, 0.0}; });
+                    { return LookaheadCandidate{candidate, true}; });
 
                 for (LookaheadCandidate &entry : lookaheadCandidates)
                 {
@@ -702,96 +709,125 @@ int main(int argc, const char **argv)
                         entrypoints,
                         cfgByFunction);
 
+                    std::vector<PathState> probeStates;
+                    probeStates.push_back(std::move(probe));
+
                     std::size_t inspectedPlainEvents = 0U;
+                    std::size_t nestedContextDepth = 0U;
                     for (std::size_t i = eventIndex + 1U;
-                         i < events.size() && inspectedPlainEvents < static_cast<std::size_t>(kLookaheadPlainEvents);
+                         i < events.size() && inspectedPlainEvents < lookaheadPlainLimit;
                          ++i)
                     {
                         const Event &futureEvent = events[i];
-                        if (futureEvent.kind != EventKind::Plain)
+                        if (futureEvent.kind == EventKind::Entry)
                         {
+                            ++nestedContextDepth;
+                            continue;
+                        }
+
+                        if (futureEvent.kind == EventKind::Exit)
+                        {
+                            if (nestedContextDepth == 0U)
+                            {
+                                // Current context ended; stop lookahead for this candidate.
+                                break;
+                            }
+
+                            --nestedContextDepth;
+                            continue;
+                        }
+
+                        if (nestedContextDepth != 0U)
+                        {
+                            // Ignore plain events that belong to nested/interrupt contexts.
                             continue;
                         }
 
                         ++inspectedPlainEvents;
-                        std::vector<ActiveCaller> futureActiveCallers =
-                            buildFeasibleActiveCallers(probe, futureEvent.baseName, cfgByFunction);
-                        if (futureActiveCallers.empty())
+                        std::vector<PathState> nextProbeStates;
+                        for (PathState &probeState : probeStates)
                         {
-                            entry.penalty += 8.0;
-                            break;
-                        }
+                            std::vector<ActiveCaller> futureActiveCallers =
+                                buildFeasibleActiveCallers(probeState, futureEvent.baseName, cfgByFunction);
+                            if (futureActiveCallers.empty())
+                            {
+                                continue;
+                            }
 
-                        std::vector<ActiveCaller> futureStaticCandidates;
-                        const auto futureStaticIt = callersByCallee.find(futureEvent.baseName);
-                        if (futureStaticIt != callersByCallee.end())
-                        {
+                            std::vector<ActiveCaller> futureStaticCandidates;
                             std::copy_if(
                                 futureActiveCallers.begin(),
                                 futureActiveCallers.end(),
                                 std::back_inserter(futureStaticCandidates),
                                 [&](const ActiveCaller &futureCandidate)
                                 {
-                                    return futureStaticIt->second.find(futureCandidate.functionName) != futureStaticIt->second.end();
+                                    return callerMatchesStaticCallee(futureCandidate.functionName, futureEvent.baseName);
                                 });
+
+                            if (futureStaticCandidates.empty())
+                            {
+                                continue;
+                            }
+
+                            std::sort(futureStaticCandidates.begin(), futureStaticCandidates.end(), rankActiveCaller);
+                            if (futureStaticCandidates.size() > branchLimit)
+                            {
+                                futureStaticCandidates.resize(branchLimit);
+                            }
+
+                            for (const ActiveCaller &futureCaller : futureStaticCandidates)
+                            {
+                                PathState nextProbe = probeState;
+                                addEdge(nextProbe, futureCaller.functionName, futureEvent.baseName);
+                                updateInferredStackAfterAssignment(
+                                    nextProbe,
+                                    futureCaller,
+                                    futureEvent.baseName,
+                                    entrypoints,
+                                    cfgByFunction);
+                                nextProbeStates.push_back(std::move(nextProbe));
+                            }
                         }
 
-                        if (futureStaticCandidates.empty())
+                        if (nextProbeStates.empty())
                         {
-                            entry.penalty += 4.0;
+                            entry.feasible = false;
                             break;
                         }
 
-                        if (futureStaticCandidates.size() > 1U)
-                        {
-                            entry.penalty += static_cast<double>(futureStaticCandidates.size() - 1U) * 0.25;
-                        }
-
-                        std::sort(futureStaticCandidates.begin(), futureStaticCandidates.end(), rankActiveCaller);
-                        const ActiveCaller &bestFutureCaller = futureStaticCandidates.front();
-                        addEdge(probe, bestFutureCaller.functionName, futureEvent.baseName);
-                        updateInferredStackAfterAssignment(
-                            probe,
-                            bestFutureCaller,
-                            futureEvent.baseName,
-                            entrypoints,
-                            cfgByFunction);
+                        mergeEquivalentPathStates(nextProbeStates);
+                        pruneTopK(nextProbeStates, branchLimit);
+                        probeStates.swap(nextProbeStates);
                     }
-                }
 
-                std::sort(lookaheadCandidates.begin(), lookaheadCandidates.end(), [&](const LookaheadCandidate &lhs, const LookaheadCandidate &rhs)
-                          {
-                    if (lhs.penalty != rhs.penalty)
+                    if (entry.feasible)
                     {
-                        return lhs.penalty < rhs.penalty;
-                    }
-                    return rankActiveCaller(lhs.caller, rhs.caller); });
-
-                const double bestPenalty = lookaheadCandidates.front().penalty;
-                std::size_t bestPenaltyCount = 0U;
-                for (const LookaheadCandidate &entry : lookaheadCandidates)
-                {
-                    if (entry.penalty == bestPenalty)
-                    {
-                        ++bestPenaltyCount;
-                    }
-                    else
-                    {
-                        break;
+                        entry.frontierWidth = probeStates.size();
                     }
                 }
 
                 candidates.clear();
-                if (bestPenaltyCount == 1U)
+                std::size_t bestFrontierWidth = static_cast<std::size_t>(-1);
+                for (const LookaheadCandidate &entry : lookaheadCandidates)
                 {
-                    candidates.push_back(lookaheadCandidates.front().caller);
+                    if (entry.feasible)
+                    {
+                        bestFrontierWidth = std::min(bestFrontierWidth, entry.frontierWidth);
+                    }
+                }
+
+                if (bestFrontierWidth == static_cast<std::size_t>(-1))
+                {
+                    candidates = originalCandidates;
                 }
                 else
                 {
-                    const std::size_t keepCount = std::min(bestPenaltyCount, branchLimit);
-                    for (std::size_t i = 0U; i < keepCount; ++i)
+                    for (const LookaheadCandidate &entry : lookaheadCandidates)
                     {
-                        candidates.push_back(lookaheadCandidates[i].caller);
+                        if (entry.feasible && entry.frontierWidth == bestFrontierWidth)
+                        {
+                            candidates.push_back(entry.caller);
+                        }
                     }
                 }
 
@@ -843,6 +879,7 @@ int main(int argc, const char **argv)
         }
 
         pathExpansionCount += nextPaths.size();
+        mergeEquivalentPathStates(nextPaths);
         pruneTopK(nextPaths, std::max<std::size_t>(1U, static_cast<std::size_t>(kTopK)));
         activePaths.swap(nextPaths);
         if (activePaths.empty())
@@ -896,10 +933,53 @@ int main(int argc, const char **argv)
         return 1;
     }
 
+    mergeEquivalentPathStates(activePaths);
     pruneTopK(activePaths, std::max<std::size_t>(1U, static_cast<std::size_t>(kTopK)));
     const PathState &best = activePaths.front();
-    const bool uniquelyDeduced =
-        activePaths.size() == 1U || (activePaths.size() > 1U && best.score < activePaths[1].score);
+
+    std::set<std::string> allFunctions;
+    for (const auto &entry : cfgByFunction)
+    {
+        allFunctions.insert(entry.first);
+    }
+
+    std::set<std::string> coveredByAnyPath;
+    for (const PathState &path : activePaths)
+    {
+        coveredByAnyPath.insert(path.nodes.begin(), path.nodes.end());
+    }
+
+    std::set<std::string> coveredByAllPaths;
+    if (!activePaths.empty())
+    {
+        coveredByAllPaths.insert(activePaths.front().nodes.begin(), activePaths.front().nodes.end());
+        for (std::size_t i = 1U; i < activePaths.size(); ++i)
+        {
+            std::set<std::string> intersection;
+            std::set_intersection(
+                coveredByAllPaths.begin(),
+                coveredByAllPaths.end(),
+                activePaths[i].nodes.begin(),
+                activePaths[i].nodes.end(),
+                std::inserter(intersection, intersection.begin()));
+            coveredByAllPaths = std::move(intersection);
+        }
+    }
+
+    std::set<std::string> uncoveredFunctions;
+    std::set_difference(
+        allFunctions.begin(),
+        allFunctions.end(),
+        coveredByAnyPath.begin(),
+        coveredByAnyPath.end(),
+        std::inserter(uncoveredFunctions, uncoveredFunctions.begin()));
+
+    const auto namesToJson = [](const std::set<std::string> &names) -> llvm::json::Array
+    {
+        llvm::json::Array values;
+        std::copy(names.begin(), names.end(), std::back_inserter(values));
+        return values;
+    };
 
     llvm::json::Object root;
 
@@ -907,10 +987,19 @@ int main(int argc, const char **argv)
     summary["events"] = static_cast<std::int64_t>(events.size());
     summary["pathsKept"] = static_cast<std::int64_t>(activePaths.size());
     summary["pathExpansions"] = static_cast<std::int64_t>(pathExpansionCount);
-    summary["singlePathDeduced"] = uniquelyDeduced;
     summary["bestScore"] = best.score;
     summary["bestWarnings"] = static_cast<std::int64_t>(best.warnings.size());
     root["summary"] = std::move(summary);
+
+    llvm::json::Object coverage;
+    coverage["totalFunctions"] = static_cast<std::int64_t>(allFunctions.size());
+    coverage["coveredFunctions"] = static_cast<std::int64_t>(coveredByAnyPath.size());
+    coverage["uncoveredFunctions"] = static_cast<std::int64_t>(uncoveredFunctions.size());
+    coverage["coveredByAllCandidatePaths"] = static_cast<std::int64_t>(coveredByAllPaths.size());
+    coverage["coveredFunctionNames"] = namesToJson(coveredByAnyPath);
+    coverage["uncoveredFunctionNames"] = namesToJson(uncoveredFunctions);
+    coverage["coveredByAllCandidatePathNames"] = namesToJson(coveredByAllPaths);
+    root["coverage"] = std::move(coverage);
 
     root["bestPath"] = pathToJson(best, 1U);
 
@@ -931,49 +1020,115 @@ int main(int argc, const char **argv)
     out << llvm::formatv("{0:2}", llvm::json::Value(std::move(root))) << "\n";
     out.flush();
 
-    if (!kNoHtml)
+    const auto outputPathForRank = [](const std::string &path, std::size_t rank, bool includeRankSuffix) -> std::string
     {
-        std::vector<std::string> visualizationWarnings;
-        std::vector<ContextRun> contextRuns = buildContextRunsFromBestPath(events, best, visualizationWarnings);
-        llvm::json::Object visualizationData = buildVisualizationData(events, contextRuns, visualizationWarnings, orderedEntrypoints);
-        const std::string timelinePageName = fileNameFromPath(kTimelineHtmlOutput);
-        const std::string contextTreePageName = fileNameFromPath(kContextTreeHtmlOutput);
-
-        if (!writeTimelineHtml(kTimelineHtmlOutput, contextTreePageName, visualizationData, error))
+        if (!includeRankSuffix)
         {
-            llvm::errs() << "error: " << error << "\n";
-            return 1;
+            return path;
         }
 
-        if (!writeContextTreeHtml(kContextTreeHtmlOutput, timelinePageName, visualizationData, error))
-        {
-            llvm::errs() << "error: " << error << "\n";
-            return 1;
-        }
-    }
+        const std::string suffix = ".rank" + std::to_string(rank);
+        const std::size_t slashPos = path.find_last_of("/\\");
+        const std::size_t dotPos = path.find_last_of('.');
+        const bool hasExtension = (dotPos != std::string::npos) &&
+                                  (slashPos == std::string::npos || dotPos > slashPos);
 
-    if (!kNoDot)
-    {
-        if (!writeDot(kDotOutput, best.nodes, best.edgeCounts, error))
+        if (!hasExtension)
         {
-            llvm::errs() << "error: " << error << "\n";
-            return 1;
+            return path + suffix;
+        }
+
+        return path.substr(0U, dotPos) + suffix + path.substr(dotPos);
+    };
+
+    const bool multiPathOutputs = activePaths.size() > 1U;
+    for (std::size_t i = 0U; i < activePaths.size(); ++i)
+    {
+        const std::size_t rank = i + 1U;
+        const PathState &path = activePaths[i];
+
+        if (!kNoHtml)
+        {
+            std::vector<std::string> visualizationWarnings;
+            std::vector<ContextRun> contextRuns = buildContextRunsFromBestPath(events, path, visualizationWarnings);
+            llvm::json::Object visualizationData = buildVisualizationData(events, contextRuns, visualizationWarnings, orderedEntrypoints);
+            const std::string timelineOutputPath = outputPathForRank(kTimelineHtmlOutput, rank, multiPathOutputs);
+            const std::string contextTreeOutputPath = outputPathForRank(kContextTreeHtmlOutput, rank, multiPathOutputs);
+            const std::string timelinePageName = fileNameFromPath(timelineOutputPath);
+            const std::string contextTreePageName = fileNameFromPath(contextTreeOutputPath);
+
+            if (!writeTimelineHtml(timelineOutputPath, contextTreePageName, visualizationData, error))
+            {
+                llvm::errs() << "error: " << error << "\n";
+                return 1;
+            }
+
+            if (!writeContextTreeHtml(contextTreeOutputPath, timelinePageName, visualizationData, error))
+            {
+                llvm::errs() << "error: " << error << "\n";
+                return 1;
+            }
+        }
+
+        if (!kNoDot)
+        {
+            const std::string dotOutputPath = outputPathForRank(kDotOutput, rank, multiPathOutputs);
+            if (!writeDot(dotOutputPath, path.nodes, path.edgeCounts, error))
+            {
+                llvm::errs() << "error: " << error << "\n";
+                return 1;
+            }
         }
     }
 
     llvm::outs() << "Wrote runtime callgraph JSON to: " << kOutput << "\n";
     if (!kNoDot)
     {
-        llvm::outs() << "Wrote runtime callgraph DOT to: " << kDotOutput << "\n";
+        if (activePaths.size() == 1U)
+        {
+            llvm::outs() << "Wrote runtime callgraph DOT to: " << kDotOutput << "\n";
+        }
+        else
+        {
+            for (std::size_t i = 0U; i < activePaths.size(); ++i)
+            {
+                const std::size_t rank = i + 1U;
+                llvm::outs() << "Wrote runtime callgraph DOT (rank " << rank << ") to: "
+                             << outputPathForRank(kDotOutput, rank, true) << "\n";
+            }
+        }
     }
     if (!kNoHtml)
     {
-        llvm::outs() << "Wrote runtime timeline HTML to: " << kTimelineHtmlOutput << "\n";
-        llvm::outs() << "Wrote runtime context tree HTML to: " << kContextTreeHtmlOutput << "\n";
+        if (activePaths.size() == 1U)
+        {
+            llvm::outs() << "Wrote runtime timeline HTML to: " << kTimelineHtmlOutput << "\n";
+            llvm::outs() << "Wrote runtime context tree HTML to: " << kContextTreeHtmlOutput << "\n";
+        }
+        else
+        {
+            for (std::size_t i = 0U; i < activePaths.size(); ++i)
+            {
+                const std::size_t rank = i + 1U;
+                llvm::outs() << "Wrote runtime timeline HTML (rank " << rank << ") to: "
+                             << outputPathForRank(kTimelineHtmlOutput, rank, true) << "\n";
+                llvm::outs() << "Wrote runtime context tree HTML (rank " << rank << ") to: "
+                             << outputPathForRank(kContextTreeHtmlOutput, rank, true) << "\n";
+            }
+        }
     }
     llvm::outs() << "Events: " << events.size() << "\n";
     llvm::outs() << "Candidate paths kept: " << activePaths.size() << "\n";
-    llvm::outs() << "Single path deduced: " << (uniquelyDeduced ? "yes" : "no") << "\n";
+    llvm::outs() << "Coverage (functions): "
+                 << coveredByAnyPath.size()
+                 << "/"
+                 << allFunctions.size()
+                 << " covered, "
+                 << uncoveredFunctions.size()
+                 << " uncovered\n";
+    llvm::outs() << "Covered in all candidate paths: "
+                 << coveredByAllPaths.size()
+                 << "\n";
 
     return 0;
 }

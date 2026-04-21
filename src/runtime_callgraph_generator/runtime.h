@@ -102,6 +102,15 @@ struct InferredFrame
 };
 
 /**
+ * @brief Inferred-frame suffix suspended when an entrypoint interrupts a context.
+ */
+struct SuspendedInferredStack
+{
+    std::size_t resumeDepth = 0U;
+    std::vector<InferredFrame> frames;
+};
+
+/**
  * @brief Basic-block CFG details for one function.
  */
 struct RuntimeCfgBlock
@@ -140,6 +149,7 @@ struct PathState
     std::vector<std::string> contextStack;
     std::vector<InferredFrame> explicitFrames;
     std::vector<InferredFrame> inferredStack;
+    std::vector<SuspendedInferredStack> suspendedInferredStacks;
     std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> edgeCounts;
     std::unordered_set<std::string> nodes;
     std::vector<Assignment> assignments;
@@ -224,6 +234,8 @@ bool loadCfgDirectCallOrder(
 // Path state management
 void cleanupInferredStack(PathState &path);
 void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
+void suspendInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
+bool restoreSuspendedInferredFramesForDepth(PathState &path, std::size_t depth);
 std::vector<std::string> buildActiveCallerOrder(const PathState &path);
 std::vector<ActiveCaller> buildFeasibleActiveCallers(
     PathState &path,
@@ -246,6 +258,7 @@ std::vector<std::string> collectImmediateExpectedCallees(
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);
 
 // Path analysis
+void mergeEquivalentPathStates(std::vector<PathState> &paths);
 void pruneTopK(std::vector<PathState> &paths, std::size_t topK);
 void addEdge(PathState &path, const std::string &caller, const std::string &callee);
 

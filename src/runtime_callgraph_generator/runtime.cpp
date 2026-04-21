@@ -781,6 +781,15 @@ void cleanupInferredStack(PathState &path)
     {
         path.inferredStack.pop_back();
     }
+
+    // Drop suspended states for contexts that no longer exist.
+    path.suspendedInferredStacks.erase(
+        std::remove_if(
+            path.suspendedInferredStacks.begin(),
+            path.suspendedInferredStacks.end(),
+            [&](const SuspendedInferredStack &entry)
+            { return entry.resumeDepth > path.contextStack.size(); }),
+        path.suspendedInferredStacks.end());
 }
 
 void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth)
@@ -794,6 +803,56 @@ void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth)
     {
         path.inferredStack.pop_back();
     }
+}
+
+void suspendInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth)
+{
+    cleanupInferredStack(path);
+
+    std::size_t begin = path.inferredStack.size();
+    while (begin > 0U)
+    {
+        const InferredFrame &frame = path.inferredStack[begin - 1U];
+        if (frame.explicitDepthAnchor < depth)
+        {
+            break;
+        }
+        --begin;
+    }
+
+    if (begin == path.inferredStack.size())
+    {
+        return;
+    }
+
+    SuspendedInferredStack suspended;
+    suspended.resumeDepth = depth;
+    suspended.frames.assign(path.inferredStack.begin() + static_cast<std::ptrdiff_t>(begin), path.inferredStack.end());
+    path.suspendedInferredStacks.push_back(std::move(suspended));
+    path.inferredStack.resize(begin);
+}
+
+bool restoreSuspendedInferredFramesForDepth(PathState &path, std::size_t depth)
+{
+    cleanupInferredStack(path);
+
+    for (std::size_t i = path.suspendedInferredStacks.size(); i > 0U; --i)
+    {
+        SuspendedInferredStack &candidate = path.suspendedInferredStacks[i - 1U];
+        if (candidate.resumeDepth != depth)
+        {
+            continue;
+        }
+
+        path.inferredStack.insert(
+            path.inferredStack.end(),
+            candidate.frames.begin(),
+            candidate.frames.end());
+        path.suspendedInferredStacks.erase(path.suspendedInferredStacks.begin() + static_cast<std::ptrdiff_t>(i - 1U));
+        return true;
+    }
+
+    return false;
 }
 
 std::vector<std::string> buildActiveCallerOrder(const PathState &path)
@@ -1120,6 +1179,31 @@ namespace
 
         return 0;
     }
+
+    int compareSuspendedStacks(const std::vector<SuspendedInferredStack> &lhs, const std::vector<SuspendedInferredStack> &rhs)
+    {
+        const std::size_t count = std::min(lhs.size(), rhs.size());
+        for (std::size_t i = 0U; i < count; ++i)
+        {
+            if (lhs[i].resumeDepth != rhs[i].resumeDepth)
+            {
+                return lhs[i].resumeDepth < rhs[i].resumeDepth ? -1 : 1;
+            }
+
+            const int frameCompare = compareFrameLists(lhs[i].frames, rhs[i].frames);
+            if (frameCompare != 0)
+            {
+                return frameCompare;
+            }
+        }
+
+        if (lhs.size() != rhs.size())
+        {
+            return lhs.size() < rhs.size() ? -1 : 1;
+        }
+
+        return 0;
+    }
 }
 
 bool pathTieBreakerLess(const PathState &lhs, const PathState &rhs)
@@ -1180,7 +1264,69 @@ bool pathTieBreakerLess(const PathState &lhs, const PathState &rhs)
         return explicitCompare < 0;
     }
 
+    const int suspendedCompare = compareSuspendedStacks(lhs.suspendedInferredStacks, rhs.suspendedInferredStacks);
+    if (suspendedCompare != 0)
+    {
+        return suspendedCompare < 0;
+    }
+
     return false;
+}
+
+void mergeEquivalentPathStates(std::vector<PathState> &paths)
+{
+    if (paths.size() < 2U)
+    {
+        return;
+    }
+
+    const auto stateLess = [](const PathState &lhs, const PathState &rhs)
+    {
+        return pathTieBreakerLess(lhs, rhs);
+    };
+
+    std::sort(paths.begin(), paths.end(), [&](const PathState &lhs, const PathState &rhs)
+              {
+        if (stateLess(lhs, rhs))
+        {
+            return true;
+        }
+        if (stateLess(rhs, lhs))
+        {
+            return false;
+        }
+        if (lhs.score != rhs.score)
+        {
+            return lhs.score < rhs.score;
+        }
+        return false; });
+
+    auto isSameState = [&](const PathState &lhs, const PathState &rhs)
+    {
+        return !stateLess(lhs, rhs) && !stateLess(rhs, lhs);
+    };
+
+    std::vector<PathState> merged;
+    merged.reserve(paths.size());
+    std::size_t i = 0U;
+    while (i < paths.size())
+    {
+        std::size_t bestIndex = i;
+        std::size_t j = i + 1U;
+        while (j < paths.size() && isSameState(paths[i], paths[j]))
+        {
+            if (paths[j].score < paths[bestIndex].score)
+            {
+                bestIndex = j;
+            }
+            ++j;
+        }
+
+        merged.push_back(std::move(paths[bestIndex]));
+        i = j;
+    }
+
+    paths = std::move(merged);
 }
 
 void pruneTopK(std::vector<PathState> &paths, std::size_t topK)
