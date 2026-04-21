@@ -94,6 +94,13 @@ namespace
         llvm::cl::init(8),
         llvm::cl::cat(kCategory));
 
+    llvm::cl::opt<unsigned> kContextJobs(
+        "context-jobs",
+        llvm::cl::desc("Number of contexts to analyze in parallel (0 = auto)"),
+        llvm::cl::value_desc("N"),
+        llvm::cl::init(0),
+        llvm::cl::cat(kCategory));
+
     llvm::cl::opt<std::string> kTimelineHtmlOutput(
         "timeline-html",
         llvm::cl::desc("Output HTML timeline path (context lanes vs event index)"),
@@ -138,8 +145,8 @@ int main(int argc, const char **argv)
     }
 
     std::set<std::string> blacklistedFunctions;
-    std::vector<std::string> orderedBlacklistedFunctions;
-    if (!loadNameList(kBlacklist, blacklistedFunctions, orderedBlacklistedFunctions, error))
+    std::vector<std::string> ignoredBlacklistedFunctions;
+    if (!loadNameList(kBlacklist, blacklistedFunctions, ignoredBlacklistedFunctions, error))
     {
         llvm::errs() << "error: " << error << "\n";
         return 1;
@@ -159,782 +166,46 @@ int main(int argc, const char **argv)
         return 1;
     }
 
+    std::vector<std::string> preprocessingWarnings;
+    std::vector<ContextRun> preprocessedContextRuns = preprocessContextRuns(events, entrypoints, preprocessingWarnings);
+
     llvm::errs() << "Loaded events: " << events.size() << "\n";
+    llvm::errs() << "Preprocessed contexts: " << preprocessedContextRuns.size() << "\n";
+    if (!preprocessingWarnings.empty())
+    {
+        llvm::errs() << "[runtime] preprocessing warnings: " << preprocessingWarnings.size() << "\n";
+    }
     if (events.size() >= 50000000U)
     {
         llvm::errs() << "note: processing a very large trace; this can take significant memory and CPU time\n";
     }
 
-    std::vector<PathState> activePaths(1U);
-    std::size_t pathExpansionCount = 1U;
-    std::size_t failureEventIndex = static_cast<std::size_t>(-1);
-    Event failureEvent;
-    std::unordered_map<std::string, std::size_t> failureReasons;
-    struct FailureExample
+    RuntimeAnalysisOptions analysisOptions;
+    analysisOptions.topK = static_cast<std::size_t>(kTopK);
+    analysisOptions.lookaheadPlainEvents = static_cast<std::size_t>(kLookaheadPlainEvents);
+    analysisOptions.contextJobs = static_cast<std::size_t>(kContextJobs);
+
+    llvm::errs() << "[runtime] analyzing " << preprocessedContextRuns.size()
+                 << " contexts with context-jobs="
+                 << (analysisOptions.contextJobs == 0U ? std::string("auto") : std::to_string(analysisOptions.contextJobs))
+                 << "\n";
+
+    RuntimeAnalysisResult analysisResult;
+    if (!analyzeContexts(
+            events,
+            preprocessedContextRuns,
+            entrypoints,
+            callersByCallee,
+            cfgByFunction,
+            analysisOptions,
+            analysisResult,
+            error))
     {
-        std::string reason;
-        double score = 0.0;
-        std::string contextSummary;
-        std::string activeCallerSummary;
-        std::string assignmentSummary;
-    };
-    std::vector<FailureExample> failureExamples;
-
-    constexpr std::size_t kProgressEveryEvents = 1000U;
-    const std::size_t branchLimit = std::max<std::size_t>(1U, static_cast<std::size_t>(kTopK));
-    llvm::errs() << "[runtime] starting event processing\n";
-    for (std::size_t eventIndex = 0U; eventIndex < events.size(); ++eventIndex)
-    {
-        if ((eventIndex + 1U) % kProgressEveryEvents == 0U || (eventIndex + 1U) == events.size())
-        {
-            llvm::errs() << "[runtime] processed " << (eventIndex + 1U)
-                         << "/" << events.size()
-                         << " events, active paths=" << activePaths.size()
-                         << "\n";
-        }
-
-        const Event &event = events[eventIndex];
-        std::unordered_map<std::string, std::size_t> invalidationReasonsForEvent;
-        std::vector<FailureExample> invalidationExamplesForEvent;
-        const auto summarizeFrames = [](const std::vector<std::string> &frames) -> std::string
-        {
-            if (frames.empty())
-            {
-                return "<empty>";
-            }
-
-            std::ostringstream out;
-            for (std::size_t i = 0U; i < frames.size(); ++i)
-            {
-                if (i != 0U)
-                {
-                    out << " -> ";
-                }
-                out << frames[i];
-            }
-            return out.str();
-        };
-        const auto summarizeRecentAssignments = [](const PathState &candidate) -> std::string
-        {
-            if (candidate.assignments.empty())
-            {
-                return "<none>";
-            }
-
-            constexpr std::size_t kRecentAssignments = 3U;
-            const std::size_t begin = candidate.assignments.size() > kRecentAssignments
-                                          ? candidate.assignments.size() - kRecentAssignments
-                                          : 0U;
-
-            std::ostringstream out;
-            for (std::size_t i = begin; i < candidate.assignments.size(); ++i)
-            {
-                if (i != begin)
-                {
-                    out << " | ";
-                }
-                const Assignment &assignment = candidate.assignments[i];
-                out << "line " << assignment.lineNumber
-                    << ": " << assignment.chosenCaller
-                    << " -> " << assignment.token;
-                if (assignment.chosenCallerDepth.has_value())
-                {
-                    out << " (depth " << *assignment.chosenCallerDepth << ")";
-                }
-            }
-            return out.str();
-        };
-        const auto noteInvalidation = [&](const std::string &reason, const PathState &candidate)
-        {
-            ++invalidationReasonsForEvent[reason];
-
-            constexpr std::size_t kMaxFailureExamples = 6U;
-            if (invalidationExamplesForEvent.size() >= kMaxFailureExamples)
-            {
-                return;
-            }
-
-            FailureExample example;
-            example.reason = reason;
-            example.score = candidate.score;
-            example.contextSummary = summarizeFrames(candidate.contextStack);
-            example.activeCallerSummary = summarizeFrames(buildActiveCallerOrder(candidate));
-            example.assignmentSummary = summarizeRecentAssignments(candidate);
-            invalidationExamplesForEvent.push_back(std::move(example));
-        };
-        const auto joinNames = [](const std::vector<std::string> &names) -> std::string
-        {
-            if (names.empty())
-            {
-                return "<none>";
-            }
-
-            std::ostringstream out;
-            for (std::size_t i = 0U; i < names.size(); ++i)
-            {
-                if (i != 0U)
-                {
-                    out << ", ";
-                }
-                out << names[i];
-            }
-            return out.str();
-        };
-        const auto callerMatchesStaticCallee = [&](const std::string &callerName, const std::string &calleeName) -> bool
-        {
-            const auto staticCallersForCallee = [&](const std::string &candidateCallee) -> const std::unordered_set<std::string> *
-            {
-                const auto staticIt = callersByCallee.find(candidateCallee);
-                if (staticIt == callersByCallee.end())
-                {
-                    return nullptr;
-                }
-                return &staticIt->second;
-            };
-
-            const std::unordered_set<std::string> *directCallers = staticCallersForCallee(calleeName);
-            if (directCallers != nullptr)
-            {
-                // If we have resolved static targets for this callee token, only accept exact matches.
-                return directCallers->find(callerName) != directCallers->end();
-            }
-
-            // Only if there is no resolved static target set for this callee token,
-            // fall back to callers that have an unresolved indirect edge.
-            if (calleeName != "<indirect-call>")
-            {
-                const std::unordered_set<std::string> *indirectCallers = staticCallersForCallee("<indirect-call>");
-                if (indirectCallers != nullptr)
-                {
-                    return indirectCallers->find(callerName) != indirectCallers->end();
-                }
-            }
-
-            return false;
-        };
-        const auto describeNoCfgCaller = [&](PathState &candidate) -> std::string
-        {
-            cleanupInferredStack(candidate);
-
-            for (std::size_t i = candidate.inferredStack.size(); i > 0U; --i)
-            {
-                InferredFrame &frame = candidate.inferredStack[i - 1U];
-                const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
-                const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
-                if (remainingCalls.has_value() && *remainingCalls == 0U)
-                {
-                    continue;
-                }
-
-                if (!expected.empty())
-                {
-                    return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}', which next expects one of [{3}]",
-                                         event.lineNumber,
-                                         event.baseName,
-                                         frame.functionName,
-                                         joinNames(expected))
-                        .str();
-                }
-
-                if (!remainingCalls.has_value())
-                {
-                    return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}', whose CFG completion state could not be proven",
-                                         event.lineNumber,
-                                         event.baseName,
-                                         frame.functionName)
-                        .str();
-                }
-
-                return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}'",
-                                     event.lineNumber,
-                                     event.baseName,
-                                     frame.functionName)
-                    .str();
-            }
-
-            if (!candidate.explicitFrames.empty())
-            {
-                InferredFrame &frame = candidate.explicitFrames.back();
-                const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
-                if (!expected.empty())
-                {
-                    return llvm::formatv("line {0}: top active context '{1}' could not call token '{2}'; next CFG-observable callees are [{3}]",
-                                         event.lineNumber,
-                                         frame.functionName,
-                                         event.baseName,
-                                         joinNames(expected))
-                        .str();
-                }
-
-                const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
-                if (remainingCalls.has_value() && *remainingCalls == 0U)
-                {
-                    return llvm::formatv("line {0}: top active context '{1}' had no remaining CFG calls, so token '{2}' cannot belong to it",
-                                         event.lineNumber,
-                                         frame.functionName,
-                                         event.baseName)
-                        .str();
-                }
-            }
-
-            if (candidate.contextStack.empty())
-            {
-                return llvm::formatv("line {0}: token '{1}' appeared with no active context",
-                                     event.lineNumber,
-                                     event.baseName)
-                    .str();
-            }
-
-            return llvm::formatv("line {0}: token '{1}' had no CFG-feasible active caller",
-                                 event.lineNumber,
-                                 event.baseName)
-                .str();
-        };
-        const auto describeExitIncompatibility = [&](PathState &candidate) -> std::optional<std::string>
-        {
-            cleanupInferredStack(candidate);
-
-            for (std::size_t i = candidate.inferredStack.size(); i > 0U; --i)
-            {
-                InferredFrame &frame = candidate.inferredStack[i - 1U];
-                const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
-                if (!remainingCalls.has_value())
-                {
-                    return llvm::formatv("line {0}: could not prove nested callee '{1}' can return before exit marker '{2}'",
-                                         event.lineNumber,
-                                         frame.functionName,
-                                         event.rawToken)
-                        .str();
-                }
-
-                if (*remainingCalls > 0U)
-                {
-                    return llvm::formatv("line {0}: nested callee '{1}' still needs {2} CFG call(s) before exit marker '{3}' can close '{4}'",
-                                         event.lineNumber,
-                                         frame.functionName,
-                                         *remainingCalls,
-                                         event.rawToken,
-                                         event.baseName)
-                        .str();
-                }
-            }
-
-            if (candidate.explicitFrames.empty() || candidate.explicitFrames.back().functionName != event.baseName)
-            {
-                return llvm::formatv("line {0}: internal frame state for exit marker '{1}' did not match active context '{2}'",
-                                     event.lineNumber,
-                                     event.rawToken,
-                                     event.baseName)
-                    .str();
-            }
-
-            const std::optional<std::size_t> remainingCalls =
-                minimumRemainingCallsToExit(candidate.explicitFrames.back(), cfgByFunction);
-            if (!remainingCalls.has_value())
-            {
-                return llvm::formatv("line {0}: could not prove CFG exit reachability for '{1}' at exit marker '{2}'",
-                                     event.lineNumber,
-                                     event.baseName,
-                                     event.rawToken)
-                    .str();
-            }
-
-            if (*remainingCalls > 0U)
-            {
-                return llvm::formatv("line {0}: exit marker '{1}' closed '{2}' before {3} remaining CFG call(s) were observed",
-                                     event.lineNumber,
-                                     event.rawToken,
-                                     event.baseName,
-                                     *remainingCalls)
-                    .str();
-            }
-
-            return std::nullopt;
-        };
-        std::vector<PathState> nextPaths;
-        nextPaths.reserve(activePaths.size() * branchLimit + 1U);
-        for (PathState &path : activePaths)
-        {
-            if (event.kind == EventKind::Entry)
-            {
-                PathState prepared = std::move(path);
-                cleanupInferredStack(prepared);
-
-                // Entry markers always begin a new explicit context. If they interrupt an active
-                // context, suspend its inferred stack until an exit unwinds back to this depth.
-                suspendInferredFramesAtOrAboveDepth(prepared, prepared.contextStack.size());
-
-                // Only treat entry markers as observed calls when a static caller matches.
-                std::vector<ActiveCaller> entryActiveCallers = buildFeasibleActiveCallers(prepared, event.baseName, cfgByFunction);
-                std::vector<ActiveCaller> entryStaticCandidates;
-                if (!entryActiveCallers.empty())
-                {
-                    std::copy_if(
-                        entryActiveCallers.begin(),
-                        entryActiveCallers.end(),
-                        std::back_inserter(entryStaticCandidates),
-                        [&](const ActiveCaller &candidate)
-                        {
-                            return callerMatchesStaticCallee(candidate.functionName, event.baseName);
-                        });
-                }
-
-                if (entryStaticCandidates.size() > 1U)
-                {
-                    std::sort(entryStaticCandidates.begin(), entryStaticCandidates.end(), [](const ActiveCaller &lhs, const ActiveCaller &rhs)
-                              {
-                        if (lhs.depth != rhs.depth)
-                        {
-                            return lhs.depth < rhs.depth;
-                        }
-                        if (lhs.functionName != rhs.functionName)
-                        {
-                            return lhs.functionName < rhs.functionName;
-                        }
-                        if (lhs.isInferred != rhs.isInferred)
-                        {
-                            return lhs.isInferred;
-                        }
-                        return lhs.frameIndex < rhs.frameIndex; });
-                }
-
-                if (entryStaticCandidates.size() > branchLimit)
-                {
-                    entryStaticCandidates.resize(branchLimit);
-                }
-
-                const auto appendEntryFrame = [&](PathState &next)
-                {
-                    next.nodes.insert(event.baseName);
-                    next.contextStack.push_back(event.baseName);
-
-                    InferredFrame explicitFrame;
-                    explicitFrame.functionName = event.baseName;
-                    const auto cfgIt = cfgByFunction.find(event.baseName);
-                    if (cfgIt != cfgByFunction.end() &&
-                        !cfgIt->second.blocks.empty() &&
-                        cfgIt->second.blocks.find(cfgIt->second.entryBlockId) != cfgIt->second.blocks.end())
-                    {
-                        explicitFrame.activePoints.push_back(InferredFrame::ProgramPoint{cfgIt->second.entryBlockId, 0U});
-                    }
-
-                    explicitFrame.functionName = event.baseName;
-                    explicitFrame.explicitDepthAnchor = next.contextStack.size();
-
-                    next.explicitFrames.push_back(std::move(explicitFrame));
-                };
-
-                if (entryStaticCandidates.empty())
-                {
-                    PathState next = std::move(prepared);
-                    appendEntryFrame(next);
-                    nextPaths.push_back(std::move(next));
-                    continue;
-                }
-
-                for (const ActiveCaller &entryCaller : entryStaticCandidates)
-                {
-                    PathState next = prepared;
-                    addEdge(next, entryCaller.functionName, event.baseName);
-                    updateInferredStackAfterAssignment(
-                        next,
-                        entryCaller,
-                        event.baseName,
-                        entrypoints,
-                        cfgByFunction);
-                    appendEntryFrame(next);
-                    nextPaths.push_back(std::move(next));
-                }
-                continue;
-            }
-
-            if (event.kind == EventKind::Exit)
-            {
-                PathState next = std::move(path);
-                cleanupInferredStack(next);
-                if (next.contextStack.empty())
-                {
-                    noteInvalidation(
-                        llvm::formatv("line {0}: exit marker '{1}' had no active context to close",
-                                      event.lineNumber,
-                                      event.rawToken)
-                            .str(),
-                        next);
-                    continue;
-                }
-
-                if (next.contextStack.back() == event.baseName)
-                {
-                    if (const std::optional<std::string> incompatibility = describeExitIncompatibility(next))
-                    {
-                        noteInvalidation(*incompatibility, next);
-                        continue;
-                    }
-
-                    next.contextStack.pop_back();
-                    cleanupInferredStack(next);
-                    (void)restoreSuspendedInferredFramesForDepth(next, next.contextStack.size());
-                    nextPaths.push_back(std::move(next));
-                    continue;
-                }
-
-                bool found = false;
-                while (!next.contextStack.empty())
-                {
-                    const std::string top = next.contextStack.back();
-                    next.contextStack.pop_back();
-                    if (top == event.baseName)
-                    {
-                        found = true;
-                        break;
-                    }
-                }
-
-                if (!found)
-                {
-                    noteInvalidation(
-                        llvm::formatv("line {0}: exit marker '{1}' did not match any active context stack frame",
-                                      event.lineNumber,
-                                      event.rawToken)
-                            .str(),
-                        next);
-                    continue;
-                }
-
-                cleanupInferredStack(next);
-                (void)restoreSuspendedInferredFramesForDepth(next, next.contextStack.size());
-
-                nextPaths.push_back(std::move(next));
-                continue;
-            }
-
-            // Plain function log.
-            PathState prepared = std::move(path);
-            std::vector<ActiveCaller> activeCallers = buildFeasibleActiveCallers(prepared, event.baseName, cfgByFunction);
-
-            if (activeCallers.empty())
-            {
-                noteInvalidation(describeNoCfgCaller(prepared), prepared);
-                continue;
-            }
-
-            std::vector<ActiveCaller> staticCandidates;
-
-            std::copy_if(
-                activeCallers.begin(),
-                activeCallers.end(),
-                std::back_inserter(staticCandidates),
-                [&](const ActiveCaller &candidate)
-                {
-                    return callerMatchesStaticCallee(candidate.functionName, event.baseName);
-                });
-
-            if (staticCandidates.empty())
-            {
-                noteInvalidation(
-                    llvm::formatv("line {0}: token '{1}' had CFG-feasible callers, but none matched the static callgraph",
-                                  event.lineNumber,
-                                  event.baseName)
-                        .str(),
-                    prepared);
-                continue;
-            }
-
-            std::vector<ActiveCaller> &candidates = staticCandidates;
-            const auto rankActiveCaller = [](const ActiveCaller &lhs, const ActiveCaller &rhs)
-            {
-                if (lhs.depth != rhs.depth)
-                {
-                    return lhs.depth < rhs.depth;
-                }
-                if (lhs.functionName != rhs.functionName)
-                {
-                    return lhs.functionName < rhs.functionName;
-                }
-                if (lhs.isInferred != rhs.isInferred)
-                {
-                    return lhs.isInferred;
-                }
-                if (lhs.frameIndex != rhs.frameIndex)
-                {
-                    return lhs.frameIndex < rhs.frameIndex;
-                }
-                return false;
-            };
-
-            if (candidates.size() > 1U)
-            {
-                std::sort(candidates.begin(), candidates.end(), rankActiveCaller);
-            }
-
-            std::vector<std::string> candidateNames;
-            candidateNames.reserve(candidates.size());
-            std::transform(
-                candidates.begin(),
-                candidates.end(),
-                std::back_inserter(candidateNames),
-                [](const ActiveCaller &candidate)
-                { return candidate.functionName; });
-
-            if (candidates.size() > 1U && kLookaheadPlainEvents > 0U)
-            {
-                // Explore a deeper same-context horizon so feasibility branching can
-                // disambiguate cases where the first few plain events are symmetric.
-                const std::size_t lookaheadPlainLimit =
-                    std::max<std::size_t>(static_cast<std::size_t>(kLookaheadPlainEvents), 32U);
-                const std::vector<ActiveCaller> originalCandidates = candidates;
-                struct LookaheadCandidate
-                {
-                    ActiveCaller caller;
-                    bool feasible = true;
-                    std::size_t frontierWidth = static_cast<std::size_t>(-1);
-                };
-
-                std::vector<LookaheadCandidate> lookaheadCandidates;
-                lookaheadCandidates.reserve(candidates.size());
-                std::transform(
-                    candidates.begin(),
-                    candidates.end(),
-                    std::back_inserter(lookaheadCandidates),
-                    [](const ActiveCaller &candidate)
-                    { return LookaheadCandidate{candidate, true}; });
-
-                for (LookaheadCandidate &entry : lookaheadCandidates)
-                {
-                    PathState probe = prepared;
-                    updateInferredStackAfterAssignment(
-                        probe,
-                        entry.caller,
-                        event.baseName,
-                        entrypoints,
-                        cfgByFunction);
-
-                    std::vector<PathState> probeStates;
-                    probeStates.push_back(std::move(probe));
-
-                    std::size_t inspectedPlainEvents = 0U;
-                    std::size_t nestedContextDepth = 0U;
-                    for (std::size_t i = eventIndex + 1U;
-                         i < events.size() && inspectedPlainEvents < lookaheadPlainLimit;
-                         ++i)
-                    {
-                        const Event &futureEvent = events[i];
-                        if (futureEvent.kind == EventKind::Entry)
-                        {
-                            ++nestedContextDepth;
-                            continue;
-                        }
-
-                        if (futureEvent.kind == EventKind::Exit)
-                        {
-                            if (nestedContextDepth == 0U)
-                            {
-                                // Current context ended; stop lookahead for this candidate.
-                                break;
-                            }
-
-                            --nestedContextDepth;
-                            continue;
-                        }
-
-                        if (nestedContextDepth != 0U)
-                        {
-                            // Ignore plain events that belong to nested/interrupt contexts.
-                            continue;
-                        }
-
-                        ++inspectedPlainEvents;
-                        std::vector<PathState> nextProbeStates;
-                        for (PathState &probeState : probeStates)
-                        {
-                            std::vector<ActiveCaller> futureActiveCallers =
-                                buildFeasibleActiveCallers(probeState, futureEvent.baseName, cfgByFunction);
-                            if (futureActiveCallers.empty())
-                            {
-                                continue;
-                            }
-
-                            std::vector<ActiveCaller> futureStaticCandidates;
-                            std::copy_if(
-                                futureActiveCallers.begin(),
-                                futureActiveCallers.end(),
-                                std::back_inserter(futureStaticCandidates),
-                                [&](const ActiveCaller &futureCandidate)
-                                {
-                                    return callerMatchesStaticCallee(futureCandidate.functionName, futureEvent.baseName);
-                                });
-
-                            if (futureStaticCandidates.empty())
-                            {
-                                continue;
-                            }
-
-                            std::sort(futureStaticCandidates.begin(), futureStaticCandidates.end(), rankActiveCaller);
-                            if (futureStaticCandidates.size() > branchLimit)
-                            {
-                                futureStaticCandidates.resize(branchLimit);
-                            }
-
-                            for (const ActiveCaller &futureCaller : futureStaticCandidates)
-                            {
-                                PathState nextProbe = probeState;
-                                addEdge(nextProbe, futureCaller.functionName, futureEvent.baseName);
-                                updateInferredStackAfterAssignment(
-                                    nextProbe,
-                                    futureCaller,
-                                    futureEvent.baseName,
-                                    entrypoints,
-                                    cfgByFunction);
-                                nextProbeStates.push_back(std::move(nextProbe));
-                            }
-                        }
-
-                        if (nextProbeStates.empty())
-                        {
-                            entry.feasible = false;
-                            break;
-                        }
-
-                        mergeEquivalentPathStates(nextProbeStates);
-                        pruneTopK(nextProbeStates, branchLimit);
-                        probeStates.swap(nextProbeStates);
-                    }
-
-                    if (entry.feasible)
-                    {
-                        entry.frontierWidth = probeStates.size();
-                    }
-                }
-
-                candidates.clear();
-                std::size_t bestFrontierWidth = static_cast<std::size_t>(-1);
-                for (const LookaheadCandidate &entry : lookaheadCandidates)
-                {
-                    if (entry.feasible)
-                    {
-                        bestFrontierWidth = std::min(bestFrontierWidth, entry.frontierWidth);
-                    }
-                }
-
-                if (bestFrontierWidth == static_cast<std::size_t>(-1))
-                {
-                    candidates = originalCandidates;
-                }
-                else
-                {
-                    for (const LookaheadCandidate &entry : lookaheadCandidates)
-                    {
-                        if (entry.feasible && entry.frontierWidth == bestFrontierWidth)
-                        {
-                            candidates.push_back(entry.caller);
-                        }
-                    }
-                }
-
-                candidateNames.clear();
-                candidateNames.reserve(candidates.size());
-                std::transform(
-                    candidates.begin(),
-                    candidates.end(),
-                    std::back_inserter(candidateNames),
-                    [](const ActiveCaller &candidate)
-                    { return candidate.functionName; });
-            }
-
-            const bool tiedBest = candidates.size() > 1U;
-            if (candidates.size() > branchLimit)
-            {
-                candidates.resize(branchLimit);
-            }
-            for (std::size_t candidateRank = 0U; candidateRank < candidates.size(); ++candidateRank)
-            {
-                const ActiveCaller &caller = candidates[candidateRank];
-                PathState next = prepared;
-                addEdge(next, caller.functionName, event.baseName);
-
-                // Keep scoring simple and stable: earlier-ranked callers are preferred.
-                const double deltaScore = static_cast<double>(candidateRank) * 0.25;
-                next.score += deltaScore;
-
-                Assignment assignment;
-                assignment.lineNumber = event.lineNumber;
-                assignment.token = event.baseName;
-                assignment.candidates = candidateNames;
-                assignment.chosenCaller = caller.functionName;
-                assignment.chosenCallerDepth = caller.depth;
-                assignment.ambiguous = tiedBest;
-                assignment.usedStaticEdge = true;
-                assignment.deltaScore = deltaScore;
-                next.assignments.push_back(std::move(assignment));
-
-                updateInferredStackAfterAssignment(
-                    next,
-                    caller,
-                    event.baseName,
-                    entrypoints,
-                    cfgByFunction);
-
-                nextPaths.push_back(std::move(next));
-            }
-        }
-
-        pathExpansionCount += nextPaths.size();
-        mergeEquivalentPathStates(nextPaths);
-        pruneTopK(nextPaths, std::max<std::size_t>(1U, static_cast<std::size_t>(kTopK)));
-        activePaths.swap(nextPaths);
-        if (activePaths.empty())
-        {
-            failureEventIndex = eventIndex;
-            failureEvent = event;
-            failureReasons = std::move(invalidationReasonsForEvent);
-            failureExamples = std::move(invalidationExamplesForEvent);
-            break;
-        }
-    }
-
-    if (activePaths.empty())
-    {
-        llvm::errs() << "error: no valid runtime paths were produced\n";
-        if (failureEventIndex != static_cast<std::size_t>(-1))
-        {
-            llvm::errs() << "note: all remaining paths were rejected while processing line "
-                         << failureEvent.lineNumber
-                         << " token '"
-                         << (failureEvent.kind == EventKind::Plain ? failureEvent.baseName : failureEvent.rawToken)
-                         << "'\n";
-
-            std::vector<std::pair<std::string, std::size_t>> sortedReasons(
-                failureReasons.begin(),
-                failureReasons.end());
-            std::sort(sortedReasons.begin(), sortedReasons.end(), [](const auto &lhs, const auto &rhs)
-                      {
-                if (lhs.second != rhs.second)
-                {
-                    return lhs.second > rhs.second;
-                }
-                return lhs.first < rhs.first; });
-
-            for (const auto &entry : sortedReasons)
-            {
-                llvm::errs() << "  - rejected " << entry.second << " path(s): " << entry.first << "\n";
-            }
-
-            for (std::size_t i = 0U; i < failureExamples.size(); ++i)
-            {
-                const FailureExample &example = failureExamples[i];
-                llvm::errs() << "  example " << (i + 1U) << ":\n";
-                llvm::errs() << "    score before rejection: " << example.score << "\n";
-                llvm::errs() << "    reason: " << example.reason << "\n";
-                llvm::errs() << "    context stack: " << example.contextSummary << "\n";
-                llvm::errs() << "    active callers: " << example.activeCallerSummary << "\n";
-                llvm::errs() << "    recent assignments: " << example.assignmentSummary << "\n";
-            }
-        }
+        llvm::errs() << "error: " << error << "\n";
         return 1;
     }
 
-    mergeEquivalentPathStates(activePaths);
-    pruneTopK(activePaths, std::max<std::size_t>(1U, static_cast<std::size_t>(kTopK)));
+    const std::vector<PathState> &activePaths = analysisResult.candidatePaths;
     const PathState &best = activePaths.front();
 
     std::set<std::string> allFunctions;
@@ -985,11 +256,52 @@ int main(int argc, const char **argv)
 
     llvm::json::Object summary;
     summary["events"] = static_cast<std::int64_t>(events.size());
+    summary["preprocessedContexts"] = static_cast<std::int64_t>(preprocessedContextRuns.size());
+    summary["preprocessingWarnings"] = static_cast<std::int64_t>(preprocessingWarnings.size());
+    summary["processedEvents"] = static_cast<std::int64_t>(analysisResult.processedEventCount);
     summary["pathsKept"] = static_cast<std::int64_t>(activePaths.size());
-    summary["pathExpansions"] = static_cast<std::int64_t>(pathExpansionCount);
+    summary["pathExpansions"] = static_cast<std::int64_t>(analysisResult.pathExpansionCount);
     summary["bestScore"] = best.score;
     summary["bestWarnings"] = static_cast<std::int64_t>(best.warnings.size());
+    summary["contextJobs"] = static_cast<std::int64_t>(analysisOptions.contextJobs);
     root["summary"] = std::move(summary);
+
+    llvm::json::Object preprocessing;
+    llvm::json::Array preprocessedContextsJson;
+    for (std::size_t i = 0U; i < preprocessedContextRuns.size(); ++i)
+    {
+        preprocessedContextsJson.push_back(contextRunToJson(preprocessedContextRuns[i], i));
+    }
+    preprocessing["contexts"] = std::move(preprocessedContextsJson);
+
+    llvm::json::Array preprocessingWarningsJson;
+    std::copy(
+        preprocessingWarnings.begin(),
+        preprocessingWarnings.end(),
+        std::back_inserter(preprocessingWarningsJson));
+    preprocessing["warnings"] = std::move(preprocessingWarningsJson);
+    root["preprocessing"] = std::move(preprocessing);
+
+    llvm::json::Object contextProcessing;
+    llvm::json::Array contextRunsJson;
+    for (std::size_t i = 0U; i < analysisResult.contexts.size(); ++i)
+    {
+        const ContextAnalysisResult &contextResult = analysisResult.contexts[i];
+        llvm::json::Object contextObject = contextRunToJson(contextResult.run, i);
+        contextObject["localEvents"] = static_cast<std::int64_t>(contextResult.localEventCount);
+        contextObject["processedEvents"] = static_cast<std::int64_t>(contextResult.processedEventCount);
+        contextObject["pathExpansions"] = static_cast<std::int64_t>(contextResult.pathExpansionCount);
+        contextObject["candidatePaths"] = static_cast<std::int64_t>(contextResult.candidatePaths.size());
+        contextObject["effectiveLookaheadPlainEvents"] =
+            static_cast<std::int64_t>(contextResult.effectiveLookaheadPlainEvents);
+        if (!contextResult.candidatePaths.empty())
+        {
+            contextObject["bestScore"] = contextResult.candidatePaths.front().score;
+        }
+        contextRunsJson.push_back(std::move(contextObject));
+    }
+    contextProcessing["contexts"] = std::move(contextRunsJson);
+    root["contextProcessing"] = std::move(contextProcessing);
 
     llvm::json::Object coverage;
     coverage["totalFunctions"] = static_cast<std::int64_t>(allFunctions.size());
@@ -1049,9 +361,29 @@ int main(int argc, const char **argv)
 
         if (!kNoHtml)
         {
-            std::vector<std::string> visualizationWarnings;
-            std::vector<ContextRun> contextRuns = buildContextRunsFromBestPath(events, path, visualizationWarnings);
-            llvm::json::Object visualizationData = buildVisualizationData(events, contextRuns, visualizationWarnings, orderedEntrypoints);
+            std::vector<ContextRun> visualizationRuns;
+            const std::vector<std::size_t> *selection =
+                i < analysisResult.candidateSelections.size() ? &analysisResult.candidateSelections[i] : nullptr;
+            if (selection != nullptr && selection->size() == analysisResult.contexts.size())
+            {
+                visualizationRuns.reserve(selection->size());
+                for (std::size_t contextIndex = 0U; contextIndex < selection->size(); ++contextIndex)
+                {
+                    const ContextAnalysisResult &contextResult = analysisResult.contexts[contextIndex];
+                    const std::size_t candidateIndex = (*selection)[contextIndex];
+                    if (candidateIndex < contextResult.candidatePaths.size())
+                    {
+                        visualizationRuns.push_back(
+                            materializeContextRun(preprocessedContextRuns[contextIndex], contextResult.candidatePaths[candidateIndex]));
+                    }
+                }
+            }
+            if (visualizationRuns.empty())
+            {
+                visualizationRuns = analysisResult.bestContextRuns;
+            }
+            llvm::json::Object visualizationData =
+                buildVisualizationData(events, visualizationRuns, preprocessingWarnings, orderedEntrypoints);
             const std::string timelineOutputPath = outputPathForRank(kTimelineHtmlOutput, rank, multiPathOutputs);
             const std::string contextTreeOutputPath = outputPathForRank(kContextTreeHtmlOutput, rank, multiPathOutputs);
             const std::string timelinePageName = fileNameFromPath(timelineOutputPath);

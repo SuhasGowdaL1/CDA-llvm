@@ -6,12 +6,20 @@
 #include "runtime.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <deque>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <queue>
 #include <sstream>
+#include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
@@ -258,6 +266,221 @@ bool parseEvents(
     llvm::errs() << "[runtime] parsed " << lineNo << " log lines, kept " << events.size() << " events\n";
 
     return true;
+}
+
+std::vector<ContextRun> preprocessContextRuns(
+    const std::vector<Event> &events,
+    const std::set<std::string> &entrypoints,
+    std::vector<std::string> &warnings)
+{
+    (void)entrypoints;
+    std::vector<ContextRun> runs;
+    std::vector<std::size_t> openRunIndices;
+    const std::size_t kNoRun = static_cast<std::size_t>(-1);
+    std::vector<std::size_t> ownerRunByEvent(events.size(), kNoRun);
+    std::unordered_map<std::string, std::size_t> ordinalByEntrypoint;
+    ordinalByEntrypoint.reserve(16U);
+
+    const auto findOpenRunByEntrypoint = [&](const std::string &entrypoint) -> std::size_t
+    {
+        if (entrypoint.empty())
+        {
+            return kNoRun;
+        }
+
+        for (std::size_t i = openRunIndices.size(); i > 0U; --i)
+        {
+            const std::size_t runIndex = openRunIndices[i - 1U];
+            if (runs[runIndex].entrypoint == entrypoint)
+            {
+                return runIndex;
+            }
+        }
+
+        return kNoRun;
+    };
+
+    for (std::size_t eventIndex = 0U; eventIndex < events.size(); ++eventIndex)
+    {
+        const Event &event = events[eventIndex];
+        if (event.kind == EventKind::Entry)
+        {
+            const std::size_t ordinal = ++ordinalByEntrypoint[event.baseName];
+            const std::size_t parentRunIndex = openRunIndices.empty() ? kNoRun : openRunIndices.back();
+
+            ContextRun run;
+            run.entrypoint = event.baseName;
+            run.ordinal = ordinal;
+            run.startEventIndex = eventIndex;
+            run.endEventIndex = eventIndex;
+            run.contextId = event.baseName + "#" + std::to_string(ordinal) + "@" + std::to_string(eventIndex);
+            if (parentRunIndex != kNoRun)
+            {
+                run.parentContextId = runs[parentRunIndex].contextId;
+            }
+            run.temporalPoints.push_back(ContextTemporalPoint{eventIndex, "entry", std::string()});
+            runs.push_back(std::move(run));
+            if (parentRunIndex != kNoRun)
+            {
+                runs[parentRunIndex].childContextIds.push_back(runs.back().contextId);
+            }
+            openRunIndices.push_back(runs.size() - 1U);
+            ownerRunByEvent[eventIndex] = openRunIndices.back();
+            continue;
+        }
+
+        if (event.kind == EventKind::Exit)
+        {
+            if (openRunIndices.empty())
+            {
+                warnings.push_back(
+                    llvm::formatv("line {0}: unmatched exit marker '{1}' while preprocessing context runs", event.lineNumber, event.rawToken).str());
+                continue;
+            }
+
+            bool matched = false;
+            std::size_t matchedRunIndex = kNoRun;
+            while (!openRunIndices.empty())
+            {
+                const std::size_t runIndex = openRunIndices.back();
+                openRunIndices.pop_back();
+                ContextRun &run = runs[runIndex];
+                run.endEventIndex = eventIndex;
+                if (run.entrypoint == event.baseName)
+                {
+                    matched = true;
+                    matchedRunIndex = runIndex;
+                    break;
+                }
+
+                run.warnings.push_back(
+                    llvm::formatv("line {0}: context '{1}' force-closed while resolving exit '{2}'", event.lineNumber, run.entrypoint, event.rawToken).str());
+            }
+
+            if (!matched)
+            {
+                warnings.push_back(
+                    llvm::formatv("line {0}: exit marker '{1}' did not match any active context run", event.lineNumber, event.rawToken).str());
+            }
+            else
+            {
+                ownerRunByEvent[eventIndex] = matchedRunIndex;
+                ContextRun &matchedRun = runs[matchedRunIndex];
+                matchedRun.temporalPoints.push_back(ContextTemporalPoint{eventIndex, "exit", std::string()});
+            }
+            continue;
+        }
+
+        if (openRunIndices.empty())
+        {
+            continue;
+        }
+
+        const std::size_t runIndex = findOpenRunByEntrypoint(event.baseName);
+        const std::size_t ownerIndex = runIndex == kNoRun ? openRunIndices.back() : runIndex;
+        ownerRunByEvent[eventIndex] = ownerIndex;
+        runs[ownerIndex].endEventIndex = eventIndex;
+    }
+
+    const std::size_t fallbackEnd = events.empty() ? 0U : (events.size() - 1U);
+    while (!openRunIndices.empty())
+    {
+        const std::size_t runIndex = openRunIndices.back();
+        openRunIndices.pop_back();
+        ContextRun &run = runs[runIndex];
+        run.endEventIndex = std::max(run.endEventIndex, fallbackEnd);
+        run.warnings.push_back("context ended without explicit exit marker");
+    }
+
+    for (std::size_t runIndex = 0U; runIndex < runs.size(); ++runIndex)
+    {
+        ContextRun &run = runs[runIndex];
+        for (std::size_t eventIndex = run.startEventIndex;
+             eventIndex <= run.endEventIndex && eventIndex < ownerRunByEvent.size();
+             ++eventIndex)
+        {
+            if (ownerRunByEvent[eventIndex] == runIndex)
+            {
+                run.ownedEventIndices.push_back(eventIndex);
+            }
+        }
+
+        bool inSegment = false;
+        std::size_t segmentStart = 0U;
+        for (std::size_t eventIndex = run.startEventIndex;
+             eventIndex <= run.endEventIndex && eventIndex < ownerRunByEvent.size();
+             ++eventIndex)
+        {
+            const bool ownsEvent = ownerRunByEvent[eventIndex] == runIndex;
+            if (ownsEvent && !inSegment)
+            {
+                if (!run.executionSegments.empty())
+                {
+                    std::string relatedContextId;
+                    if (eventIndex > 0U)
+                    {
+                        const std::size_t previousOwner = ownerRunByEvent[eventIndex - 1U];
+                        if (previousOwner != kNoRun && previousOwner != runIndex)
+                        {
+                            relatedContextId = runs[previousOwner].contextId;
+                        }
+                    }
+                    run.temporalPoints.push_back(ContextTemporalPoint{eventIndex, "interrupt_end", std::move(relatedContextId)});
+                }
+                inSegment = true;
+                segmentStart = eventIndex;
+                continue;
+            }
+
+            if (!ownsEvent && inSegment)
+            {
+                ContextSegment segment;
+                segment.startEventIndex = segmentStart;
+                segment.endEventIndex = eventIndex - 1U;
+                segment.startsAtContextStart = segment.startEventIndex == run.startEventIndex;
+                segment.endsAtContextEnd = segment.endEventIndex == run.endEventIndex;
+                run.executionSegments.push_back(std::move(segment));
+                std::string relatedContextId;
+                const std::size_t interruptOwner = ownerRunByEvent[eventIndex];
+                if (interruptOwner != kNoRun && interruptOwner != runIndex)
+                {
+                    relatedContextId = runs[interruptOwner].contextId;
+                }
+                run.temporalPoints.push_back(ContextTemporalPoint{eventIndex, "interrupt_start", std::move(relatedContextId)});
+                inSegment = false;
+            }
+        }
+
+        if (inSegment)
+        {
+            ContextSegment segment;
+            segment.startEventIndex = segmentStart;
+            segment.endEventIndex = run.endEventIndex;
+            segment.startsAtContextStart = segment.startEventIndex == run.startEventIndex;
+            segment.endsAtContextEnd = segment.endEventIndex == run.endEventIndex;
+            run.executionSegments.push_back(std::move(segment));
+        }
+
+        if (run.executionSegments.empty())
+        {
+            ContextSegment fallback;
+            fallback.startEventIndex = run.startEventIndex;
+            fallback.endEventIndex = run.endEventIndex;
+            fallback.startsAtContextStart = true;
+            fallback.endsAtContextEnd = true;
+            run.executionSegments.push_back(std::move(fallback));
+        }
+
+        std::sort(run.temporalPoints.begin(), run.temporalPoints.end(), [](const ContextTemporalPoint &lhs, const ContextTemporalPoint &rhs)
+                  {
+            if (lhs.eventIndex != rhs.eventIndex)
+            {
+                return lhs.eventIndex < rhs.eventIndex;
+            }
+            return lhs.kind < rhs.kind; });
+    }
+
+    return runs;
 }
 
 bool loadStaticEdges(
@@ -548,6 +771,15 @@ namespace
         return point;
     }
 
+    void invalidateFrameCaches(InferredFrame &frame)
+    {
+        frame.tokenCacheValid = false;
+        frame.lastCheckedToken.clear();
+        frame.lastCheckedTokenFeasible = false;
+        frame.remainingCallsCacheValid = false;
+        frame.cachedRemainingCallsToExit.reset();
+    }
+
     bool seedFrameForFunction(
         InferredFrame &frame,
         const std::string &functionName,
@@ -555,6 +787,8 @@ namespace
     {
         frame.functionName = functionName;
         frame.activePoints.clear();
+        frame.closureComputed = false;
+        invalidateFrameCaches(frame);
 
         const auto cfgIt = cfgByFunction.find(functionName);
         if (cfgIt == cfgByFunction.end())
@@ -574,10 +808,6 @@ namespace
         }
 
         frame.activePoints.push_back(InferredFrame::ProgramPoint{functionCfg.entryBlockId, 0U});
-        frame.closureComputed = false;
-        frame.tokenCacheValid = false;
-        frame.lastCheckedToken.clear();
-        frame.lastCheckedTokenFeasible = false;
         return true;
     }
 
@@ -763,9 +993,7 @@ namespace
         computeEpsilonClosure(nextPoints, functionCfg);
         frame.activePoints = std::move(nextPoints);
         frame.closureComputed = true;
-        frame.tokenCacheValid = false;
-        frame.lastCheckedToken.clear();
-        frame.lastCheckedTokenFeasible = false;
+        invalidateFrameCaches(frame);
         return true;
     }
 }
@@ -903,7 +1131,7 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
 
         if (frameCanCallToken(frame, token, cfgByFunction))
         {
-            callers.push_back(ActiveCaller{frame.functionName, true, i - 1U, depth});
+            callers.push_back(ActiveCaller{&frame.functionName, true, i - 1U, depth});
         }
 
         const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
@@ -925,7 +1153,7 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
         InferredFrame &frame = path.explicitFrames.back();
         if (frameCanCallToken(frame, token, cfgByFunction))
         {
-            callers.push_back(ActiveCaller{frame.functionName, false, path.explicitFrames.size() - 1U, depth});
+            callers.push_back(ActiveCaller{&frame.functionName, false, path.explicitFrames.size() - 1U, depth});
         }
     }
 
@@ -992,9 +1220,16 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
     InferredFrame &frame,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
 {
+    if (frame.remainingCallsCacheValid)
+    {
+        return frame.cachedRemainingCallsToExit;
+    }
+
     const auto cfgIt = cfgByFunction.find(frame.functionName);
     if (cfgIt == cfgByFunction.end())
     {
+        frame.remainingCallsCacheValid = true;
+        frame.cachedRemainingCallsToExit = std::nullopt;
         return std::nullopt;
     }
 
@@ -1038,6 +1273,8 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
         const std::size_t callCount = block.callees.size();
         if (point.blockId == functionCfg.exitBlockId && static_cast<std::size_t>(point.callIndex) >= callCount)
         {
+            frame.remainingCallsCacheValid = true;
+            frame.cachedRemainingCallsToExit = current.first;
             return current.first;
         }
 
@@ -1073,6 +1310,8 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
         }
     }
 
+    frame.remainingCallsCacheValid = true;
+    frame.cachedRemainingCallsToExit = std::nullopt;
     return std::nullopt;
 }
 
@@ -1364,6 +1603,1286 @@ void addEdge(PathState &path, const std::string &caller, const std::string &call
     path.edgeCounts[EdgeKey{caller, callee}] += 1U;
 }
 
+namespace
+{
+    std::mutex gRuntimeTraceMutex;
+
+    void logRuntimeTrace(const std::string &message)
+    {
+        std::lock_guard<std::mutex> lock(gRuntimeTraceMutex);
+        llvm::errs() << message << '\n';
+    }
+
+    struct ContextProcessingEvent
+    {
+        std::size_t eventIndex = 0U;
+        std::size_t lineNumber = 0U;
+        const std::string *token = nullptr;
+        bool entersContext = false;
+        const std::string *relatedContextId = nullptr;
+    };
+
+    struct CombinedContextSelection
+    {
+        std::vector<std::size_t> indices;
+        double score = 0.0;
+    };
+
+    std::size_t computeEffectiveLookahead(std::size_t eventCount, std::size_t requestedLookahead)
+    {
+        std::size_t effectiveLookahead = requestedLookahead;
+        if (eventCount > 1000000U)
+        {
+            effectiveLookahead = std::min<std::size_t>(effectiveLookahead, 2U);
+        }
+        if (eventCount > 5000000U)
+        {
+            effectiveLookahead = 0U;
+        }
+        return effectiveLookahead;
+    }
+
+    std::size_t computeTraceInterval(std::size_t eventCount)
+    {
+        if (eventCount >= 100000U)
+        {
+            return 25000U;
+        }
+        if (eventCount >= 10000U)
+        {
+            return 5000U;
+        }
+        return 0U;
+    }
+
+    std::vector<std::size_t> buildAdaptiveLookaheadSchedule(std::size_t maxLookahead)
+    {
+        std::vector<std::size_t> schedule;
+        schedule.push_back(0U);
+        if (maxLookahead == 0U)
+        {
+            return schedule;
+        }
+
+        std::size_t current = 1U;
+        while (current < maxLookahead)
+        {
+            schedule.push_back(current);
+            if (current > (std::numeric_limits<std::size_t>::max() / 2U))
+            {
+                break;
+            }
+            current *= 2U;
+        }
+
+        if (schedule.back() != maxLookahead)
+        {
+            schedule.push_back(maxLookahead);
+        }
+        return schedule;
+    }
+
+    const std::string &contextEventToken(const ContextProcessingEvent &event)
+    {
+        static const std::string empty;
+        return event.token != nullptr ? *event.token : empty;
+    }
+
+    const std::string &contextEventRelatedContextId(const ContextProcessingEvent &event)
+    {
+        static const std::string empty;
+        return event.relatedContextId != nullptr ? *event.relatedContextId : empty;
+    }
+
+    const std::string &activeCallerName(const ActiveCaller &caller)
+    {
+        static const std::string empty;
+        return caller.functionName != nullptr ? *caller.functionName : empty;
+    }
+
+    template <typename RankFn>
+    void retainMostImmediateCandidates(std::vector<ActiveCaller> &candidates, const RankFn &rankActiveCaller)
+    {
+        if (candidates.size() <= 1U)
+        {
+            return;
+        }
+
+        std::sort(candidates.begin(), candidates.end(), rankActiveCaller);
+        const std::size_t bestDepth = candidates.front().depth;
+        auto eraseBegin = std::find_if(
+            candidates.begin() + 1,
+            candidates.end(),
+            [&](const ActiveCaller &candidate)
+            { return candidate.depth != bestDepth; });
+        candidates.erase(eraseBegin, candidates.end());
+    }
+
+    std::string encodeSelectionKey(const std::vector<std::size_t> &indices)
+    {
+        std::ostringstream out;
+        for (std::size_t i = 0U; i < indices.size(); ++i)
+        {
+            if (i != 0U)
+            {
+                out << ',';
+            }
+            out << indices[i];
+        }
+        return out.str();
+    }
+
+    std::string summarizeFrames(const std::vector<std::string> &frames)
+    {
+        if (frames.empty())
+        {
+            return "<empty>";
+        }
+
+        std::ostringstream out;
+        for (std::size_t i = 0U; i < frames.size(); ++i)
+        {
+            if (i != 0U)
+            {
+                out << " -> ";
+            }
+            out << frames[i];
+        }
+        return out.str();
+    }
+
+    std::string summarizeRecentAssignments(const PathState &candidate)
+    {
+        if (candidate.assignments.empty())
+        {
+            return "<none>";
+        }
+
+        constexpr std::size_t kRecentAssignments = 3U;
+        const std::size_t begin = candidate.assignments.size() > kRecentAssignments
+                                      ? candidate.assignments.size() - kRecentAssignments
+                                      : 0U;
+
+        std::ostringstream out;
+        for (std::size_t i = begin; i < candidate.assignments.size(); ++i)
+        {
+            if (i != begin)
+            {
+                out << " | ";
+            }
+
+            const Assignment &assignment = candidate.assignments[i];
+            out << "line " << assignment.lineNumber
+                << ": " << assignment.chosenCaller
+                << " -> " << assignment.token;
+            if (assignment.chosenCallerDepth.has_value())
+            {
+                out << " (depth " << *assignment.chosenCallerDepth << ")";
+            }
+        }
+        return out.str();
+    }
+
+    std::string joinNames(const std::vector<std::string> &names)
+    {
+        if (names.empty())
+        {
+            return "<none>";
+        }
+
+        std::ostringstream out;
+        for (std::size_t i = 0U; i < names.size(); ++i)
+        {
+            if (i != 0U)
+            {
+                out << ", ";
+            }
+            out << names[i];
+        }
+        return out.str();
+    }
+
+    bool callerMatchesStaticCallee(
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+        const std::string &callerName,
+        const std::string &calleeName)
+    {
+        const auto staticCallersForCallee = [&](const std::string &candidateCallee) -> const std::unordered_set<std::string> *
+        {
+            const auto staticIt = callersByCallee.find(candidateCallee);
+            if (staticIt == callersByCallee.end())
+            {
+                return nullptr;
+            }
+            return &staticIt->second;
+        };
+
+        const std::unordered_set<std::string> *directCallers = staticCallersForCallee(calleeName);
+        if (directCallers != nullptr)
+        {
+            return directCallers->find(callerName) != directCallers->end();
+        }
+
+        if (calleeName != "<indirect-call>")
+        {
+            const std::unordered_set<std::string> *indirectCallers = staticCallersForCallee("<indirect-call>");
+            if (indirectCallers != nullptr)
+            {
+                return indirectCallers->find(callerName) != indirectCallers->end();
+            }
+        }
+
+        return false;
+    }
+
+    std::string describeNoCfgCaller(
+        const ContextProcessingEvent &event,
+        PathState &candidate,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+    {
+        const std::string &eventToken = contextEventToken(event);
+        cleanupInferredStack(candidate);
+
+        for (std::size_t i = candidate.inferredStack.size(); i > 0U; --i)
+        {
+            InferredFrame &frame = candidate.inferredStack[i - 1U];
+            const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
+            const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
+            if (remainingCalls.has_value() && *remainingCalls == 0U)
+            {
+                continue;
+            }
+
+            if (!expected.empty())
+            {
+                return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}', which next expects one of [{3}]",
+                                     event.lineNumber,
+                                     eventToken,
+                                     frame.functionName,
+                                     joinNames(expected))
+                    .str();
+            }
+
+            if (!remainingCalls.has_value())
+            {
+                return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}', whose CFG completion state could not be proven",
+                                     event.lineNumber,
+                                     eventToken,
+                                     frame.functionName)
+                    .str();
+            }
+
+            return llvm::formatv("line {0}: token '{1}' was blocked by active nested callee '{2}'",
+                                 event.lineNumber,
+                                 eventToken,
+                                 frame.functionName)
+                .str();
+        }
+
+        if (!candidate.explicitFrames.empty())
+        {
+            InferredFrame &frame = candidate.explicitFrames.back();
+            const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
+            if (!expected.empty())
+            {
+                return llvm::formatv("line {0}: top active context '{1}' could not call token '{2}'; next CFG-observable callees are [{3}]",
+                                     event.lineNumber,
+                                     frame.functionName,
+                                     eventToken,
+                                     joinNames(expected))
+                    .str();
+            }
+
+            const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
+            if (remainingCalls.has_value() && *remainingCalls == 0U)
+            {
+                return llvm::formatv("line {0}: top active context '{1}' had no remaining CFG calls, so token '{2}' cannot belong to it",
+                                     event.lineNumber,
+                                     frame.functionName,
+                                     eventToken)
+                    .str();
+            }
+        }
+
+        if (candidate.contextStack.empty())
+        {
+            return llvm::formatv("line {0}: token '{1}' appeared with no active context",
+                                 event.lineNumber,
+                                 eventToken)
+                .str();
+        }
+
+        return llvm::formatv("line {0}: token '{1}' had no CFG-feasible active caller",
+                             event.lineNumber,
+                             eventToken)
+            .str();
+    }
+
+    std::optional<std::string> describeContextExitIncompatibility(
+        const ContextRun &run,
+        const std::vector<Event> &events,
+        PathState &candidate,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+    {
+        if (run.endEventIndex >= events.size())
+        {
+            return std::nullopt;
+        }
+
+        const Event &event = events[run.endEventIndex];
+        if (event.kind != EventKind::Exit || event.baseName != run.entrypoint)
+        {
+            return std::nullopt;
+        }
+
+        cleanupInferredStack(candidate);
+
+        for (std::size_t i = candidate.inferredStack.size(); i > 0U; --i)
+        {
+            InferredFrame &frame = candidate.inferredStack[i - 1U];
+            const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
+            if (!remainingCalls.has_value())
+            {
+                return llvm::formatv("line {0}: could not prove nested callee '{1}' can return before exit marker '{2}'",
+                                     event.lineNumber,
+                                     frame.functionName,
+                                     event.rawToken)
+                    .str();
+            }
+
+            if (*remainingCalls > 0U)
+            {
+                return llvm::formatv("line {0}: nested callee '{1}' still needs {2} CFG call(s) before exit marker '{3}' can close '{4}'",
+                                     event.lineNumber,
+                                     frame.functionName,
+                                     *remainingCalls,
+                                     event.rawToken,
+                                     event.baseName)
+                    .str();
+            }
+        }
+
+        if (candidate.explicitFrames.empty() || candidate.explicitFrames.back().functionName != event.baseName)
+        {
+            return llvm::formatv("line {0}: internal frame state for exit marker '{1}' did not match active context '{2}'",
+                                 event.lineNumber,
+                                 event.rawToken,
+                                 event.baseName)
+                .str();
+        }
+
+        const std::optional<std::size_t> remainingCalls =
+            minimumRemainingCallsToExit(candidate.explicitFrames.back(), cfgByFunction);
+        if (!remainingCalls.has_value())
+        {
+            return llvm::formatv("line {0}: could not prove CFG exit reachability for '{1}' at exit marker '{2}'",
+                                 event.lineNumber,
+                                 event.baseName,
+                                 event.rawToken)
+                .str();
+        }
+
+        if (*remainingCalls > 0U)
+        {
+            return llvm::formatv("line {0}: exit marker '{1}' closed '{2}' before {3} remaining CFG call(s) were observed",
+                                 event.lineNumber,
+                                 event.rawToken,
+                                 event.baseName,
+                                 *remainingCalls)
+                .str();
+        }
+
+        return std::nullopt;
+    }
+
+    std::vector<ContextProcessingEvent> buildContextProcessingEvents(
+        const std::vector<Event> &events,
+        const ContextRun &run,
+        const std::unordered_map<std::string, const ContextRun *> &runById,
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee)
+    {
+        std::vector<ContextProcessingEvent> processingEvents;
+        processingEvents.reserve(run.ownedEventIndices.size() + run.childContextIds.size());
+
+        for (const std::size_t eventIndex : run.ownedEventIndices)
+        {
+            if (eventIndex >= events.size())
+            {
+                continue;
+            }
+
+            const Event &event = events[eventIndex];
+            if (event.kind != EventKind::Plain)
+            {
+                continue;
+            }
+
+            ContextProcessingEvent processingEvent;
+            processingEvent.eventIndex = eventIndex;
+            processingEvent.lineNumber = event.lineNumber;
+            processingEvent.token = &event.baseName;
+            processingEvents.push_back(std::move(processingEvent));
+        }
+
+        for (const std::string &childContextId : run.childContextIds)
+        {
+            const auto childIt = runById.find(childContextId);
+            if (childIt == runById.end() || childIt->second == nullptr)
+            {
+                continue;
+            }
+
+            const ContextRun &childRun = *childIt->second;
+            if (callersByCallee.find(childRun.entrypoint) == callersByCallee.end())
+            {
+                continue;
+            }
+            if (childRun.startEventIndex >= events.size())
+            {
+                continue;
+            }
+
+            ContextProcessingEvent processingEvent;
+            processingEvent.eventIndex = childRun.startEventIndex;
+            processingEvent.lineNumber = events[childRun.startEventIndex].lineNumber;
+            processingEvent.token = &childRun.entrypoint;
+            processingEvent.entersContext = true;
+            processingEvent.relatedContextId = &childRun.contextId;
+            processingEvents.push_back(std::move(processingEvent));
+        }
+
+        std::sort(processingEvents.begin(), processingEvents.end(), [](const ContextProcessingEvent &lhs, const ContextProcessingEvent &rhs)
+                  {
+            if (lhs.eventIndex != rhs.eventIndex)
+            {
+                return lhs.eventIndex < rhs.eventIndex;
+            }
+            if (lhs.entersContext != rhs.entersContext)
+            {
+                return lhs.entersContext;
+            }
+            return contextEventToken(lhs) < contextEventToken(rhs); });
+        return processingEvents;
+    }
+
+    ContextRun materializeContextRunFromPath(const ContextRun &baseRun, const PathState &path)
+    {
+        ContextRun run = baseRun;
+        run.calls.clear();
+        run.calls.reserve(path.assignments.size());
+        for (const Assignment &assignment : path.assignments)
+        {
+            ContextCall call;
+            call.eventIndex = assignment.eventIndex;
+            call.lineNumber = assignment.lineNumber;
+            call.caller = assignment.chosenCaller;
+            call.callerDepth = assignment.chosenCallerDepth;
+            call.callee = assignment.token;
+            call.ambiguous = assignment.ambiguous;
+            call.usedStaticEdge = assignment.usedStaticEdge;
+            call.deltaScore = assignment.deltaScore;
+            call.entersContext = assignment.entersContext;
+            call.relatedContextId = assignment.relatedContextId;
+            run.calls.push_back(std::move(call));
+        }
+        return run;
+    }
+
+    PathState mergeIndependentPaths(const std::vector<const PathState *> &parts)
+    {
+        PathState merged;
+        for (const PathState *part : parts)
+        {
+            if (part == nullptr)
+            {
+                continue;
+            }
+
+            merged.score += part->score;
+            merged.nodes.insert(part->nodes.begin(), part->nodes.end());
+            merged.assignments.insert(merged.assignments.end(), part->assignments.begin(), part->assignments.end());
+            merged.warnings.insert(merged.warnings.end(), part->warnings.begin(), part->warnings.end());
+            for (const auto &edgeEntry : part->edgeCounts)
+            {
+                merged.edgeCounts[edgeEntry.first] += edgeEntry.second;
+            }
+        }
+
+        std::sort(merged.assignments.begin(), merged.assignments.end(), [](const Assignment &lhs, const Assignment &rhs)
+                  {
+            if (lhs.eventIndex != rhs.eventIndex)
+            {
+                return lhs.eventIndex < rhs.eventIndex;
+            }
+            if (lhs.contextId != rhs.contextId)
+            {
+                return lhs.contextId < rhs.contextId;
+            }
+            if (lhs.chosenCaller != rhs.chosenCaller)
+            {
+                return lhs.chosenCaller < rhs.chosenCaller;
+            }
+            return lhs.token < rhs.token; });
+        return merged;
+    }
+
+    bool processSingleContextAttempt(
+        const std::vector<Event> &events,
+        const ContextRun &run,
+        const std::unordered_map<std::string, const ContextRun *> &runById,
+        const std::set<std::string> &entrypoints,
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+        const RuntimeAnalysisOptions &options,
+        std::size_t lookaheadPlainEvents,
+        ContextAnalysisResult &result)
+    {
+        result = ContextAnalysisResult();
+        result.run = run;
+
+        std::vector<ContextProcessingEvent> processingEvents =
+            buildContextProcessingEvents(events, run, runById, callersByCallee);
+        result.localEventCount = processingEvents.size();
+        result.processedEventCount = processingEvents.size();
+        result.effectiveLookaheadPlainEvents =
+            computeEffectiveLookahead(processingEvents.size(), lookaheadPlainEvents);
+        const std::size_t traceInterval = computeTraceInterval(processingEvents.size());
+
+        logRuntimeTrace(
+            llvm::formatv("[runtime] context start id={0} entrypoint={1} events={2} lookahead={3}",
+                          run.contextId,
+                          run.entrypoint,
+                          processingEvents.size(),
+                          result.effectiveLookaheadPlainEvents)
+                .str());
+
+        std::vector<PathState> activePaths(1U);
+        PathState &initialPath = activePaths.front();
+        initialPath.edgeCounts.reserve(processingEvents.size());
+        initialPath.nodes.reserve(processingEvents.size() + 1U);
+        initialPath.assignments.reserve(processingEvents.size());
+        initialPath.contextStack.push_back(run.entrypoint);
+        initialPath.nodes.insert(run.entrypoint);
+
+        InferredFrame explicitFrame;
+        explicitFrame.functionName = run.entrypoint;
+        explicitFrame.explicitDepthAnchor = 1U;
+        (void)seedFrameForFunction(explicitFrame, run.entrypoint, cfgByFunction);
+        explicitFrame.functionName = run.entrypoint;
+        explicitFrame.explicitDepthAnchor = 1U;
+        initialPath.explicitFrames.push_back(std::move(explicitFrame));
+
+        const std::size_t branchLimit = std::max<std::size_t>(1U, options.topK);
+
+        auto noteInvalidation = [&](const std::string &reason,
+                                    const PathState &candidate,
+                                    std::unordered_map<std::string, std::size_t> &failureReasons,
+                                    std::vector<RuntimeFailureExample> &failureExamples)
+        {
+            ++failureReasons[reason];
+
+            constexpr std::size_t kMaxFailureExamples = 6U;
+            if (failureExamples.size() >= kMaxFailureExamples)
+            {
+                return;
+            }
+
+            RuntimeFailureExample example;
+            example.reason = reason;
+            example.score = candidate.score;
+            example.contextSummary = summarizeFrames(candidate.contextStack);
+            example.activeCallerSummary = summarizeFrames(buildActiveCallerOrder(candidate));
+            example.assignmentSummary = summarizeRecentAssignments(candidate);
+            failureExamples.push_back(std::move(example));
+        };
+
+        const auto rankActiveCaller = [](const ActiveCaller &lhs, const ActiveCaller &rhs)
+        {
+            if (lhs.depth != rhs.depth)
+            {
+                return lhs.depth < rhs.depth;
+            }
+            const std::string &lhsName = activeCallerName(lhs);
+            const std::string &rhsName = activeCallerName(rhs);
+            if (lhsName != rhsName)
+            {
+                return lhsName < rhsName;
+            }
+            if (lhs.isInferred != rhs.isInferred)
+            {
+                return lhs.isInferred;
+            }
+            if (lhs.frameIndex != rhs.frameIndex)
+            {
+                return lhs.frameIndex < rhs.frameIndex;
+            }
+            return false;
+        };
+
+        for (std::size_t cursor = 0U; cursor < processingEvents.size(); ++cursor)
+        {
+            const ContextProcessingEvent &event = processingEvents[cursor];
+            const std::string &eventToken = contextEventToken(event);
+            const std::string &relatedContextId = contextEventRelatedContextId(event);
+            std::unordered_map<std::string, std::size_t> invalidationReasonsForEvent;
+            std::vector<RuntimeFailureExample> invalidationExamplesForEvent;
+
+            std::vector<PathState> nextPaths;
+            nextPaths.reserve(activePaths.size() * branchLimit + 1U);
+            for (PathState &path : activePaths)
+            {
+                PathState prepared = std::move(path);
+                std::vector<ActiveCaller> activeCallers = buildFeasibleActiveCallers(prepared, eventToken, cfgByFunction);
+
+                if (activeCallers.empty())
+                {
+                    noteInvalidation(
+                        describeNoCfgCaller(event, prepared, cfgByFunction),
+                        prepared,
+                        invalidationReasonsForEvent,
+                        invalidationExamplesForEvent);
+                    continue;
+                }
+
+                std::vector<ActiveCaller> staticCandidates;
+                std::copy_if(
+                    activeCallers.begin(),
+                    activeCallers.end(),
+                    std::back_inserter(staticCandidates),
+                    [&](const ActiveCaller &candidate)
+                    {
+                        return callerMatchesStaticCallee(callersByCallee, activeCallerName(candidate), eventToken);
+                    });
+
+                if (staticCandidates.empty())
+                {
+                    noteInvalidation(
+                        llvm::formatv("line {0}: token '{1}' had CFG-feasible callers, but none matched the static callgraph",
+                                      event.lineNumber,
+                                      eventToken)
+                            .str(),
+                        prepared,
+                        invalidationReasonsForEvent,
+                        invalidationExamplesForEvent);
+                    continue;
+                }
+
+                std::vector<ActiveCaller> &candidates = staticCandidates;
+                if (candidates.size() > 1U)
+                {
+                    retainMostImmediateCandidates(candidates, rankActiveCaller);
+                }
+
+                auto candidateNames = std::make_shared<std::vector<std::string>>();
+                candidateNames->reserve(candidates.size());
+                std::transform(
+                    candidates.begin(),
+                    candidates.end(),
+                    std::back_inserter(*candidateNames),
+                    [](const ActiveCaller &candidate)
+                    { return activeCallerName(candidate); });
+
+                if (candidates.size() > 1U && result.effectiveLookaheadPlainEvents > 0U)
+                {
+                    const std::vector<ActiveCaller> originalCandidates = candidates;
+                    struct LookaheadCandidate
+                    {
+                        ActiveCaller caller;
+                        bool feasible = true;
+                        std::size_t frontierWidth = static_cast<std::size_t>(-1);
+                    };
+
+                    std::vector<LookaheadCandidate> lookaheadCandidates;
+                    lookaheadCandidates.reserve(candidates.size());
+                    std::transform(
+                        candidates.begin(),
+                        candidates.end(),
+                        std::back_inserter(lookaheadCandidates),
+                        [](const ActiveCaller &candidate)
+                        { return LookaheadCandidate{candidate, true}; });
+
+                    for (LookaheadCandidate &entry : lookaheadCandidates)
+                    {
+                        PathState probe = prepared;
+                        updateInferredStackAfterAssignment(
+                            probe,
+                            entry.caller,
+                            eventToken,
+                            entrypoints,
+                            cfgByFunction);
+
+                        std::vector<PathState> probeStates;
+                        probeStates.push_back(std::move(probe));
+
+                        std::size_t inspectedEvents = 0U;
+                        for (std::size_t futureIndex = cursor + 1U;
+                             futureIndex < processingEvents.size() &&
+                             inspectedEvents < result.effectiveLookaheadPlainEvents;
+                             ++futureIndex)
+                        {
+                            const ContextProcessingEvent &futureEvent = processingEvents[futureIndex];
+                            const std::string &futureEventToken = contextEventToken(futureEvent);
+                            ++inspectedEvents;
+
+                            std::vector<PathState> nextProbeStates;
+                            for (PathState &probeState : probeStates)
+                            {
+                                std::vector<ActiveCaller> futureActiveCallers =
+                                    buildFeasibleActiveCallers(probeState, futureEventToken, cfgByFunction);
+                                if (futureActiveCallers.empty())
+                                {
+                                    continue;
+                                }
+
+                                std::vector<ActiveCaller> futureStaticCandidates;
+                                std::copy_if(
+                                    futureActiveCallers.begin(),
+                                    futureActiveCallers.end(),
+                                    std::back_inserter(futureStaticCandidates),
+                                    [&](const ActiveCaller &futureCandidate)
+                                    {
+                                        return callerMatchesStaticCallee(
+                                            callersByCallee,
+                                            activeCallerName(futureCandidate),
+                                            futureEventToken);
+                                    });
+
+                                if (futureStaticCandidates.empty())
+                                {
+                                    continue;
+                                }
+
+                                retainMostImmediateCandidates(futureStaticCandidates, rankActiveCaller);
+                                if (futureStaticCandidates.size() > branchLimit)
+                                {
+                                    futureStaticCandidates.resize(branchLimit);
+                                }
+
+                                for (const ActiveCaller &futureCaller : futureStaticCandidates)
+                                {
+                                    PathState nextProbe = probeState;
+                                    addEdge(nextProbe, activeCallerName(futureCaller), futureEventToken);
+                                    updateInferredStackAfterAssignment(
+                                        nextProbe,
+                                        futureCaller,
+                                        futureEventToken,
+                                        entrypoints,
+                                        cfgByFunction);
+                                    nextProbeStates.push_back(std::move(nextProbe));
+                                }
+                            }
+
+                            if (nextProbeStates.empty())
+                            {
+                                entry.feasible = false;
+                                break;
+                            }
+
+                            mergeEquivalentPathStates(nextProbeStates);
+                            pruneTopK(nextProbeStates, branchLimit);
+                            probeStates.swap(nextProbeStates);
+                        }
+
+                        if (entry.feasible)
+                        {
+                            entry.frontierWidth = probeStates.size();
+                        }
+                    }
+
+                    candidates.clear();
+                    std::size_t bestFrontierWidth = static_cast<std::size_t>(-1);
+                    for (const LookaheadCandidate &entry : lookaheadCandidates)
+                    {
+                        if (entry.feasible)
+                        {
+                            bestFrontierWidth = std::min(bestFrontierWidth, entry.frontierWidth);
+                        }
+                    }
+
+                    if (bestFrontierWidth == static_cast<std::size_t>(-1))
+                    {
+                        candidates = originalCandidates;
+                    }
+                    else
+                    {
+                        for (const LookaheadCandidate &entry : lookaheadCandidates)
+                        {
+                            if (entry.feasible && entry.frontierWidth == bestFrontierWidth)
+                            {
+                                candidates.push_back(entry.caller);
+                            }
+                        }
+                    }
+
+                    candidateNames = std::make_shared<std::vector<std::string>>();
+                    candidateNames->reserve(candidates.size());
+                    std::transform(
+                        candidates.begin(),
+                        candidates.end(),
+                        std::back_inserter(*candidateNames),
+                        [](const ActiveCaller &candidate)
+                        { return activeCallerName(candidate); });
+                }
+
+                const bool tiedBest = candidates.size() > 1U;
+                if (candidates.size() > branchLimit)
+                {
+                    candidates.resize(branchLimit);
+                }
+
+                for (std::size_t candidateRank = 0U; candidateRank < candidates.size(); ++candidateRank)
+                {
+                    const ActiveCaller &caller = candidates[candidateRank];
+                    PathState next = prepared;
+                    addEdge(next, activeCallerName(caller), eventToken);
+
+                    const double deltaScore = static_cast<double>(candidateRank) * 0.25;
+                    next.score += deltaScore;
+
+                    Assignment assignment;
+                    assignment.eventIndex = event.eventIndex;
+                    assignment.lineNumber = event.lineNumber;
+                    assignment.contextId = run.contextId;
+                    assignment.token = eventToken;
+                    assignment.candidates = candidateNames;
+                    assignment.chosenCaller = activeCallerName(caller);
+                    assignment.chosenCallerDepth = caller.depth;
+                    assignment.ambiguous = tiedBest;
+                    assignment.usedStaticEdge = true;
+                    assignment.deltaScore = deltaScore;
+                    assignment.entersContext = event.entersContext;
+                    assignment.relatedContextId = relatedContextId;
+                    next.assignments.push_back(std::move(assignment));
+
+                    updateInferredStackAfterAssignment(
+                        next,
+                        caller,
+                        eventToken,
+                        entrypoints,
+                        cfgByFunction);
+
+                    nextPaths.push_back(std::move(next));
+                }
+            }
+
+            result.pathExpansionCount += nextPaths.size();
+            mergeEquivalentPathStates(nextPaths);
+            pruneTopK(nextPaths, branchLimit);
+            activePaths.swap(nextPaths);
+
+            if (traceInterval != 0U &&
+                (((cursor + 1U) % traceInterval) == 0U || (cursor + 1U) == processingEvents.size()))
+            {
+                logRuntimeTrace(
+                    llvm::formatv("[runtime] context progress id={0} processed={1}/{2} active_paths={3} expansions={4}",
+                                  run.contextId,
+                                  cursor + 1U,
+                                  processingEvents.size(),
+                                  activePaths.size(),
+                                  result.pathExpansionCount)
+                        .str());
+            }
+
+            if (activePaths.empty())
+            {
+                result.failureEventIndex = event.eventIndex;
+                result.failureEvent.lineNumber = event.lineNumber;
+                result.failureEvent.baseName = eventToken;
+                result.failureEvent.kind = EventKind::Plain;
+                result.failureReasons = std::move(invalidationReasonsForEvent);
+                result.failureExamples = std::move(invalidationExamplesForEvent);
+                logRuntimeTrace(
+                    llvm::formatv("[runtime] context failed id={0} line={1} token={2} reasons={3}",
+                                  run.contextId,
+                                  result.failureEvent.lineNumber,
+                                  result.failureEvent.baseName,
+                                  result.failureReasons.size())
+                        .str());
+                return false;
+            }
+        }
+
+        if (run.endEventIndex < events.size())
+        {
+            std::vector<PathState> exitValidatedPaths;
+            exitValidatedPaths.reserve(activePaths.size());
+            std::unordered_map<std::string, std::size_t> invalidationReasonsForExit;
+            std::vector<RuntimeFailureExample> invalidationExamplesForExit;
+
+            for (PathState &path : activePaths)
+            {
+                PathState next = std::move(path);
+                if (const std::optional<std::string> incompatibility =
+                        describeContextExitIncompatibility(run, events, next, cfgByFunction))
+                {
+                    noteInvalidation(
+                        *incompatibility,
+                        next,
+                        invalidationReasonsForExit,
+                        invalidationExamplesForExit);
+                    continue;
+                }
+
+                next.contextStack.clear();
+                next.explicitFrames.clear();
+                next.inferredStack.clear();
+                next.suspendedInferredStacks.clear();
+                exitValidatedPaths.push_back(std::move(next));
+            }
+
+            if (!exitValidatedPaths.empty())
+            {
+                mergeEquivalentPathStates(exitValidatedPaths);
+                pruneTopK(exitValidatedPaths, branchLimit);
+                activePaths.swap(exitValidatedPaths);
+            }
+            else if (!invalidationReasonsForExit.empty())
+            {
+                result.failureEventIndex = run.endEventIndex;
+                result.failureEvent = events[run.endEventIndex];
+                result.failureReasons = std::move(invalidationReasonsForExit);
+                result.failureExamples = std::move(invalidationExamplesForExit);
+                logRuntimeTrace(
+                    llvm::formatv("[runtime] context failed id={0} line={1} token={2} reasons={3}",
+                                  run.contextId,
+                                  result.failureEvent.lineNumber,
+                                  result.failureEvent.rawToken,
+                                  result.failureReasons.size())
+                        .str());
+                return false;
+            }
+        }
+
+        for (PathState &path : activePaths)
+        {
+            path.contextStack.clear();
+            path.explicitFrames.clear();
+            path.inferredStack.clear();
+            path.suspendedInferredStacks.clear();
+        }
+
+        mergeEquivalentPathStates(activePaths);
+        pruneTopK(activePaths, branchLimit);
+        result.candidatePaths = std::move(activePaths);
+        if (!result.candidatePaths.empty())
+        {
+            result.run = materializeContextRunFromPath(run, result.candidatePaths.front());
+        }
+        logRuntimeTrace(
+            llvm::formatv("[runtime] context done id={0} candidate_paths={1} expansions={2} best_score={3}",
+                          run.contextId,
+                          result.candidatePaths.size(),
+                          result.pathExpansionCount,
+                          result.candidatePaths.empty() ? 0.0 : result.candidatePaths.front().score)
+                .str());
+        return !result.candidatePaths.empty();
+    }
+
+    bool processSingleContext(
+        const std::vector<Event> &events,
+        const ContextRun &run,
+        const std::unordered_map<std::string, const ContextRun *> &runById,
+        const std::set<std::string> &entrypoints,
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+        const RuntimeAnalysisOptions &options,
+        ContextAnalysisResult &result)
+    {
+        const std::vector<std::size_t> lookaheadSchedule =
+            buildAdaptiveLookaheadSchedule(options.lookaheadPlainEvents);
+
+        ContextAnalysisResult lastFailure;
+        bool hasFailure = false;
+        std::optional<std::size_t> lastEffectiveAttemptLookahead;
+        std::optional<std::size_t> knownEventCount;
+        for (std::size_t attemptIndex = 0U; attemptIndex < lookaheadSchedule.size(); ++attemptIndex)
+        {
+            if (knownEventCount.has_value() && lastEffectiveAttemptLookahead.has_value())
+            {
+                const std::size_t expectedEffectiveLookahead =
+                    computeEffectiveLookahead(*knownEventCount, lookaheadSchedule[attemptIndex]);
+                if (expectedEffectiveLookahead == *lastEffectiveAttemptLookahead)
+                {
+                    continue;
+                }
+            }
+
+            ContextAnalysisResult attemptResult;
+            const std::size_t attemptLookahead = lookaheadSchedule[attemptIndex];
+            const bool success = processSingleContextAttempt(
+                events,
+                run,
+                runById,
+                entrypoints,
+                callersByCallee,
+                cfgByFunction,
+                options,
+                attemptLookahead,
+                attemptResult);
+            knownEventCount = attemptResult.localEventCount;
+            lastEffectiveAttemptLookahead = attemptResult.effectiveLookaheadPlainEvents;
+            if (success)
+            {
+                if (attemptIndex > 0U)
+                {
+                    logRuntimeTrace(
+                        llvm::formatv("[runtime] context recovered id={0} lookahead={1}",
+                                      run.contextId,
+                                      attemptResult.effectiveLookaheadPlainEvents)
+                            .str());
+                }
+                result = std::move(attemptResult);
+                return true;
+            }
+
+            hasFailure = true;
+            lastFailure = std::move(attemptResult);
+            if (attemptIndex + 1U < lookaheadSchedule.size())
+            {
+                logRuntimeTrace(
+                    llvm::formatv("[runtime] context retry id={0} next_lookahead={1} previous_failure_line={2}",
+                                  run.contextId,
+                                  lookaheadSchedule[attemptIndex + 1U],
+                                  lastFailure.failureEvent.lineNumber)
+                        .str());
+            }
+        }
+
+        if (hasFailure)
+        {
+            result = std::move(lastFailure);
+        }
+        return false;
+    }
+
+    std::string buildContextFailureMessage(const ContextAnalysisResult &result)
+    {
+        std::ostringstream out;
+        out << "context '" << result.run.contextId << "' failed to produce a valid runtime path";
+        if (result.failureEventIndex != static_cast<std::size_t>(-1))
+        {
+            out << " at line " << result.failureEvent.lineNumber
+                << " token '"
+                << (result.failureEvent.kind == EventKind::Plain ? result.failureEvent.baseName : result.failureEvent.rawToken)
+                << "'";
+        }
+
+        std::vector<std::pair<std::string, std::size_t>> sortedReasons(
+            result.failureReasons.begin(),
+            result.failureReasons.end());
+        std::sort(sortedReasons.begin(), sortedReasons.end(), [](const auto &lhs, const auto &rhs)
+                  {
+            if (lhs.second != rhs.second)
+            {
+                return lhs.second > rhs.second;
+            }
+            return lhs.first < rhs.first; });
+
+        for (const auto &entry : sortedReasons)
+        {
+            out << "\n  - rejected " << entry.second << " path(s): " << entry.first;
+        }
+
+        for (std::size_t i = 0U; i < result.failureExamples.size(); ++i)
+        {
+            const RuntimeFailureExample &example = result.failureExamples[i];
+            out << "\n  example " << (i + 1U) << ":";
+            out << "\n    score before rejection: " << example.score;
+            out << "\n    reason: " << example.reason;
+            out << "\n    context stack: " << example.contextSummary;
+            out << "\n    active callers: " << example.activeCallerSummary;
+            out << "\n    recent assignments: " << example.assignmentSummary;
+        }
+        return out.str();
+    }
+}
+
+bool analyzeContexts(
+    const std::vector<Event> &events,
+    const std::vector<ContextRun> &runs,
+    const std::set<std::string> &entrypoints,
+    const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+    const RuntimeAnalysisOptions &options,
+    RuntimeAnalysisResult &result,
+    std::string &error)
+{
+    result = RuntimeAnalysisResult();
+    result.contexts.resize(runs.size());
+
+    if (runs.empty())
+    {
+        PathState empty;
+        result.candidatePaths.push_back(std::move(empty));
+        return true;
+    }
+
+    std::unordered_map<std::string, const ContextRun *> runById;
+    runById.reserve(runs.size() * 2U + 1U);
+    for (const ContextRun &run : runs)
+    {
+        runById[run.contextId] = &run;
+    }
+
+    std::atomic<std::size_t> nextRunIndex(0U);
+    std::atomic<bool> failed(false);
+    std::mutex errorMutex;
+
+    const std::size_t requestedJobs = options.contextJobs == 0U
+                                          ? std::max<std::size_t>(1U, std::thread::hardware_concurrency())
+                                          : options.contextJobs;
+    const std::size_t workerCount = std::min<std::size_t>(std::max<std::size_t>(1U, requestedJobs), runs.size());
+
+    auto worker = [&]()
+    {
+        while (!failed.load())
+        {
+            const std::size_t runIndex = nextRunIndex.fetch_add(1U);
+            if (runIndex >= runs.size())
+            {
+                return;
+            }
+
+            ContextAnalysisResult localResult;
+            const bool success = processSingleContext(
+                events,
+                runs[runIndex],
+                runById,
+                entrypoints,
+                callersByCallee,
+                cfgByFunction,
+                options,
+                localResult);
+
+            result.contexts[runIndex] = std::move(localResult);
+            if (!success)
+            {
+                std::lock_guard<std::mutex> lock(errorMutex);
+                if (error.empty())
+                {
+                    error = buildContextFailureMessage(result.contexts[runIndex]);
+                }
+                failed.store(true);
+                return;
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve(workerCount);
+    for (std::size_t i = 0U; i < workerCount; ++i)
+    {
+        workers.emplace_back(worker);
+    }
+    for (std::thread &thread : workers)
+    {
+        thread.join();
+    }
+
+    if (failed.load())
+    {
+        return false;
+    }
+
+    result.processedEventCount = 0U;
+    result.pathExpansionCount = 0U;
+    for (const ContextAnalysisResult &contextResult : result.contexts)
+    {
+        result.processedEventCount += contextResult.processedEventCount;
+        result.pathExpansionCount += contextResult.pathExpansionCount;
+    }
+
+    auto selectionScore = [&](const std::vector<std::size_t> &indices) -> double
+    {
+        double score = 0.0;
+        for (std::size_t i = 0U; i < indices.size(); ++i)
+        {
+            score += result.contexts[i].candidatePaths[indices[i]].score;
+        }
+        return score;
+    };
+
+    std::vector<CombinedContextSelection> selections;
+    selections.reserve(std::max<std::size_t>(1U, options.topK));
+
+    std::priority_queue<
+        CombinedContextSelection,
+        std::vector<CombinedContextSelection>,
+        std::function<bool(const CombinedContextSelection &, const CombinedContextSelection &)>>
+        queue([](const CombinedContextSelection &lhs, const CombinedContextSelection &rhs)
+              {
+            if (lhs.score != rhs.score)
+            {
+                return lhs.score > rhs.score;
+            }
+            return lhs.indices > rhs.indices; });
+
+    std::unordered_set<std::string> seenSelections;
+    std::vector<std::size_t> initialIndices(runs.size(), 0U);
+    queue.push(CombinedContextSelection{initialIndices, selectionScore(initialIndices)});
+    seenSelections.insert(encodeSelectionKey(initialIndices));
+
+    while (!queue.empty() && selections.size() < std::max<std::size_t>(1U, options.topK))
+    {
+        CombinedContextSelection current = queue.top();
+        queue.pop();
+        selections.push_back(current);
+
+        for (std::size_t runIndex = 0U; runIndex < runs.size(); ++runIndex)
+        {
+            std::vector<std::size_t> nextIndices = current.indices;
+            if (nextIndices[runIndex] + 1U >= result.contexts[runIndex].candidatePaths.size())
+            {
+                continue;
+            }
+
+            ++nextIndices[runIndex];
+            const std::string key = encodeSelectionKey(nextIndices);
+            if (!seenSelections.insert(key).second)
+            {
+                continue;
+            }
+
+            queue.push(CombinedContextSelection{std::move(nextIndices), selectionScore(current.indices) -
+                                                                             result.contexts[runIndex].candidatePaths[current.indices[runIndex]].score +
+                                                                             result.contexts[runIndex].candidatePaths[current.indices[runIndex] + 1U].score});
+        }
+    }
+
+    for (const CombinedContextSelection &selection : selections)
+    {
+        result.candidateSelections.push_back(selection.indices);
+        std::vector<const PathState *> parts;
+        parts.reserve(selection.indices.size());
+        for (std::size_t i = 0U; i < selection.indices.size(); ++i)
+        {
+            parts.push_back(&result.contexts[i].candidatePaths[selection.indices[i]]);
+        }
+        result.candidatePaths.push_back(mergeIndependentPaths(parts));
+    }
+
+    if (result.candidatePaths.empty())
+    {
+        error = "no merged runtime paths were produced";
+        return false;
+    }
+
+    const std::vector<std::size_t> &bestSelection = selections.front().indices;
+    result.bestContextRuns.reserve(bestSelection.size());
+    for (std::size_t i = 0U; i < bestSelection.size(); ++i)
+    {
+        result.bestContextRuns.push_back(
+            materializeContextRunFromPath(runs[i], result.contexts[i].candidatePaths[bestSelection[i]]));
+    }
+
+    return true;
+}
+
+ContextRun materializeContextRun(const ContextRun &baseRun, const PathState &path)
+{
+    return materializeContextRunFromPath(baseRun, path);
+}
+
 // ============================================================================
 // JSON serialization
 // ============================================================================
@@ -1371,7 +2890,9 @@ void addEdge(PathState &path, const std::string &caller, const std::string &call
 llvm::json::Object assignmentToJson(const Assignment &assignment)
 {
     llvm::json::Object object;
+    object["eventIndex"] = static_cast<std::int64_t>(assignment.eventIndex);
     object["line"] = static_cast<std::int64_t>(assignment.lineNumber);
+    object["contextId"] = assignment.contextId;
     object["token"] = assignment.token;
     object["chosenCaller"] = assignment.chosenCaller;
     if (assignment.chosenCallerDepth.has_value())
@@ -1381,12 +2902,20 @@ llvm::json::Object assignmentToJson(const Assignment &assignment)
     object["ambiguous"] = assignment.ambiguous;
     object["usedStaticEdge"] = assignment.usedStaticEdge;
     object["deltaScore"] = assignment.deltaScore;
+    object["entersContext"] = assignment.entersContext;
+    if (!assignment.relatedContextId.empty())
+    {
+        object["relatedContextId"] = assignment.relatedContextId;
+    }
 
     llvm::json::Array candidates;
-    std::copy(
-        assignment.candidates.begin(),
-        assignment.candidates.end(),
-        std::back_inserter(candidates));
+    if (assignment.candidates != nullptr)
+    {
+        std::copy(
+            assignment.candidates->begin(),
+            assignment.candidates->end(),
+            std::back_inserter(candidates));
+    }
     object["candidates"] = std::move(candidates);
     return object;
 }
@@ -1461,6 +2990,11 @@ llvm::json::Object contextCallToJson(const ContextCall &call)
     object["ambiguous"] = call.ambiguous;
     object["usedStaticEdge"] = call.usedStaticEdge;
     object["deltaScore"] = call.deltaScore;
+    object["entersContext"] = call.entersContext;
+    if (!call.relatedContextId.empty())
+    {
+        object["relatedContextId"] = call.relatedContextId;
+    }
     return object;
 }
 
@@ -1469,10 +3003,22 @@ llvm::json::Object contextRunToJson(const ContextRun &run, std::size_t lane)
     llvm::json::Object object;
     object["contextId"] = run.contextId;
     object["entrypoint"] = run.entrypoint;
+    if (!run.parentContextId.empty())
+    {
+        object["parentContextId"] = run.parentContextId;
+    }
     object["ordinal"] = static_cast<std::int64_t>(run.ordinal);
     object["lane"] = static_cast<std::int64_t>(lane);
     object["startEventIndex"] = static_cast<std::int64_t>(run.startEventIndex);
     object["endEventIndex"] = static_cast<std::int64_t>(run.endEventIndex);
+    object["ownedEventCount"] = static_cast<std::int64_t>(run.ownedEventIndices.size());
+
+    llvm::json::Array childContextIds;
+    std::copy(
+        run.childContextIds.begin(),
+        run.childContextIds.end(),
+        std::back_inserter(childContextIds));
+    object["childContextIds"] = std::move(childContextIds);
 
     llvm::json::Array segments;
     for (const ContextSegment &segment : run.executionSegments)
@@ -1485,6 +3031,20 @@ llvm::json::Object contextRunToJson(const ContextRun &run, std::size_t lane)
         segments.push_back(std::move(seg));
     }
     object["segments"] = std::move(segments);
+
+    llvm::json::Array temporalPoints;
+    for (const ContextTemporalPoint &point : run.temporalPoints)
+    {
+        llvm::json::Object marker;
+        marker["eventIndex"] = static_cast<std::int64_t>(point.eventIndex);
+        marker["kind"] = point.kind;
+        if (!point.relatedContextId.empty())
+        {
+            marker["relatedContextId"] = point.relatedContextId;
+        }
+        temporalPoints.push_back(std::move(marker));
+    }
+    object["temporalPoints"] = std::move(temporalPoints);
 
     llvm::json::Array calls;
     std::transform(
@@ -1621,7 +3181,7 @@ std::vector<ContextRun> buildContextRunsFromBestPath(
         run.endEventIndex = eventIndex;
 
         ContextCall call;
-        call.eventIndex = eventIndex;
+        call.eventIndex = assignment.eventIndex;
         call.lineNumber = assignment.lineNumber;
         call.caller = assignment.chosenCaller;
         call.callerDepth = assignment.chosenCallerDepth;
@@ -1629,6 +3189,8 @@ std::vector<ContextRun> buildContextRunsFromBestPath(
         call.ambiguous = assignment.ambiguous;
         call.usedStaticEdge = assignment.usedStaticEdge;
         call.deltaScore = assignment.deltaScore;
+        call.entersContext = assignment.entersContext;
+        call.relatedContextId = assignment.relatedContextId;
         run.calls.push_back(std::move(call));
     }
 

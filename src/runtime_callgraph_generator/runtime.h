@@ -6,6 +6,7 @@
 #ifndef RUNTIME_H
 #define RUNTIME_H
 
+#include <memory>
 #include <map>
 #include <optional>
 #include <set>
@@ -62,14 +63,18 @@ struct EdgeKeyHash
  */
 struct Assignment
 {
+    std::size_t eventIndex = 0U;
     std::size_t lineNumber = 0U;
+    std::string contextId;
     std::string token;
-    std::vector<std::string> candidates;
+    std::shared_ptr<const std::vector<std::string>> candidates;
     std::string chosenCaller;
     std::optional<std::size_t> chosenCallerDepth;
     bool ambiguous = false;
     bool usedStaticEdge = false;
     double deltaScore = 0.0;
+    bool entersContext = false;
+    std::string relatedContextId;
 };
 
 /**
@@ -98,6 +103,8 @@ struct InferredFrame
     bool tokenCacheValid = false;
     std::string lastCheckedToken;
     bool lastCheckedTokenFeasible = false;
+    bool remainingCallsCacheValid = false;
+    std::optional<std::size_t> cachedRemainingCallsToExit;
     std::size_t explicitDepthAnchor = 0U;
 };
 
@@ -135,7 +142,7 @@ struct RuntimeFunctionCfg
  */
 struct ActiveCaller
 {
-    std::string functionName;
+    const std::string *functionName = nullptr;
     bool isInferred = false;
     std::size_t frameIndex = 0U;
     std::size_t depth = 0U;
@@ -170,6 +177,8 @@ struct ContextCall
     bool ambiguous = false;
     bool usedStaticEdge = false;
     double deltaScore = 0.0;
+    bool entersContext = false;
+    std::string relatedContextId;
 };
 
 /**
@@ -184,18 +193,77 @@ struct ContextSegment
 };
 
 /**
+ * @brief Temporal marker for context entry/exit/interruption boundaries.
+ */
+struct ContextTemporalPoint
+{
+    std::size_t eventIndex = 0U;
+    std::string kind;
+    std::string relatedContextId;
+};
+
+/**
  * @brief A single invocation of an entrypoint.
  */
 struct ContextRun
 {
     std::string contextId;
     std::string entrypoint;
+    std::string parentContextId;
+    std::vector<std::string> childContextIds;
     std::size_t ordinal = 0U;
     std::size_t startEventIndex = 0U;
     std::size_t endEventIndex = 0U;
+    std::vector<std::size_t> ownedEventIndices;
     std::vector<ContextSegment> executionSegments;
+    std::vector<ContextTemporalPoint> temporalPoints;
     std::vector<ContextCall> calls;
     std::vector<std::string> warnings;
+};
+
+std::vector<ContextRun> preprocessContextRuns(
+    const std::vector<Event> &events,
+    const std::set<std::string> &entrypoints,
+    std::vector<std::string> &warnings);
+
+struct RuntimeAnalysisOptions
+{
+    std::size_t topK = 8U;
+    std::size_t lookaheadPlainEvents = 8U;
+    std::size_t contextJobs = 0U;
+};
+
+struct RuntimeFailureExample
+{
+    std::string reason;
+    double score = 0.0;
+    std::string contextSummary;
+    std::string activeCallerSummary;
+    std::string assignmentSummary;
+};
+
+struct ContextAnalysisResult
+{
+    ContextRun run;
+    std::vector<PathState> candidatePaths;
+    std::size_t localEventCount = 0U;
+    std::size_t processedEventCount = 0U;
+    std::size_t pathExpansionCount = 1U;
+    std::size_t effectiveLookaheadPlainEvents = 0U;
+    std::size_t failureEventIndex = static_cast<std::size_t>(-1);
+    Event failureEvent;
+    std::unordered_map<std::string, std::size_t> failureReasons;
+    std::vector<RuntimeFailureExample> failureExamples;
+};
+
+struct RuntimeAnalysisResult
+{
+    std::vector<ContextAnalysisResult> contexts;
+    std::vector<ContextRun> bestContextRuns;
+    std::vector<PathState> candidatePaths;
+    std::vector<std::vector<std::size_t>> candidateSelections;
+    std::size_t processedEventCount = 0U;
+    std::size_t pathExpansionCount = 0U;
 };
 
 // String utilities
@@ -229,6 +297,16 @@ bool loadCfgDirectCallOrder(
     const std::string &cfgAnalysisPath,
     const std::set<std::string> &blacklistedFunctions,
     std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+    std::string &error);
+
+bool analyzeContexts(
+    const std::vector<Event> &events,
+    const std::vector<ContextRun> &runs,
+    const std::set<std::string> &entrypoints,
+    const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+    const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+    const RuntimeAnalysisOptions &options,
+    RuntimeAnalysisResult &result,
     std::string &error);
 
 // Path state management
@@ -267,6 +345,7 @@ llvm::json::Object assignmentToJson(const Assignment &assignment);
 llvm::json::Object pathToJson(const PathState &path, std::size_t rank);
 llvm::json::Object contextCallToJson(const ContextCall &call);
 llvm::json::Object contextRunToJson(const ContextRun &run, std::size_t lane);
+ContextRun materializeContextRun(const ContextRun &baseRun, const PathState &path);
 
 // Context run building and visualization
 std::vector<ContextRun> buildContextRunsFromBestPath(
