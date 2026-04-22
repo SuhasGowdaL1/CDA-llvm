@@ -1,5 +1,5 @@
 #include <stdio.h>
-
+#include <stdbool.h>
 /* ===== Logging Macros ===== */
 #define LOG_ENTRY(fn) printf("%s_entry\n", fn)
 #define LOG_EXIT(fn) printf("%s_exit\n", fn)
@@ -37,6 +37,8 @@ void loglog(int x)
     if (x > 0)
         process_data();
 }
+int abc(int i) { return i; }
+bool abcd() { return true; }
 /* ===== Entry Point 3 ===== */
 void UART_ISR(void)
 {
@@ -51,24 +53,27 @@ void UART_ISR(void)
 /* ===== Entry Point 1 ===== */
 int main(void)
 {
+    int a;
     LOG_ENTRY("main");
 
     for (int i = 0; i < 2; i++)
     {
         // LOG_FUNC("main_loop");
         loglog(i);
-        process_data(); // <-- ambiguous (third place)
-
         if (i % 2 == 0)
+            abcd();
+        if (i % 3 == 0)
+            process_data(); // <-- ambiguous (third place)
+        a = (abcd() == true) ? 1 : 0;
+        if (abc(i) % 2 == 0)
         {
-            Timer_ISR();
         }
         else
         {
-            UART_ISR();
         }
     }
-
+    if (abcd() == true)
+        ;
     LOG_EXIT("main");
     return 0;
 }

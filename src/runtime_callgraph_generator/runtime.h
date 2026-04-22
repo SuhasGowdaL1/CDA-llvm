@@ -8,6 +8,7 @@
 
 #include <memory>
 #include <map>
+#include <limits>
 #include <optional>
 #include <set>
 #include <cstdint>
@@ -83,6 +84,7 @@ struct Assignment
 struct InferredFrame
 {
     std::string functionName;
+    std::uint32_t functionId = std::numeric_limits<std::uint32_t>::max();
     struct ProgramPoint
     {
         std::uint32_t blockId = 0U;
@@ -101,6 +103,7 @@ struct InferredFrame
     llvm::SmallVector<ProgramPoint, 4> activePoints;
     bool closureComputed = false;
     bool tokenCacheValid = false;
+    std::uint32_t lastCheckedTokenId = std::numeric_limits<std::uint32_t>::max();
     std::string lastCheckedToken;
     bool lastCheckedTokenFeasible = false;
     bool remainingCallsCacheValid = false;
@@ -142,7 +145,7 @@ struct RuntimeFunctionCfg
  */
 struct ActiveCaller
 {
-    const std::string *functionName = nullptr;
+    std::uint32_t functionId = std::numeric_limits<std::uint32_t>::max();
     bool isInferred = false;
     std::size_t frameIndex = 0U;
     std::size_t depth = 0U;
@@ -250,6 +253,8 @@ struct ContextAnalysisResult
     std::size_t processedEventCount = 0U;
     std::size_t pathExpansionCount = 1U;
     std::size_t effectiveLookaheadPlainEvents = 0U;
+    std::size_t lookaheadEligibleAmbiguityCount = 0U;
+    std::size_t lookaheadResolvedAmbiguityCount = 0U;
     std::size_t failureEventIndex = static_cast<std::size_t>(-1);
     Event failureEvent;
     std::unordered_map<std::string, std::size_t> failureReasons;
@@ -315,7 +320,7 @@ void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
 void suspendInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
 bool restoreSuspendedInferredFramesForDepth(PathState &path, std::size_t depth);
 std::vector<std::string> buildActiveCallerOrder(const PathState &path);
-std::vector<ActiveCaller> buildFeasibleActiveCallers(
+llvm::SmallVector<ActiveCaller, 4> buildFeasibleActiveCallers(
     PathState &path,
     const std::string &token,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction);

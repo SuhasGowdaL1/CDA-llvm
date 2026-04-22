@@ -190,7 +190,7 @@ Example:
 
 ```sh
 docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/work" -w /work cfggen:linux-build-deps -lc \
-	"./build-linux/runtime_callgraph_generator --logs input/logs.txt --entrypoints input/entrypoints.txt --static-callgraph out/callgraph.json -o out/runtime-callgraph.json --dot-output out/runtime-callgraph.dot --timeline-html out/runtime-timeline.html --context-tree-html out/runtime-context-tree.html --top-k 8"
+	"./build-linux/runtime_callgraph_generator --logs input/logs.txt --entrypoints input/entrypoints.txt --static-callgraph out/callgraph.json -o out/runtime-callgraph.json --dot-output out/runtime-callgraph.dot --timeline-html out/runtime-timeline.html --context-tree-html out/runtime-context-tree.html --top-k 8 --context-jobs 0"
 ```
 
 HTML outputs:
@@ -202,10 +202,16 @@ Optional flags:
 
 - `--timeline-html <file>`: customize timeline page output path.
 - `--context-tree-html <file>`: customize context tree page output path.
+- `--context-jobs <N>`: analyze independent entrypoint contexts in parallel (`0` = auto).
 - `--no-html`: skip HTML generation.
 
 Behavior:
 
+- Logs are preprocessed into entrypoint-scoped context runs before reconstruction.
+- Each context run is analyzed independently, preserving its local temporal order and nested interruption markers.
+- Direct child contexts that are statically callable are injected back into the parent context as synthetic call events so merged graphs retain call edges without restoring the full global stack.
+- Interrupt-style contexts that are not statically callable stay temporal-only, so asynchronous ISRs do not become false parent call edges.
+- Final candidate graphs are produced by merging the per-context candidate paths instead of reconstructing one monolithic global path.
 - `singlePathDeduced=true`: best path score is strictly better than alternatives.
 - If not uniquely deduced, output still contains multiple `candidatePaths` with scores.
 - `bestPath` always provides the chosen highest-score reconstruction.

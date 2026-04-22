@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <deque>
 #include <fstream>
 #include <functional>
@@ -23,6 +24,7 @@
 
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Support/raw_ostream.h"
 
@@ -753,9 +755,180 @@ bool loadCfgDirectCallOrder(
 
 namespace
 {
+    using RuntimeSymbolId = std::uint32_t;
+    constexpr RuntimeSymbolId kInvalidRuntimeSymbolId = std::numeric_limits<RuntimeSymbolId>::max();
+
+    struct RuntimeSymbolTable
+    {
+        llvm::StringMap<RuntimeSymbolId> idsByName;
+        std::vector<std::string> namesById;
+
+        RuntimeSymbolId intern(const std::string &name)
+        {
+            const auto existing = idsByName.find(name);
+            if (existing != idsByName.end())
+            {
+                return existing->second;
+            }
+
+            const RuntimeSymbolId id = static_cast<RuntimeSymbolId>(namesById.size());
+            namesById.push_back(name);
+            idsByName[namesById.back()] = id;
+            return id;
+        }
+
+        RuntimeSymbolId lookup(const std::string &name) const
+        {
+            const auto it = idsByName.find(name);
+            if (it == idsByName.end())
+            {
+                return kInvalidRuntimeSymbolId;
+            }
+            return it->second;
+        }
+
+        const std::string &name(RuntimeSymbolId id) const
+        {
+            static const std::string unknown = "<unknown>";
+            if (id == kInvalidRuntimeSymbolId || id >= namesById.size())
+            {
+                return unknown;
+            }
+            return namesById[id];
+        }
+    };
+
+    struct InternedRuntimeCfgBlock
+    {
+        llvm::SmallVector<RuntimeSymbolId, 4> calleeIds;
+        llvm::SmallVector<std::uint32_t, 4> successors;
+    };
+
+    struct InternedRuntimeFunctionCfg
+    {
+        std::uint32_t entryBlockId = 0U;
+        std::uint32_t exitBlockId = 0U;
+        llvm::DenseMap<std::uint32_t, InternedRuntimeCfgBlock> blocks;
+    };
+
+    using InternedCallersByCallee = llvm::DenseMap<RuntimeSymbolId, llvm::DenseSet<RuntimeSymbolId>>;
+    using InternedCfgByFunction = llvm::DenseMap<RuntimeSymbolId, InternedRuntimeFunctionCfg>;
+
+    RuntimeSymbolTable buildRuntimeSymbolTable(
+        const std::vector<Event> &events,
+        const std::vector<ContextRun> &runs,
+        const std::set<std::string> &entrypoints,
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+    {
+        RuntimeSymbolTable symbols;
+        for (const Event &event : events)
+        {
+            if (!event.baseName.empty())
+            {
+                symbols.intern(event.baseName);
+            }
+        }
+        for (const ContextRun &run : runs)
+        {
+            symbols.intern(run.entrypoint);
+        }
+        for (const std::string &entrypoint : entrypoints)
+        {
+            symbols.intern(entrypoint);
+        }
+        for (const auto &entry : callersByCallee)
+        {
+            symbols.intern(entry.first);
+            for (const std::string &callerName : entry.second)
+            {
+                symbols.intern(callerName);
+            }
+        }
+        for (const auto &entry : cfgByFunction)
+        {
+            symbols.intern(entry.first);
+            for (const auto &blockEntry : entry.second.blocks)
+            {
+                for (const std::string &calleeName : blockEntry.second.callees)
+                {
+                    symbols.intern(calleeName);
+                }
+            }
+        }
+        return symbols;
+    }
+
+    InternedCallersByCallee buildInternedCallersByCallee(
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+        const RuntimeSymbolTable &symbols)
+    {
+        InternedCallersByCallee interned;
+        for (const auto &entry : callersByCallee)
+        {
+            const RuntimeSymbolId calleeId = symbols.lookup(entry.first);
+            if (calleeId == kInvalidRuntimeSymbolId)
+            {
+                continue;
+            }
+
+            llvm::DenseSet<RuntimeSymbolId> callers;
+            callers.reserve(entry.second.size());
+            for (const std::string &callerName : entry.second)
+            {
+                const RuntimeSymbolId callerId = symbols.lookup(callerName);
+                if (callerId != kInvalidRuntimeSymbolId)
+                {
+                    callers.insert(callerId);
+                }
+            }
+            interned[calleeId] = std::move(callers);
+        }
+        return interned;
+    }
+
+    InternedCfgByFunction buildInternedCfgByFunction(
+        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+        const RuntimeSymbolTable &symbols)
+    {
+        InternedCfgByFunction interned;
+        for (const auto &entry : cfgByFunction)
+        {
+            const RuntimeSymbolId functionId = symbols.lookup(entry.first);
+            if (functionId == kInvalidRuntimeSymbolId)
+            {
+                continue;
+            }
+
+            InternedRuntimeFunctionCfg internedFunction;
+            internedFunction.entryBlockId = entry.second.entryBlockId;
+            internedFunction.exitBlockId = entry.second.exitBlockId;
+            for (const auto &blockEntry : entry.second.blocks)
+            {
+                InternedRuntimeCfgBlock internedBlock;
+                internedBlock.calleeIds.reserve(blockEntry.second.callees.size());
+                for (const std::string &calleeName : blockEntry.second.callees)
+                {
+                    internedBlock.calleeIds.push_back(symbols.lookup(calleeName));
+                }
+                internedBlock.successors.append(blockEntry.second.successors.begin(), blockEntry.second.successors.end());
+                internedFunction.blocks[blockEntry.first] = std::move(internedBlock);
+            }
+            interned[functionId] = std::move(internedFunction);
+        }
+        return interned;
+    }
+
     void computeEpsilonClosure(
         llvm::SmallVectorImpl<InferredFrame::ProgramPoint> &points,
-        const RuntimeFunctionCfg &functionCfg);
+        const InternedRuntimeFunctionCfg &functionCfg);
+    std::optional<std::size_t> minimumRemainingCallsToExit(
+        InferredFrame &frame,
+        const InternedCfgByFunction &cfgByFunction);
+    std::vector<std::string> collectImmediateExpectedCallees(
+        InferredFrame &frame,
+        const RuntimeSymbolTable &symbols,
+        const InternedCfgByFunction &cfgByFunction);
 
     std::uint64_t encodeProgramPoint(const InferredFrame::ProgramPoint &point)
     {
@@ -774,6 +947,7 @@ namespace
     void invalidateFrameCaches(InferredFrame &frame)
     {
         frame.tokenCacheValid = false;
+        frame.lastCheckedTokenId = kInvalidRuntimeSymbolId;
         frame.lastCheckedToken.clear();
         frame.lastCheckedTokenFeasible = false;
         frame.remainingCallsCacheValid = false;
@@ -782,21 +956,23 @@ namespace
 
     bool seedFrameForFunction(
         InferredFrame &frame,
-        const std::string &functionName,
-        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+        RuntimeSymbolId functionId,
+        const RuntimeSymbolTable &symbols,
+        const InternedCfgByFunction &cfgByFunction)
     {
-        frame.functionName = functionName;
+        frame.functionId = functionId;
+        frame.functionName = symbols.name(functionId);
         frame.activePoints.clear();
         frame.closureComputed = false;
         invalidateFrameCaches(frame);
 
-        const auto cfgIt = cfgByFunction.find(functionName);
+        const auto cfgIt = cfgByFunction.find(functionId);
         if (cfgIt == cfgByFunction.end())
         {
             return false;
         }
 
-        const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+        const InternedRuntimeFunctionCfg &functionCfg = cfgIt->second;
         if (functionCfg.blocks.empty())
         {
             return false;
@@ -813,7 +989,7 @@ namespace
 
     void ensureClosureComputed(
         InferredFrame &frame,
-        const RuntimeFunctionCfg &functionCfg)
+        const InternedRuntimeFunctionCfg &functionCfg)
     {
         if (frame.closureComputed)
         {
@@ -834,7 +1010,7 @@ namespace
 
     void computeEpsilonClosure(
         llvm::SmallVectorImpl<InferredFrame::ProgramPoint> &points,
-        const RuntimeFunctionCfg &functionCfg)
+        const InternedRuntimeFunctionCfg &functionCfg)
     {
         normalizePoints(points);
 
@@ -862,8 +1038,8 @@ namespace
                 continue;
             }
 
-            const RuntimeCfgBlock &block = blockIt->second;
-            const std::uint32_t callCount = static_cast<std::uint32_t>(block.callees.size());
+            const InternedRuntimeCfgBlock &block = blockIt->second;
+            const std::uint32_t callCount = static_cast<std::uint32_t>(block.calleeIds.size());
             if (point.callIndex < callCount)
             {
                 continue;
@@ -898,24 +1074,26 @@ namespace
 
     bool frameCanCallToken(
         InferredFrame &frame,
-        const std::string &token,
-        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+        RuntimeSymbolId tokenId,
+        const RuntimeSymbolTable &symbols,
+        const InternedCfgByFunction &cfgByFunction)
     {
-        if (frame.tokenCacheValid && frame.lastCheckedToken == token)
+        if (frame.tokenCacheValid && frame.lastCheckedTokenId == tokenId)
         {
             return frame.lastCheckedTokenFeasible;
         }
 
-        const auto cfgIt = cfgByFunction.find(frame.functionName);
+        const auto cfgIt = cfgByFunction.find(frame.functionId);
         if (cfgIt == cfgByFunction.end())
         {
             frame.tokenCacheValid = true;
-            frame.lastCheckedToken = token;
+            frame.lastCheckedTokenId = tokenId;
+            frame.lastCheckedToken = symbols.name(tokenId);
             frame.lastCheckedTokenFeasible = false;
             return false;
         }
 
-        const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+        const InternedRuntimeFunctionCfg &functionCfg = cfgIt->second;
         ensureClosureComputed(frame, functionCfg);
         for (const InferredFrame::ProgramPoint &point : frame.activePoints)
         {
@@ -925,40 +1103,43 @@ namespace
                 continue;
             }
 
-            const RuntimeCfgBlock &block = blockIt->second;
-            if (point.callIndex >= block.callees.size())
+            const InternedRuntimeCfgBlock &block = blockIt->second;
+            if (point.callIndex >= block.calleeIds.size())
             {
                 continue;
             }
 
-            const std::string &expectedCallee = block.callees[point.callIndex];
-            if (expectedCallee == token || expectedCallee == "<indirect-call>")
+            const RuntimeSymbolId expectedCalleeId = block.calleeIds[point.callIndex];
+            if (expectedCalleeId == tokenId || symbols.name(expectedCalleeId) == "<indirect-call>")
             {
                 frame.tokenCacheValid = true;
-                frame.lastCheckedToken = token;
+                frame.lastCheckedTokenId = tokenId;
+                frame.lastCheckedToken = symbols.name(tokenId);
                 frame.lastCheckedTokenFeasible = true;
                 return true;
             }
         }
 
         frame.tokenCacheValid = true;
-        frame.lastCheckedToken = token;
+        frame.lastCheckedTokenId = tokenId;
+        frame.lastCheckedToken = symbols.name(tokenId);
         frame.lastCheckedTokenFeasible = false;
         return false;
     }
 
     bool consumeTokenInFrame(
         InferredFrame &frame,
-        const std::string &token,
-        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+        RuntimeSymbolId tokenId,
+        const RuntimeSymbolTable &symbols,
+        const InternedCfgByFunction &cfgByFunction)
     {
-        const auto cfgIt = cfgByFunction.find(frame.functionName);
+        const auto cfgIt = cfgByFunction.find(frame.functionId);
         if (cfgIt == cfgByFunction.end())
         {
             return false;
         }
 
-        const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+        const InternedRuntimeFunctionCfg &functionCfg = cfgIt->second;
         ensureClosureComputed(frame, functionCfg);
 
         llvm::SmallVector<InferredFrame::ProgramPoint, 8> nextPoints;
@@ -970,14 +1151,14 @@ namespace
                 continue;
             }
 
-            const RuntimeCfgBlock &block = blockIt->second;
-            if (point.callIndex >= block.callees.size())
+            const InternedRuntimeCfgBlock &block = blockIt->second;
+            if (point.callIndex >= block.calleeIds.size())
             {
                 continue;
             }
 
-            const std::string &expectedCallee = block.callees[point.callIndex];
-            if (expectedCallee != token && expectedCallee != "<indirect-call>")
+            const RuntimeSymbolId expectedCalleeId = block.calleeIds[point.callIndex];
+            if (expectedCalleeId != tokenId && symbols.name(expectedCalleeId) != "<indirect-call>")
             {
                 continue;
             }
@@ -1101,14 +1282,27 @@ std::vector<std::string> buildActiveCallerOrder(const PathState &path)
     return callers;
 }
 
-std::vector<ActiveCaller> buildFeasibleActiveCallers(
+llvm::SmallVector<ActiveCaller, 4> buildFeasibleActiveCallers(
     PathState &path,
     const std::string &token,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
 {
+    (void)token;
+    (void)cfgByFunction;
+    std::abort();
+}
+
+namespace
+{
+llvm::SmallVector<ActiveCaller, 4> buildFeasibleActiveCallers(
+    PathState &path,
+    RuntimeSymbolId tokenId,
+    const RuntimeSymbolTable &symbols,
+    const InternedCfgByFunction &cfgByFunction)
+{
     cleanupInferredStack(path);
 
-    std::vector<ActiveCaller> callers;
+    llvm::SmallVector<ActiveCaller, 4> callers;
     callers.reserve(path.inferredStack.size() + path.explicitFrames.size());
 
     std::size_t depth = 0U;
@@ -1119,7 +1313,7 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
         const bool mirrorsExplicitTop =
             isTopInferredFrame &&
             !path.explicitFrames.empty() &&
-            frame.functionName == path.explicitFrames.back().functionName;
+            frame.functionId == path.explicitFrames.back().functionId;
 
         // Entry-marked calls can create a mirrored inferred top frame for the same function.
         // Do not let that mirrored frame block attribution of sibling calls in the explicit frame.
@@ -1129,9 +1323,9 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
             continue;
         }
 
-        if (frameCanCallToken(frame, token, cfgByFunction))
+        if (frameCanCallToken(frame, tokenId, symbols, cfgByFunction))
         {
-            callers.push_back(ActiveCaller{&frame.functionName, true, i - 1U, depth});
+            callers.push_back(ActiveCaller{frame.functionId, true, i - 1U, depth});
         }
 
         const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
@@ -1151,14 +1345,15 @@ std::vector<ActiveCaller> buildFeasibleActiveCallers(
     if (!path.explicitFrames.empty())
     {
         InferredFrame &frame = path.explicitFrames.back();
-        if (frameCanCallToken(frame, token, cfgByFunction))
+        if (frameCanCallToken(frame, tokenId, symbols, cfgByFunction))
         {
-            callers.push_back(ActiveCaller{&frame.functionName, false, path.explicitFrames.size() - 1U, depth});
+            callers.push_back(ActiveCaller{frame.functionId, false, path.explicitFrames.size() - 1U, depth});
         }
     }
 
     return callers;
 }
+} // namespace
 
 void updateInferredStackAfterAssignment(
     PathState &path,
@@ -1166,6 +1361,24 @@ void updateInferredStackAfterAssignment(
     const std::string &chosenCallee,
     const std::set<std::string> &entrypoints,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+{
+    (void)path;
+    (void)chosenCaller;
+    (void)chosenCallee;
+    (void)entrypoints;
+    (void)cfgByFunction;
+    std::abort();
+}
+
+namespace
+{
+void updateInferredStackAfterAssignment(
+    PathState &path,
+    const ActiveCaller &chosenCaller,
+    RuntimeSymbolId chosenCalleeId,
+    const std::set<std::string> &entrypoints,
+    const RuntimeSymbolTable &symbols,
+    const InternedCfgByFunction &cfgByFunction)
 {
     cleanupInferredStack(path);
 
@@ -1196,36 +1409,50 @@ void updateInferredStackAfterAssignment(
 
     if (callerFrame != nullptr)
     {
-        (void)consumeTokenInFrame(*callerFrame, chosenCallee, cfgByFunction);
+        (void)consumeTokenInFrame(*callerFrame, chosenCalleeId, symbols, cfgByFunction);
     }
 
     // Keep explicit-frame events authoritative: entrypoints with explicit markers should not be inferred.
+    const std::string &chosenCallee = symbols.name(chosenCalleeId);
     if (entrypoints.find(chosenCallee) != entrypoints.end())
     {
         return;
     }
 
     InferredFrame frame;
-    if (!seedFrameForFunction(frame, chosenCallee, cfgByFunction))
+    if (!seedFrameForFunction(frame, chosenCalleeId, symbols, cfgByFunction))
     {
         return;
     }
 
     frame.functionName = chosenCallee;
+    frame.functionId = chosenCalleeId;
     frame.explicitDepthAnchor = path.contextStack.size();
     path.inferredStack.push_back(std::move(frame));
 }
+} // namespace
 
 std::optional<std::size_t> minimumRemainingCallsToExit(
     InferredFrame &frame,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+{
+    (void)frame;
+    (void)cfgByFunction;
+    std::abort();
+}
+
+namespace
+{
+std::optional<std::size_t> minimumRemainingCallsToExit(
+    InferredFrame &frame,
+    const InternedCfgByFunction &cfgByFunction)
 {
     if (frame.remainingCallsCacheValid)
     {
         return frame.cachedRemainingCallsToExit;
     }
 
-    const auto cfgIt = cfgByFunction.find(frame.functionName);
+    const auto cfgIt = cfgByFunction.find(frame.functionId);
     if (cfgIt == cfgByFunction.end())
     {
         frame.remainingCallsCacheValid = true;
@@ -1233,7 +1460,7 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
         return std::nullopt;
     }
 
-    const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+    const InternedRuntimeFunctionCfg &functionCfg = cfgIt->second;
     ensureClosureComputed(frame, functionCfg);
 
     using QueueEntry = std::pair<std::size_t, std::uint64_t>;
@@ -1269,8 +1496,8 @@ std::optional<std::size_t> minimumRemainingCallsToExit(
             continue;
         }
 
-        const RuntimeCfgBlock &block = blockIt->second;
-        const std::size_t callCount = block.callees.size();
+        const InternedRuntimeCfgBlock &block = blockIt->second;
+        const std::size_t callCount = block.calleeIds.size();
         if (point.blockId == functionCfg.exitBlockId && static_cast<std::size_t>(point.callIndex) >= callCount)
         {
             frame.remainingCallsCacheValid = true;
@@ -1319,15 +1546,25 @@ std::vector<std::string> collectImmediateExpectedCallees(
     InferredFrame &frame,
     const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
 {
+    (void)frame;
+    (void)cfgByFunction;
+    std::abort();
+}
+
+std::vector<std::string> collectImmediateExpectedCallees(
+    InferredFrame &frame,
+    const RuntimeSymbolTable &symbols,
+    const InternedCfgByFunction &cfgByFunction)
+{
     std::vector<std::string> expected;
 
-    const auto cfgIt = cfgByFunction.find(frame.functionName);
+    const auto cfgIt = cfgByFunction.find(frame.functionId);
     if (cfgIt == cfgByFunction.end())
     {
         return expected;
     }
 
-    const RuntimeFunctionCfg &functionCfg = cfgIt->second;
+    const InternedRuntimeFunctionCfg &functionCfg = cfgIt->second;
     ensureClosureComputed(frame, functionCfg);
     for (const InferredFrame::ProgramPoint &point : frame.activePoints)
     {
@@ -1337,19 +1574,20 @@ std::vector<std::string> collectImmediateExpectedCallees(
             continue;
         }
 
-        const RuntimeCfgBlock &block = blockIt->second;
-        if (point.callIndex >= block.callees.size())
+        const InternedRuntimeCfgBlock &block = blockIt->second;
+        if (point.callIndex >= block.calleeIds.size())
         {
             continue;
         }
 
-        expected.push_back(block.callees[point.callIndex]);
+        expected.push_back(symbols.name(block.calleeIds[point.callIndex]));
     }
 
     std::sort(expected.begin(), expected.end());
     expected.erase(std::unique(expected.begin(), expected.end()), expected.end());
     return expected;
 }
+} // namespace
 
 // ============================================================================
 // Path analysis
@@ -1372,9 +1610,9 @@ namespace
 
     int compareFrameState(const InferredFrame &lhs, const InferredFrame &rhs)
     {
-        if (lhs.functionName != rhs.functionName)
+        if (lhs.functionId != rhs.functionId)
         {
-            return lhs.functionName < rhs.functionName ? -1 : 1;
+            return lhs.functionId < rhs.functionId ? -1 : 1;
         }
         if (lhs.explicitDepthAnchor != rhs.explicitDepthAnchor)
         {
@@ -1618,6 +1856,7 @@ namespace
         std::size_t eventIndex = 0U;
         std::size_t lineNumber = 0U;
         const std::string *token = nullptr;
+        RuntimeSymbolId tokenId = kInvalidRuntimeSymbolId;
         bool entersContext = false;
         const std::string *relatedContextId = nullptr;
     };
@@ -1694,28 +1933,9 @@ namespace
         return event.relatedContextId != nullptr ? *event.relatedContextId : empty;
     }
 
-    const std::string &activeCallerName(const ActiveCaller &caller)
+    const std::string &activeCallerName(const RuntimeSymbolTable &symbols, const ActiveCaller &caller)
     {
-        static const std::string empty;
-        return caller.functionName != nullptr ? *caller.functionName : empty;
-    }
-
-    template <typename RankFn>
-    void retainMostImmediateCandidates(std::vector<ActiveCaller> &candidates, const RankFn &rankActiveCaller)
-    {
-        if (candidates.size() <= 1U)
-        {
-            return;
-        }
-
-        std::sort(candidates.begin(), candidates.end(), rankActiveCaller);
-        const std::size_t bestDepth = candidates.front().depth;
-        auto eraseBegin = std::find_if(
-            candidates.begin() + 1,
-            candidates.end(),
-            [&](const ActiveCaller &candidate)
-            { return candidate.depth != bestDepth; });
-        candidates.erase(eraseBegin, candidates.end());
+        return symbols.name(caller.functionId);
     }
 
     std::string encodeSelectionKey(const std::vector<std::size_t> &indices)
@@ -1803,11 +2023,12 @@ namespace
     }
 
     bool callerMatchesStaticCallee(
-        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
-        const std::string &callerName,
-        const std::string &calleeName)
+        const InternedCallersByCallee &callersByCallee,
+        RuntimeSymbolId callerId,
+        RuntimeSymbolId calleeId,
+        RuntimeSymbolId indirectCallId)
     {
-        const auto staticCallersForCallee = [&](const std::string &candidateCallee) -> const std::unordered_set<std::string> *
+        const auto staticCallersForCallee = [&](RuntimeSymbolId candidateCallee) -> const llvm::DenseSet<RuntimeSymbolId> *
         {
             const auto staticIt = callersByCallee.find(candidateCallee);
             if (staticIt == callersByCallee.end())
@@ -1817,18 +2038,18 @@ namespace
             return &staticIt->second;
         };
 
-        const std::unordered_set<std::string> *directCallers = staticCallersForCallee(calleeName);
+        const llvm::DenseSet<RuntimeSymbolId> *directCallers = staticCallersForCallee(calleeId);
         if (directCallers != nullptr)
         {
-            return directCallers->find(callerName) != directCallers->end();
+            return directCallers->contains(callerId);
         }
 
-        if (calleeName != "<indirect-call>")
+        if (calleeId != indirectCallId)
         {
-            const std::unordered_set<std::string> *indirectCallers = staticCallersForCallee("<indirect-call>");
+            const llvm::DenseSet<RuntimeSymbolId> *indirectCallers = staticCallersForCallee(indirectCallId);
             if (indirectCallers != nullptr)
             {
-                return indirectCallers->find(callerName) != indirectCallers->end();
+                return indirectCallers->contains(callerId);
             }
         }
 
@@ -1838,7 +2059,8 @@ namespace
     std::string describeNoCfgCaller(
         const ContextProcessingEvent &event,
         PathState &candidate,
-        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+        const RuntimeSymbolTable &symbols,
+        const InternedCfgByFunction &cfgByFunction)
     {
         const std::string &eventToken = contextEventToken(event);
         cleanupInferredStack(candidate);
@@ -1846,7 +2068,7 @@ namespace
         for (std::size_t i = candidate.inferredStack.size(); i > 0U; --i)
         {
             InferredFrame &frame = candidate.inferredStack[i - 1U];
-            const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
+            const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, symbols, cfgByFunction);
             const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
             if (remainingCalls.has_value() && *remainingCalls == 0U)
             {
@@ -1882,7 +2104,7 @@ namespace
         if (!candidate.explicitFrames.empty())
         {
             InferredFrame &frame = candidate.explicitFrames.back();
-            const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, cfgByFunction);
+            const std::vector<std::string> expected = collectImmediateExpectedCallees(frame, symbols, cfgByFunction);
             if (!expected.empty())
             {
                 return llvm::formatv("line {0}: top active context '{1}' could not call token '{2}'; next CFG-observable callees are [{3}]",
@@ -1922,8 +2144,10 @@ namespace
         const ContextRun &run,
         const std::vector<Event> &events,
         PathState &candidate,
-        const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction)
+        const RuntimeSymbolTable &symbols,
+        const InternedCfgByFunction &cfgByFunction)
     {
+        (void)symbols;
         if (run.endEventIndex >= events.size())
         {
             return std::nullopt;
@@ -1999,7 +2223,8 @@ namespace
         const std::vector<Event> &events,
         const ContextRun &run,
         const std::unordered_map<std::string, const ContextRun *> &runById,
-        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee)
+        const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
+        const RuntimeSymbolTable &symbols)
     {
         std::vector<ContextProcessingEvent> processingEvents;
         processingEvents.reserve(run.ownedEventIndices.size() + run.childContextIds.size());
@@ -2021,6 +2246,7 @@ namespace
             processingEvent.eventIndex = eventIndex;
             processingEvent.lineNumber = event.lineNumber;
             processingEvent.token = &event.baseName;
+            processingEvent.tokenId = symbols.lookup(event.baseName);
             processingEvents.push_back(std::move(processingEvent));
         }
 
@@ -2046,6 +2272,7 @@ namespace
             processingEvent.eventIndex = childRun.startEventIndex;
             processingEvent.lineNumber = events[childRun.startEventIndex].lineNumber;
             processingEvent.token = &childRun.entrypoint;
+            processingEvent.tokenId = symbols.lookup(childRun.entrypoint);
             processingEvent.entersContext = true;
             processingEvent.relatedContextId = &childRun.contextId;
             processingEvents.push_back(std::move(processingEvent));
@@ -2133,6 +2360,9 @@ namespace
         const std::set<std::string> &entrypoints,
         const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
         const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+        const RuntimeSymbolTable &symbols,
+        const InternedCallersByCallee &internedCallersByCallee,
+        const InternedCfgByFunction &internedCfgByFunction,
         const RuntimeAnalysisOptions &options,
         std::size_t lookaheadPlainEvents,
         ContextAnalysisResult &result)
@@ -2141,7 +2371,7 @@ namespace
         result.run = run;
 
         std::vector<ContextProcessingEvent> processingEvents =
-            buildContextProcessingEvents(events, run, runById, callersByCallee);
+            buildContextProcessingEvents(events, run, runById, callersByCallee, symbols);
         result.localEventCount = processingEvents.size();
         result.processedEventCount = processingEvents.size();
         result.effectiveLookaheadPlainEvents =
@@ -2166,13 +2396,16 @@ namespace
 
         InferredFrame explicitFrame;
         explicitFrame.functionName = run.entrypoint;
+        explicitFrame.functionId = symbols.lookup(run.entrypoint);
         explicitFrame.explicitDepthAnchor = 1U;
-        (void)seedFrameForFunction(explicitFrame, run.entrypoint, cfgByFunction);
+        (void)seedFrameForFunction(explicitFrame, explicitFrame.functionId, symbols, internedCfgByFunction);
         explicitFrame.functionName = run.entrypoint;
+        explicitFrame.functionId = symbols.lookup(run.entrypoint);
         explicitFrame.explicitDepthAnchor = 1U;
         initialPath.explicitFrames.push_back(std::move(explicitFrame));
 
         const std::size_t branchLimit = std::max<std::size_t>(1U, options.topK);
+        const RuntimeSymbolId indirectCallId = symbols.lookup("<indirect-call>");
 
         auto noteInvalidation = [&](const std::string &reason,
                                     const PathState &candidate,
@@ -2196,14 +2429,14 @@ namespace
             failureExamples.push_back(std::move(example));
         };
 
-        const auto rankActiveCaller = [](const ActiveCaller &lhs, const ActiveCaller &rhs)
+        const auto rankActiveCaller = [&](const ActiveCaller &lhs, const ActiveCaller &rhs)
         {
             if (lhs.depth != rhs.depth)
             {
                 return lhs.depth < rhs.depth;
             }
-            const std::string &lhsName = activeCallerName(lhs);
-            const std::string &rhsName = activeCallerName(rhs);
+            const std::string &lhsName = activeCallerName(symbols, lhs);
+            const std::string &rhsName = activeCallerName(symbols, rhs);
             if (lhsName != rhsName)
             {
                 return lhsName < rhsName;
@@ -2219,6 +2452,26 @@ namespace
             return false;
         };
 
+        auto failCurrentEvent = [&](const ContextProcessingEvent &failedEvent,
+                                    std::unordered_map<std::string, std::size_t> &&failureReasons,
+                                    std::vector<RuntimeFailureExample> &&failureExamples) -> bool
+        {
+            result.failureEventIndex = failedEvent.eventIndex;
+            result.failureEvent.lineNumber = failedEvent.lineNumber;
+            result.failureEvent.baseName = contextEventToken(failedEvent);
+            result.failureEvent.kind = EventKind::Plain;
+            result.failureReasons = std::move(failureReasons);
+            result.failureExamples = std::move(failureExamples);
+            logRuntimeTrace(
+                llvm::formatv("[runtime] context failed id={0} line={1} token={2} reasons={3}",
+                              run.contextId,
+                              result.failureEvent.lineNumber,
+                              result.failureEvent.baseName,
+                              result.failureReasons.size())
+                    .str());
+            return false;
+        };
+
         for (std::size_t cursor = 0U; cursor < processingEvents.size(); ++cursor)
         {
             const ContextProcessingEvent &event = processingEvents[cursor];
@@ -2227,31 +2480,133 @@ namespace
             std::unordered_map<std::string, std::size_t> invalidationReasonsForEvent;
             std::vector<RuntimeFailureExample> invalidationExamplesForEvent;
 
-            std::vector<PathState> nextPaths;
-            nextPaths.reserve(activePaths.size() * branchLimit + 1U);
-            for (PathState &path : activePaths)
+            if (activePaths.size() == 1U)
             {
-                PathState prepared = std::move(path);
-                std::vector<ActiveCaller> activeCallers = buildFeasibleActiveCallers(prepared, eventToken, cfgByFunction);
+                PathState prepared = std::move(activePaths.front());
+                llvm::SmallVector<ActiveCaller, 4> activeCallers =
+                    buildFeasibleActiveCallers(prepared, event.tokenId, symbols, internedCfgByFunction);
 
                 if (activeCallers.empty())
                 {
                     noteInvalidation(
-                        describeNoCfgCaller(event, prepared, cfgByFunction),
+                        describeNoCfgCaller(event, prepared, symbols, internedCfgByFunction),
                         prepared,
                         invalidationReasonsForEvent,
                         invalidationExamplesForEvent);
-                    continue;
+                    return failCurrentEvent(
+                        event,
+                        std::move(invalidationReasonsForEvent),
+                        std::move(invalidationExamplesForEvent));
                 }
 
-                std::vector<ActiveCaller> staticCandidates;
+                llvm::SmallVector<ActiveCaller, 4> staticCandidates;
                 std::copy_if(
                     activeCallers.begin(),
                     activeCallers.end(),
                     std::back_inserter(staticCandidates),
                     [&](const ActiveCaller &candidate)
                     {
-                        return callerMatchesStaticCallee(callersByCallee, activeCallerName(candidate), eventToken);
+                        return callerMatchesStaticCallee(
+                            internedCallersByCallee,
+                            candidate.functionId,
+                            event.tokenId,
+                            indirectCallId);
+                    });
+
+                if (staticCandidates.empty())
+                {
+                    noteInvalidation(
+                        llvm::formatv("line {0}: token '{1}' had CFG-feasible callers, but none matched the static callgraph",
+                                      event.lineNumber,
+                                      eventToken)
+                            .str(),
+                        prepared,
+                        invalidationReasonsForEvent,
+                        invalidationExamplesForEvent);
+                    return failCurrentEvent(
+                        event,
+                        std::move(invalidationReasonsForEvent),
+                        std::move(invalidationExamplesForEvent));
+                }
+
+                if (staticCandidates.size() == 1U)
+                {
+                    const ActiveCaller &caller = staticCandidates.front();
+                    addEdge(prepared, activeCallerName(symbols, caller), eventToken);
+
+                    Assignment assignment;
+                    assignment.eventIndex = event.eventIndex;
+                    assignment.lineNumber = event.lineNumber;
+                    assignment.contextId = run.contextId;
+                    assignment.token = eventToken;
+                    assignment.chosenCaller = activeCallerName(symbols, caller);
+                    assignment.chosenCallerDepth = caller.depth;
+                    assignment.ambiguous = false;
+                    assignment.usedStaticEdge = true;
+                    assignment.deltaScore = 0.0;
+                    assignment.entersContext = event.entersContext;
+                    assignment.relatedContextId = relatedContextId;
+                    prepared.assignments.push_back(std::move(assignment));
+
+                    updateInferredStackAfterAssignment(
+                        prepared,
+                        caller,
+                        event.tokenId,
+                        entrypoints,
+                        symbols,
+                        internedCfgByFunction);
+
+                    activePaths.front() = std::move(prepared);
+                    result.pathExpansionCount += 1U;
+
+                    if (traceInterval != 0U &&
+                        (((cursor + 1U) % traceInterval) == 0U || (cursor + 1U) == processingEvents.size()))
+                    {
+                        logRuntimeTrace(
+                            llvm::formatv("[runtime] context progress id={0} processed={1}/{2} active_paths={3} expansions={4}",
+                                          run.contextId,
+                                          cursor + 1U,
+                                          processingEvents.size(),
+                                          activePaths.size(),
+                                          result.pathExpansionCount)
+                                .str());
+                    }
+                    continue;
+                }
+
+                activePaths.front() = std::move(prepared);
+            }
+
+            std::vector<PathState> nextPaths;
+            nextPaths.reserve(activePaths.size() * branchLimit + 1U);
+            for (PathState &path : activePaths)
+            {
+                PathState prepared = std::move(path);
+                llvm::SmallVector<ActiveCaller, 4> activeCallers =
+                    buildFeasibleActiveCallers(prepared, event.tokenId, symbols, internedCfgByFunction);
+
+                if (activeCallers.empty())
+                {
+                    noteInvalidation(
+                        describeNoCfgCaller(event, prepared, symbols, internedCfgByFunction),
+                        prepared,
+                        invalidationReasonsForEvent,
+                        invalidationExamplesForEvent);
+                    continue;
+                }
+
+                llvm::SmallVector<ActiveCaller, 4> staticCandidates;
+                std::copy_if(
+                    activeCallers.begin(),
+                    activeCallers.end(),
+                    std::back_inserter(staticCandidates),
+                    [&](const ActiveCaller &candidate)
+                    {
+                        return callerMatchesStaticCallee(
+                            internedCallersByCallee,
+                            candidate.functionId,
+                            event.tokenId,
+                            indirectCallId);
                     });
 
                 if (staticCandidates.empty())
@@ -2267,24 +2622,34 @@ namespace
                     continue;
                 }
 
-                std::vector<ActiveCaller> &candidates = staticCandidates;
+                llvm::SmallVector<ActiveCaller, 4> &candidates = staticCandidates;
                 if (candidates.size() > 1U)
                 {
-                    retainMostImmediateCandidates(candidates, rankActiveCaller);
+                    std::sort(candidates.begin(), candidates.end(), rankActiveCaller);
+                }
+                const std::size_t ambiguousCandidateCountBeforeLookahead = candidates.size();
+                if (ambiguousCandidateCountBeforeLookahead > 1U)
+                {
+                    ++result.lookaheadEligibleAmbiguityCount;
                 }
 
-                auto candidateNames = std::make_shared<std::vector<std::string>>();
-                candidateNames->reserve(candidates.size());
-                std::transform(
-                    candidates.begin(),
-                    candidates.end(),
-                    std::back_inserter(*candidateNames),
-                    [](const ActiveCaller &candidate)
-                    { return activeCallerName(candidate); });
+                std::shared_ptr<const std::vector<std::string>> candidateNames;
+                if (candidates.size() > 1U)
+                {
+                    auto names = std::make_shared<std::vector<std::string>>();
+                    names->reserve(candidates.size());
+                    std::transform(
+                        candidates.begin(),
+                        candidates.end(),
+                        std::back_inserter(*names),
+                        [&](const ActiveCaller &candidate)
+                        { return activeCallerName(symbols, candidate); });
+                    candidateNames = std::move(names);
+                }
 
                 if (candidates.size() > 1U && result.effectiveLookaheadPlainEvents > 0U)
                 {
-                    const std::vector<ActiveCaller> originalCandidates = candidates;
+                    const llvm::SmallVector<ActiveCaller, 4> originalCandidates = candidates;
                     struct LookaheadCandidate
                     {
                         ActiveCaller caller;
@@ -2307,9 +2672,10 @@ namespace
                         updateInferredStackAfterAssignment(
                             probe,
                             entry.caller,
-                            eventToken,
+                            event.tokenId,
                             entrypoints,
-                            cfgByFunction);
+                            symbols,
+                            internedCfgByFunction);
 
                         std::vector<PathState> probeStates;
                         probeStates.push_back(std::move(probe));
@@ -2327,14 +2693,14 @@ namespace
                             std::vector<PathState> nextProbeStates;
                             for (PathState &probeState : probeStates)
                             {
-                                std::vector<ActiveCaller> futureActiveCallers =
-                                    buildFeasibleActiveCallers(probeState, futureEventToken, cfgByFunction);
+                                llvm::SmallVector<ActiveCaller, 4> futureActiveCallers =
+                                    buildFeasibleActiveCallers(probeState, futureEvent.tokenId, symbols, internedCfgByFunction);
                                 if (futureActiveCallers.empty())
                                 {
                                     continue;
                                 }
 
-                                std::vector<ActiveCaller> futureStaticCandidates;
+                                llvm::SmallVector<ActiveCaller, 4> futureStaticCandidates;
                                 std::copy_if(
                                     futureActiveCallers.begin(),
                                     futureActiveCallers.end(),
@@ -2342,9 +2708,10 @@ namespace
                                     [&](const ActiveCaller &futureCandidate)
                                     {
                                         return callerMatchesStaticCallee(
-                                            callersByCallee,
-                                            activeCallerName(futureCandidate),
-                                            futureEventToken);
+                                            internedCallersByCallee,
+                                            futureCandidate.functionId,
+                                            futureEvent.tokenId,
+                                            indirectCallId);
                                     });
 
                                 if (futureStaticCandidates.empty())
@@ -2352,7 +2719,7 @@ namespace
                                     continue;
                                 }
 
-                                retainMostImmediateCandidates(futureStaticCandidates, rankActiveCaller);
+                                std::sort(futureStaticCandidates.begin(), futureStaticCandidates.end(), rankActiveCaller);
                                 if (futureStaticCandidates.size() > branchLimit)
                                 {
                                     futureStaticCandidates.resize(branchLimit);
@@ -2361,13 +2728,14 @@ namespace
                                 for (const ActiveCaller &futureCaller : futureStaticCandidates)
                                 {
                                     PathState nextProbe = probeState;
-                                    addEdge(nextProbe, activeCallerName(futureCaller), futureEventToken);
+                                    addEdge(nextProbe, activeCallerName(symbols, futureCaller), futureEventToken);
                                     updateInferredStackAfterAssignment(
                                         nextProbe,
                                         futureCaller,
-                                        futureEventToken,
+                                        futureEvent.tokenId,
                                         entrypoints,
-                                        cfgByFunction);
+                                        symbols,
+                                        internedCfgByFunction);
                                     nextProbeStates.push_back(std::move(nextProbe));
                                 }
                             }
@@ -2414,14 +2782,26 @@ namespace
                         }
                     }
 
-                    candidateNames = std::make_shared<std::vector<std::string>>();
-                    candidateNames->reserve(candidates.size());
-                    std::transform(
-                        candidates.begin(),
-                        candidates.end(),
-                        std::back_inserter(*candidateNames),
-                        [](const ActiveCaller &candidate)
-                        { return activeCallerName(candidate); });
+                    if (candidates.size() > 1U)
+                    {
+                        auto names = std::make_shared<std::vector<std::string>>();
+                        names->reserve(candidates.size());
+                        std::transform(
+                            candidates.begin(),
+                            candidates.end(),
+                            std::back_inserter(*names),
+                            [&](const ActiveCaller &candidate)
+                            { return activeCallerName(symbols, candidate); });
+                        candidateNames = std::move(names);
+                    }
+                    else
+                    {
+                        candidateNames.reset();
+                    }
+                    if (candidates.size() == 1U)
+                    {
+                        ++result.lookaheadResolvedAmbiguityCount;
+                    }
                 }
 
                 const bool tiedBest = candidates.size() > 1U;
@@ -2434,7 +2814,7 @@ namespace
                 {
                     const ActiveCaller &caller = candidates[candidateRank];
                     PathState next = prepared;
-                    addEdge(next, activeCallerName(caller), eventToken);
+                    addEdge(next, activeCallerName(symbols, caller), eventToken);
 
                     const double deltaScore = static_cast<double>(candidateRank) * 0.25;
                     next.score += deltaScore;
@@ -2445,7 +2825,7 @@ namespace
                     assignment.contextId = run.contextId;
                     assignment.token = eventToken;
                     assignment.candidates = candidateNames;
-                    assignment.chosenCaller = activeCallerName(caller);
+                    assignment.chosenCaller = activeCallerName(symbols, caller);
                     assignment.chosenCallerDepth = caller.depth;
                     assignment.ambiguous = tiedBest;
                     assignment.usedStaticEdge = true;
@@ -2457,17 +2837,21 @@ namespace
                     updateInferredStackAfterAssignment(
                         next,
                         caller,
-                        eventToken,
+                        event.tokenId,
                         entrypoints,
-                        cfgByFunction);
+                        symbols,
+                        internedCfgByFunction);
 
                     nextPaths.push_back(std::move(next));
                 }
             }
 
             result.pathExpansionCount += nextPaths.size();
-            mergeEquivalentPathStates(nextPaths);
-            pruneTopK(nextPaths, branchLimit);
+            if (nextPaths.size() > 1U)
+            {
+                mergeEquivalentPathStates(nextPaths);
+                pruneTopK(nextPaths, branchLimit);
+            }
             activePaths.swap(nextPaths);
 
             if (traceInterval != 0U &&
@@ -2485,20 +2869,10 @@ namespace
 
             if (activePaths.empty())
             {
-                result.failureEventIndex = event.eventIndex;
-                result.failureEvent.lineNumber = event.lineNumber;
-                result.failureEvent.baseName = eventToken;
-                result.failureEvent.kind = EventKind::Plain;
-                result.failureReasons = std::move(invalidationReasonsForEvent);
-                result.failureExamples = std::move(invalidationExamplesForEvent);
-                logRuntimeTrace(
-                    llvm::formatv("[runtime] context failed id={0} line={1} token={2} reasons={3}",
-                                  run.contextId,
-                                  result.failureEvent.lineNumber,
-                                  result.failureEvent.baseName,
-                                  result.failureReasons.size())
-                        .str());
-                return false;
+                return failCurrentEvent(
+                    event,
+                    std::move(invalidationReasonsForEvent),
+                    std::move(invalidationExamplesForEvent));
             }
         }
 
@@ -2513,7 +2887,7 @@ namespace
             {
                 PathState next = std::move(path);
                 if (const std::optional<std::string> incompatibility =
-                        describeContextExitIncompatibility(run, events, next, cfgByFunction))
+                        describeContextExitIncompatibility(run, events, next, symbols, internedCfgByFunction))
                 {
                     noteInvalidation(
                         *incompatibility,
@@ -2532,8 +2906,11 @@ namespace
 
             if (!exitValidatedPaths.empty())
             {
-                mergeEquivalentPathStates(exitValidatedPaths);
-                pruneTopK(exitValidatedPaths, branchLimit);
+                if (exitValidatedPaths.size() > 1U)
+                {
+                    mergeEquivalentPathStates(exitValidatedPaths);
+                    pruneTopK(exitValidatedPaths, branchLimit);
+                }
                 activePaths.swap(exitValidatedPaths);
             }
             else if (!invalidationReasonsForExit.empty())
@@ -2561,8 +2938,11 @@ namespace
             path.suspendedInferredStacks.clear();
         }
 
-        mergeEquivalentPathStates(activePaths);
-        pruneTopK(activePaths, branchLimit);
+        if (activePaths.size() > 1U)
+        {
+            mergeEquivalentPathStates(activePaths);
+            pruneTopK(activePaths, branchLimit);
+        }
         result.candidatePaths = std::move(activePaths);
         if (!result.candidatePaths.empty())
         {
@@ -2585,6 +2965,9 @@ namespace
         const std::set<std::string> &entrypoints,
         const std::unordered_map<std::string, std::unordered_set<std::string>> &callersByCallee,
         const std::unordered_map<std::string, RuntimeFunctionCfg> &cfgByFunction,
+        const RuntimeSymbolTable &symbols,
+        const InternedCallersByCallee &internedCallersByCallee,
+        const InternedCfgByFunction &internedCfgByFunction,
         const RuntimeAnalysisOptions &options,
         ContextAnalysisResult &result)
     {
@@ -2593,6 +2976,8 @@ namespace
 
         ContextAnalysisResult lastFailure;
         bool hasFailure = false;
+        ContextAnalysisResult deferredSuccess;
+        bool hasDeferredSuccess = false;
         std::optional<std::size_t> lastEffectiveAttemptLookahead;
         std::optional<std::size_t> knownEventCount;
         for (std::size_t attemptIndex = 0U; attemptIndex < lookaheadSchedule.size(); ++attemptIndex)
@@ -2616,6 +3001,9 @@ namespace
                 entrypoints,
                 callersByCallee,
                 cfgByFunction,
+                symbols,
+                internedCallersByCallee,
+                internedCfgByFunction,
                 options,
                 attemptLookahead,
                 attemptResult);
@@ -2623,12 +3011,31 @@ namespace
             lastEffectiveAttemptLookahead = attemptResult.effectiveLookaheadPlainEvents;
             if (success)
             {
+                const bool needsHigherLookaheadForAmbiguity =
+                    attemptResult.lookaheadEligibleAmbiguityCount > 0U &&
+                    (attemptResult.effectiveLookaheadPlainEvents == 0U ||
+                     attemptResult.candidatePaths.size() > 1U) &&
+                    attemptIndex + 1U < lookaheadSchedule.size();
+                if (needsHigherLookaheadForAmbiguity)
+                {
+                    deferredSuccess = attemptResult;
+                    hasDeferredSuccess = true;
+                    logRuntimeTrace(
+                        llvm::formatv("[runtime] context retry id={0} next_lookahead={1} ambiguous_events={2} candidate_paths={3}",
+                                      run.contextId,
+                                      lookaheadSchedule[attemptIndex + 1U],
+                                      attemptResult.lookaheadEligibleAmbiguityCount,
+                                      attemptResult.candidatePaths.size())
+                            .str());
+                    continue;
+                }
                 if (attemptIndex > 0U)
                 {
                     logRuntimeTrace(
-                        llvm::formatv("[runtime] context recovered id={0} lookahead={1}",
+                        llvm::formatv("[runtime] context recovered id={0} lookahead={1} resolved_ambiguities={2}",
                                       run.contextId,
-                                      attemptResult.effectiveLookaheadPlainEvents)
+                                      attemptResult.effectiveLookaheadPlainEvents,
+                                      attemptResult.lookaheadResolvedAmbiguityCount)
                             .str());
                 }
                 result = std::move(attemptResult);
@@ -2646,6 +3053,12 @@ namespace
                                   lastFailure.failureEvent.lineNumber)
                         .str());
             }
+        }
+
+        if (hasDeferredSuccess)
+        {
+            result = std::move(deferredSuccess);
+            return true;
         }
 
         if (hasFailure)
@@ -2724,6 +3137,13 @@ bool analyzeContexts(
         runById[run.contextId] = &run;
     }
 
+    const RuntimeSymbolTable symbols =
+        buildRuntimeSymbolTable(events, runs, entrypoints, callersByCallee, cfgByFunction);
+    const InternedCallersByCallee internedCallersByCallee =
+        buildInternedCallersByCallee(callersByCallee, symbols);
+    const InternedCfgByFunction internedCfgByFunction =
+        buildInternedCfgByFunction(cfgByFunction, symbols);
+
     std::atomic<std::size_t> nextRunIndex(0U);
     std::atomic<bool> failed(false);
     std::mutex errorMutex;
@@ -2751,6 +3171,9 @@ bool analyzeContexts(
                 entrypoints,
                 callersByCallee,
                 cfgByFunction,
+                symbols,
+                internedCallersByCallee,
+                internedCfgByFunction,
                 options,
                 localResult);
 
@@ -2915,6 +3338,10 @@ llvm::json::Object assignmentToJson(const Assignment &assignment)
             assignment.candidates->begin(),
             assignment.candidates->end(),
             std::back_inserter(candidates));
+    }
+    else
+    {
+        candidates.push_back(assignment.chosenCaller);
     }
     object["candidates"] = std::move(candidates);
     return object;
