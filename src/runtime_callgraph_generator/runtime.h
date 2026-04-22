@@ -152,6 +152,27 @@ struct ActiveCaller
 };
 
 /**
+ * @brief One assignment in a shared packed history chain.
+ */
+struct PackedAssignmentNode
+{
+    Assignment assignment;
+    std::shared_ptr<const PackedAssignmentNode> previous;
+    std::size_t length = 0U;
+    std::uint64_t fingerprint = 0U;
+};
+
+/**
+ * @brief One concrete assignment history packed under a shared future state.
+ */
+struct PackedPathVariant
+{
+    std::shared_ptr<const PackedAssignmentNode> tail;
+    mutable std::shared_ptr<const std::vector<Assignment>> materializedAssignments;
+    double score = 0.0;
+};
+
+/**
  * @brief Candidate path state during trace reconstruction.
  */
 struct PathState
@@ -163,6 +184,7 @@ struct PathState
     std::unordered_map<EdgeKey, std::size_t, EdgeKeyHash> edgeCounts;
     std::unordered_set<std::string> nodes;
     std::vector<Assignment> assignments;
+    std::vector<PackedPathVariant> packedVariants;
     std::vector<std::string> warnings;
     double score = 0.0;
 };
@@ -316,9 +338,6 @@ bool analyzeContexts(
 
 // Path state management
 void cleanupInferredStack(PathState &path);
-void discardInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
-void suspendInferredFramesAtOrAboveDepth(PathState &path, std::size_t depth);
-bool restoreSuspendedInferredFramesForDepth(PathState &path, std::size_t depth);
 std::vector<std::string> buildActiveCallerOrder(const PathState &path);
 llvm::SmallVector<ActiveCaller, 4> buildFeasibleActiveCallers(
     PathState &path,
@@ -351,12 +370,6 @@ llvm::json::Object pathToJson(const PathState &path, std::size_t rank);
 llvm::json::Object contextCallToJson(const ContextCall &call);
 llvm::json::Object contextRunToJson(const ContextRun &run, std::size_t lane);
 ContextRun materializeContextRun(const ContextRun &baseRun, const PathState &path);
-
-// Context run building and visualization
-std::vector<ContextRun> buildContextRunsFromBestPath(
-    const std::vector<Event> &events,
-    const PathState &best,
-    std::vector<std::string> &warnings);
 
 llvm::json::Object buildVisualizationData(
     const std::vector<Event> &events,
