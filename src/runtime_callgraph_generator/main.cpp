@@ -206,6 +206,12 @@ int main(int argc, const char **argv)
     }
 
     const std::vector<PathState> &activePaths = analysisResult.candidatePaths;
+    if (activePaths.empty())
+    {
+        llvm::errs() << "error: runtime analysis produced no candidate paths\n";
+        return 1;
+    }
+
     const PathState &best = activePaths.front();
 
     std::set<std::string> allFunctions;

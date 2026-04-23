@@ -1268,8 +1268,10 @@ namespace
             const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, cfgByFunction);
             if (!remainingCalls.has_value())
             {
-                ++depth;
-                continue;
+                // If we cannot prove that the active nested frame can return, do not attribute
+                // the token to any outer caller. The current frame may still be a valid caller,
+                // but parents must stay blocked until this nested callee is known to complete.
+                return callers;
             }
 
             if (*remainingCalls != 0U)
@@ -2200,12 +2202,17 @@ namespace
 
         struct ExtractionCursorGreater
         {
-            const std::vector<PathState> *paths = nullptr;
+            explicit ExtractionCursorGreater(const std::vector<PathState> &candidatePaths)
+                : paths(candidatePaths)
+            {
+            }
+
+            const std::vector<PathState> &paths;
 
             bool operator()(const ExtractionCursor &lhs, const ExtractionCursor &rhs) const
             {
-                const PackedPathVariant &lhsVariant = (*paths)[lhs.pathIndex].packedVariants[lhs.variantIndex];
-                const PackedPathVariant &rhsVariant = (*paths)[rhs.pathIndex].packedVariants[rhs.variantIndex];
+                const PackedPathVariant &lhsVariant = paths[lhs.pathIndex].packedVariants[lhs.variantIndex];
+                const PackedPathVariant &rhsVariant = paths[rhs.pathIndex].packedVariants[rhs.variantIndex];
                 if (lhsVariant.score != rhsVariant.score)
                 {
                     return lhsVariant.score > rhsVariant.score;
@@ -2225,8 +2232,8 @@ namespace
             }
         };
 
-        std::priority_queue<ExtractionCursor, std::vector<ExtractionCursor>, ExtractionCursorGreater> worklist(
-            ExtractionCursorGreater{&normalizedPaths});
+        std::priority_queue<ExtractionCursor, std::vector<ExtractionCursor>, ExtractionCursorGreater> worklist{
+            ExtractionCursorGreater(normalizedPaths)};
 
         for (std::size_t pathIndex = 0U; pathIndex < normalizedPaths.size(); ++pathIndex)
         {
@@ -2713,7 +2720,11 @@ namespace
             }
 
             const ContextRun &childRun = *childIt->second;
-            if (callersByCallee.find(childRun.entrypoint) == callersByCallee.end())
+            const bool hasDirectStaticCallers =
+                callersByCallee.find(childRun.entrypoint) != callersByCallee.end();
+            const bool hasIndirectStaticCallers =
+                callersByCallee.find("<indirect-call>") != callersByCallee.end();
+            if (!hasDirectStaticCallers && !hasIndirectStaticCallers)
             {
                 continue;
             }
@@ -2966,88 +2977,13 @@ namespace
         };
 
         const auto buildFeasibleActiveCallersDeterministicFirst =
-            [&](PathState &path, RuntimeSymbolId tokenId, std::size_t remainingTokens) -> llvm::SmallVector<ActiveCaller, 4>
+            [&](PathState &path, RuntimeSymbolId tokenId) -> llvm::SmallVector<ActiveCaller, 4>
         {
-            cleanupInferredStack(path);
-
-            const auto callerIsStaticFeasible = [&](RuntimeSymbolId callerId) -> bool
-            {
-                return callerMatchesStaticCallee(internedCallersByCallee, callerId, tokenId, indirectCallId);
-            };
-
-            llvm::SmallVector<ActiveCaller, 4> callers;
-            callers.reserve(path.inferredStack.size() + path.explicitFrames.size());
-
-            if (!path.inferredStack.empty())
-            {
-                InferredFrame &top = path.inferredStack.back();
-                const bool mirrorsExplicitTop =
-                    !path.explicitFrames.empty() && top.functionId == path.explicitFrames.back().functionId;
-                if (!mirrorsExplicitTop &&
-                    callerIsStaticFeasible(top.functionId) &&
-                    frameCanCallToken(top, tokenId, symbols, internedCfgByFunction))
-                {
-                    callers.push_back(ActiveCaller{top.functionId, true, path.inferredStack.size() - 1U, 0U});
-                    return callers;
-                }
-            }
-
-            if (!path.explicitFrames.empty())
-            {
-                InferredFrame &top = path.explicitFrames.back();
-                if (callerIsStaticFeasible(top.functionId) &&
-                    frameCanCallToken(top, tokenId, symbols, internedCfgByFunction))
-                {
-                    callers.push_back(ActiveCaller{top.functionId, false, path.explicitFrames.size() - 1U, 0U});
-                    return callers;
-                }
-            }
-
-            std::size_t depth = 0U;
-            for (std::size_t i = path.inferredStack.size(); i > 0U; --i)
-            {
-                InferredFrame &frame = path.inferredStack[i - 1U];
-                const bool isTopInferredFrame = (i == path.inferredStack.size());
-                const bool mirrorsExplicitTop =
-                    isTopInferredFrame &&
-                    !path.explicitFrames.empty() &&
-                    frame.functionId == path.explicitFrames.back().functionId;
-
-                if (mirrorsExplicitTop)
-                {
-                    ++depth;
-                    continue;
-                }
-
-                if (!callerIsStaticFeasible(frame.functionId) ||
-                    !frameCanCallToken(frame, tokenId, symbols, internedCfgByFunction))
-                {
-                    ++depth;
-                    continue;
-                }
-
-                const std::optional<std::size_t> remainingCalls = minimumRemainingCallsToExit(frame, internedCfgByFunction);
-                if (remainingCalls.has_value() && *remainingCalls < remainingTokens)
-                {
-                    ++depth;
-                    continue;
-                }
-
-                callers.push_back(ActiveCaller{frame.functionId, true, i - 1U, depth});
-                ++depth;
-            }
-
-            if (!path.explicitFrames.empty())
-            {
-                InferredFrame &frame = path.explicitFrames.back();
-                if (callerIsStaticFeasible(frame.functionId) &&
-                    frameCanCallToken(frame, tokenId, symbols, internedCfgByFunction))
-                {
-                    callers.push_back(ActiveCaller{frame.functionId, false, path.explicitFrames.size() - 1U, depth});
-                }
-            }
-
-            return callers;
+            // Use the full feasible-caller walk here instead of pruning by the number of
+            // remaining context events. A callee can legitimately return before later
+            // sibling/ancestor events execute, so treating the whole suffix as if it must fit
+            // inside one inferred frame rejects valid paths.
+            return buildFeasibleActiveCallers(path, tokenId, symbols, internedCfgByFunction);
         };
 
         auto failCurrentEvent = [&](const ContextProcessingEvent &failedEvent,
@@ -3079,13 +3015,11 @@ namespace
             std::vector<RuntimeFailureExample> invalidationExamplesForEvent;
             bool eventHadEligibleAmbiguity = false;
             bool eventResolvedByLookahead = false;
-            const std::size_t remainingTokens = processingEvents.size() - cursor;
-
             if (activePaths.size() == 1U)
             {
                 PathState prepared = std::move(activePaths.front());
                 llvm::SmallVector<ActiveCaller, 4> activeCallers =
-                    buildFeasibleActiveCallersDeterministicFirst(prepared, event.tokenId, remainingTokens);
+                    buildFeasibleActiveCallersDeterministicFirst(prepared, event.tokenId);
 
                 if (activeCallers.empty())
                 {
@@ -3185,7 +3119,7 @@ namespace
             {
                 PathState prepared = std::move(path);
                 llvm::SmallVector<ActiveCaller, 4> activeCallers =
-                    buildFeasibleActiveCallersDeterministicFirst(prepared, event.tokenId, remainingTokens);
+                    buildFeasibleActiveCallersDeterministicFirst(prepared, event.tokenId);
 
                 if (activeCallers.empty())
                 {
@@ -3257,16 +3191,16 @@ namespace
                         ActiveCaller caller;
                         bool feasible = true;
                         std::size_t frontierWidth = static_cast<std::size_t>(-1);
+                        std::size_t originalRank = 0U;
                     };
 
                     std::vector<LookaheadCandidate> lookaheadCandidates;
                     lookaheadCandidates.reserve(candidates.size());
-                    std::transform(
-                        candidates.begin(),
-                        candidates.end(),
-                        std::back_inserter(lookaheadCandidates),
-                        [](const ActiveCaller &candidate)
-                        { return LookaheadCandidate{candidate, true}; });
+                    for (std::size_t candidateIndex = 0U; candidateIndex < candidates.size(); ++candidateIndex)
+                    {
+                        lookaheadCandidates.push_back(
+                            LookaheadCandidate{candidates[candidateIndex], true, static_cast<std::size_t>(-1), candidateIndex});
+                    }
 
                     for (LookaheadCandidate &entry : lookaheadCandidates)
                     {
@@ -3290,7 +3224,10 @@ namespace
                         {
                             const ContextProcessingEvent &futureEvent = processingEvents[futureIndex];
                             const std::string &futureEventToken = contextEventToken(futureEvent);
-                            ++inspectedEvents;
+                            if (!futureEvent.entersContext)
+                            {
+                                ++inspectedEvents;
+                            }
 
                             std::vector<PathState> nextProbeStates;
                             for (PathState &probeState : probeStates)
@@ -3359,29 +3296,40 @@ namespace
                         }
                     }
 
-                    candidates.clear();
-                    std::size_t bestFrontierWidth = static_cast<std::size_t>(-1);
+                    llvm::SmallVector<ActiveCaller, 4> lookaheadOrderedCandidates;
+                    lookaheadOrderedCandidates.reserve(lookaheadCandidates.size());
+                    const auto lookaheadRankLess = [](const LookaheadCandidate &lhs, const LookaheadCandidate &rhs)
+                    {
+                        if (lhs.feasible != rhs.feasible)
+                        {
+                            return lhs.feasible && !rhs.feasible;
+                        }
+                        if (lhs.feasible && rhs.feasible && lhs.frontierWidth != rhs.frontierWidth)
+                        {
+                            return lhs.frontierWidth < rhs.frontierWidth;
+                        }
+                        return lhs.originalRank < rhs.originalRank;
+                    };
+                    std::sort(lookaheadCandidates.begin(), lookaheadCandidates.end(), lookaheadRankLess);
+
+                    bool keptAnyFeasibleCandidate = false;
                     for (const LookaheadCandidate &entry : lookaheadCandidates)
                     {
-                        if (entry.feasible)
+                        if (!entry.feasible)
                         {
-                            bestFrontierWidth = std::min(bestFrontierWidth, entry.frontierWidth);
+                            continue;
                         }
+                        keptAnyFeasibleCandidate = true;
+                        lookaheadOrderedCandidates.push_back(entry.caller);
                     }
 
-                    if (bestFrontierWidth == static_cast<std::size_t>(-1))
+                    if (keptAnyFeasibleCandidate)
                     {
-                        candidates = originalCandidates;
+                        candidates = std::move(lookaheadOrderedCandidates);
                     }
                     else
                     {
-                        for (const LookaheadCandidate &entry : lookaheadCandidates)
-                        {
-                            if (entry.feasible && entry.frontierWidth == bestFrontierWidth)
-                            {
-                                candidates.push_back(entry.caller);
-                            }
-                        }
+                        candidates = originalCandidates;
                     }
 
                     if (candidates.size() > 1U)
@@ -3400,7 +3348,7 @@ namespace
                     {
                         candidateNames.reset();
                     }
-                    if (candidates.size() == 1U)
+                    if (originalCandidates.size() > 1U && candidates.size() == 1U)
                     {
                         eventResolvedByLookahead = true;
                     }
