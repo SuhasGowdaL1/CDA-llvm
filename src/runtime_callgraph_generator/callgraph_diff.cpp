@@ -84,6 +84,25 @@ namespace
         std::vector<std::size_t> children;
     };
 
+    struct NamedNodeKey
+    {
+        std::size_t parentIndex = 0U;
+        std::string childName;
+
+        bool operator==(const NamedNodeKey &other) const
+        {
+            return parentIndex == other.parentIndex && childName == other.childName;
+        }
+    };
+
+    struct NamedNodeKeyHash
+    {
+        std::size_t operator()(const NamedNodeKey &key) const
+        {
+            return std::hash<std::size_t>{}(key.parentIndex) ^ (std::hash<std::string>{}(key.childName) << 1U);
+        }
+    };
+
     struct RootStats
     {
         std::string name;
@@ -610,9 +629,6 @@ namespace
 
     std::vector<RuntimeOccurrenceNode> buildOccurrenceNodesForContext(const RuntimeContextData &runtimeContext)
     {
-        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
-        occurrenceNodes.push_back({runtimeContext.entrypoint, 0U, {}});
-
         std::vector<const RuntimeCallData *> orderedCalls;
         orderedCalls.reserve(runtimeContext.calls.size());
         for (const RuntimeCallData &call : runtimeContext.calls)
@@ -630,6 +646,13 @@ namespace
                 return lhs->caller < rhs->caller;
             }
             return lhs->callee < rhs->callee; });
+
+        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
+        occurrenceNodes.reserve(runtimeContext.calls.size() + 1U);
+        occurrenceNodes.push_back({runtimeContext.entrypoint, 0U, {}});
+
+        std::unordered_map<NamedNodeKey, std::size_t, NamedNodeKeyHash> childIndexByParentAndName;
+        childIndexByParentAndName.reserve(runtimeContext.calls.size() * 2U + 1U);
 
         std::vector<std::size_t> frameStack;
         frameStack.push_back(0U);
@@ -677,68 +700,25 @@ namespace
 
             const std::size_t parentIndex = frameStack.back();
             const std::string calleeName = call->callee.empty() ? std::string("<unknown>") : call->callee;
-            const std::size_t childIndex = occurrenceNodes.size();
-            occurrenceNodes.push_back({calleeName, 1U, {}});
-            occurrenceNodes[parentIndex].children.push_back(childIndex);
+            const NamedNodeKey key{parentIndex, calleeName};
+            std::size_t childIndex = 0U;
+            const auto childIt = childIndexByParentAndName.find(key);
+            if (childIt != childIndexByParentAndName.end())
+            {
+                childIndex = childIt->second;
+                ++occurrenceNodes[childIndex].hitCount;
+            }
+            else
+            {
+                childIndex = occurrenceNodes.size();
+                occurrenceNodes.push_back({calleeName, 1U, {}});
+                occurrenceNodes[parentIndex].children.push_back(childIndex);
+                childIndexByParentAndName.emplace(NamedNodeKey{parentIndex, calleeName}, childIndex);
+            }
             frameStack.push_back(childIndex);
         }
 
-        std::vector<RuntimeOccurrenceNode> compressedNodes;
-        if (occurrenceNodes.empty())
-        {
-            return compressedNodes;
-        }
-
-        const std::function<std::size_t(const std::vector<std::size_t> &)> compressGroup =
-            [&](const std::vector<std::size_t> &sourceIndices) -> std::size_t
-        {
-            if (sourceIndices.empty())
-            {
-                return 0U;
-            }
-
-            const RuntimeOccurrenceNode &representative = occurrenceNodes[sourceIndices.front()];
-            const std::size_t compressedIndex = compressedNodes.size();
-            compressedNodes.push_back({representative.name, 0U, {}});
-
-            std::vector<std::string> childOrder;
-            std::unordered_map<std::string, std::vector<std::size_t>> childGroups;
-            for (const std::size_t sourceIndex : sourceIndices)
-            {
-                if (sourceIndex >= occurrenceNodes.size())
-                {
-                    continue;
-                }
-
-                const RuntimeOccurrenceNode &sourceNode = occurrenceNodes[sourceIndex];
-                compressedNodes[compressedIndex].hitCount += sourceNode.hitCount;
-                for (const std::size_t sourceChildIndex : sourceNode.children)
-                {
-                    if (sourceChildIndex >= occurrenceNodes.size())
-                    {
-                        continue;
-                    }
-
-                    const std::string &childName = occurrenceNodes[sourceChildIndex].name;
-                    std::vector<std::size_t> &group = childGroups[childName];
-                    if (group.empty())
-                    {
-                        childOrder.push_back(childName);
-                    }
-                    group.push_back(sourceChildIndex);
-                }
-            }
-
-            for (const std::string &childName : childOrder)
-            {
-                const std::size_t compressedChildIndex = compressGroup(childGroups[childName]);
-                compressedNodes[compressedIndex].children.push_back(compressedChildIndex);
-            }
-            return compressedIndex;
-        };
-
-        compressGroup({0U});
-        return compressedNodes;
+        return occurrenceNodes;
     }
 
     void mergeOccurrenceSubtree(
