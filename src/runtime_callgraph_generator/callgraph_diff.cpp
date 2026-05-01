@@ -73,7 +73,6 @@ namespace
         std::size_t ordinal = 0U;
         std::size_t startEventIndex = 0U;
         std::size_t endEventIndex = 0U;
-        std::unordered_map<std::string, std::size_t> edgeCounts;
         std::vector<RuntimeCallData> calls;
     };
 
@@ -110,9 +109,6 @@ namespace
         std::size_t covered = 0;
         std::size_t uncovered = 0;
         double pct = 0.0;
-        std::size_t runCount = 0;
-        CallGraph subgraph;
-        std::set<std::string> nodes;
         TreeNodes treeNodes;
     };
 
@@ -453,7 +449,6 @@ namespace
                 runtimeContext.endEventIndex = static_cast<std::size_t>(*endValue);
             }
 
-            runtimeContext.edgeCounts.reserve(calls->size());
             runtimeContext.calls.reserve(calls->size());
 
             for (const llvm::json::Value &callValue : *calls)
@@ -494,8 +489,6 @@ namespace
                 {
                     runtimeContext.entrypoint = caller;
                 }
-                const std::string key = caller + "|" + callee;
-                ++runtimeContext.edgeCounts[key];
                 runtimeContext.calls.push_back(RuntimeCallData{eventIndex, caller, callerDepth, callee});
             }
 
@@ -531,7 +524,7 @@ namespace
         return true;
     }
 
-    void removeBackEdges(const std::set<Edge> &staticEdges, CallGraph &acyclicGraph, std::set<Edge> &acyclicEdges)
+    void removeBackEdges(const std::set<Edge> &staticEdges, CallGraph &acyclicGraph)
     {
         CallGraph adjacency;
         for (const Edge &edge : staticEdges)
@@ -571,7 +564,6 @@ namespace
                     }
 
                     acyclicGraph[node].insert(child);
-                    acyclicEdges.insert({node, child});
                 }
             }
 
@@ -588,7 +580,7 @@ namespace
         }
     }
 
-    void buildSubgraphFromRoot(const std::string &root, const CallGraph &acyclicGraph, CallGraph &subgraph, std::set<std::string> &nodes)
+    void buildSubgraphFromRoot(const std::string &root, const CallGraph &acyclicGraph, CallGraph &subgraph)
     {
         std::unordered_set<std::string> visited;
         std::queue<std::string> worklist;
@@ -603,8 +595,6 @@ namespace
             {
                 continue;
             }
-
-            nodes.insert(current);
 
             const auto it = acyclicGraph.find(current);
             if (it == acyclicGraph.end())
@@ -1213,8 +1203,7 @@ int main(int argc, const char **argv)
     }
 
     CallGraph acyclicGraph;
-    std::set<Edge> acyclicEdges;
-    removeBackEdges(staticEdges, acyclicGraph, acyclicEdges);
+    removeBackEdges(staticEdges, acyclicGraph);
 
     std::vector<const RuntimeContextData *> orderedContexts;
     orderedContexts.reserve(runtimeContexts.size());
@@ -1280,10 +1269,9 @@ int main(int argc, const char **argv)
         {
             stats.name += " (" + std::to_string(contextGroup.size()) + " runs)";
         }
-        stats.runCount = contextGroup.size();
-
-        buildSubgraphFromRoot(entrypoint, acyclicGraph, stats.subgraph, stats.nodes);
-        buildTreeNodesForContexts(entrypoint, contextGroup, stats.subgraph, stats.treeNodes);
+        CallGraph subgraph;
+        buildSubgraphFromRoot(entrypoint, acyclicGraph, subgraph);
+        buildTreeNodesForContexts(entrypoint, contextGroup, subgraph, stats.treeNodes);
         for (const TreeNode &node : stats.treeNodes)
         {
             stats.covered += node.coveredChildren;
