@@ -102,14 +102,13 @@ namespace
         }
     };
 
-    struct RootStats
+    struct RootSummary
     {
         std::string name;
         std::size_t nodeCount = 0;
         std::size_t covered = 0;
         std::size_t uncovered = 0;
         double pct = 0.0;
-        TreeNodes treeNodes;
     };
 
     llvm::cl::OptionCategory kCategory("callgraph-diff options");
@@ -868,26 +867,27 @@ namespace
         emitTree(0U, std::string{}, 0, true);
     }
 
-    std::string buildSidebarHtml(const std::vector<std::string> &rootNames, const std::vector<double> &coveragePercents)
+    std::string buildSidebarHtml(const std::vector<RootSummary> &rootSummaries)
     {
         std::ostringstream html;
         html << "<div class=\"sidebar\">\n";
-        html << "  <div class=\"sidebar-title\">Contexts (" << rootNames.size() << ")</div>\n";
+        html << "  <div class=\"sidebar-title\">Contexts (" << rootSummaries.size() << ")</div>\n";
         html << "  <div class=\"sidebar-search\">\n";
         html << "    <input type=\"text\" id=\"sidebar-search\" placeholder=\"Filter contexts...\" oninput=\"filterSidebar(this.value)\">\n";
         html << "  </div>\n";
         html << "  <div class=\"entry-list\" id=\"entry-list\">\n";
 
-        for (std::size_t index = 0; index < rootNames.size(); ++index)
+        for (std::size_t index = 0; index < rootSummaries.size(); ++index)
         {
-            const double pct = coveragePercents[index];
+            const RootSummary &summary = rootSummaries[index];
+            const double pct = summary.pct;
             const std::string pctClass = pct >= 75.0 ? "pct-high" : (pct >= 40.0 ? "pct-medium" : "pct-low");
             const std::string barColor = pct >= 75.0 ? "var(--green)" : (pct >= 40.0 ? "var(--yellow)" : "var(--red)");
 
             html << "    <div class=\"entry-card\" data-idx=\"" << index << "\">\n";
             html << "      <button type=\"button\" class=\"entry-item" << (index == 0U ? " active" : "")
                  << "\" data-idx=\"" << index << "\" onclick=\"selectRoot(" << index << ")\">\n";
-            html << "        <span class=\"entry-name\" title=\"" << escapeHtml(rootNames[index]) << "\">" << escapeHtml(rootNames[index]) << "</span>\n";
+            html << "        <span class=\"entry-name\" title=\"" << escapeHtml(summary.name) << "\">" << escapeHtml(summary.name) << "</span>\n";
             html << "        <span class=\"entry-pct " << pctClass << "\">" << static_cast<int>(pct) << "%</span>\n";
             html << "      </button>\n";
             html << "      <div class=\"entry-bar\">\n";
@@ -901,9 +901,8 @@ namespace
         return html.str();
     }
 
-    std::string buildTreeRowsHtml(const TreeNodes &treeNodes, std::size_t tabIndex)
+    void writeTreeRowsHtml(std::ostream &output, const TreeNodes &treeNodes, std::size_t tabIndex)
     {
-        std::ostringstream html;
         for (std::size_t index = 0; index < treeNodes.size(); ++index)
         {
             const TreeNode &node = treeNodes[index];
@@ -930,90 +929,120 @@ namespace
                 badgeText = node.edgeTaken ? "&check; taken" : "&times; not taken";
             }
 
-            html << "        <tr class=\"tree-node" << (node.level != 0 ? " tree-hidden" : "") << "\"";
-            html << " data-uid=\"" << uid << "\"";
-            html << " data-parent-uid=\"" << parentUid << "\"";
-            html << " data-edge-status=\"" << edgeStatus << "\"";
-            html << " data-name=\"" << escapeHtml(node.name) << "\">\n";
-            html << "          <td>\n";
-            html << "            <div class=\"node-cell\">\n";
+            output << "        <tr class=\"tree-node" << (node.level != 0 ? " tree-hidden" : "") << "\"";
+            output << " data-uid=\"" << uid << "\"";
+            output << " data-parent-uid=\"" << parentUid << "\"";
+            output << " data-edge-status=\"" << edgeStatus << "\"";
+            output << " data-name=\"" << escapeHtml(node.name) << "\">\n";
+            output << "          <td>\n";
+            output << "            <div class=\"node-cell\">\n";
             for (int level = 0; level < node.level; ++level)
             {
-                html << "              <span class=\"ident-block\"></span>\n";
+                output << "              <span class=\"ident-block\"></span>\n";
             }
 
             if (hasChildren)
             {
-                html << "              <span class=\"tree-toggle\" data-toggle-uid=\"" << uid << "\" data-expanded=\"true\">&#9660;</span>\n";
+                output << "              <span class=\"tree-toggle\" data-toggle-uid=\"" << uid << "\" data-expanded=\"true\">&#9660;</span>\n";
             }
             else
             {
-                html << "              <span class=\"tree-toggle no-children\">&#9675;</span>\n";
+                output << "              <span class=\"tree-toggle no-children\">&#9675;</span>\n";
             }
 
             // show node name and, if present, the hit count for the incoming edge
-            html << "              <span class=\"node-name" << (node.level == 0 ? " is-root" : "") << "\">" << escapeHtml(node.name) << "</span>\n";
+            output << "              <span class=\"node-name" << (node.level == 0 ? " is-root" : "") << "\">" << escapeHtml(node.name) << "</span>\n";
             if (node.hitCount > 0U)
             {
-                html << "              <span class=\"edge-hits\">(" << node.hitCount << ")</span>\n";
+                output << "              <span class=\"edge-hits\">(" << node.hitCount << ")</span>\n";
             }
-            html << "            </div>\n";
-            html << "          </td>\n";
-            html << "          <td class=\"status-cell\">\n";
-            html << "            <span class=\"badge " << badgeClass << "\">" << badgeText << "</span>\n";
-            html << "          </td>\n";
-            html << "        </tr>\n";
+            output << "            </div>\n";
+            output << "          </td>\n";
+            output << "          <td class=\"status-cell\">\n";
+            output << "            <span class=\"badge " << badgeClass << "\">" << badgeText << "</span>\n";
+            output << "          </td>\n";
+            output << "        </tr>\n";
         }
-
-        return html.str();
     }
 
-    std::string buildMainHtml(const std::vector<RootStats> &rootStats)
+    void writePanelHtml(std::ostream &output, const RootSummary &summary, const TreeNodes &treeNodes, std::size_t tabIndex)
     {
-        std::ostringstream html;
-        html << "<div class=\"main\">\n";
-        for (std::size_t index = 0; index < rootStats.size(); ++index)
-        {
-            const RootStats &stats = rootStats[index];
-            html << "  <div id=\"panel-" << index << "\" class=\"panel\" style=\"display:" << (index == 0U ? "flex" : "none") << "\">\n";
-            html << "    <div class=\"panel-header\">\n";
-            html << "      <div class=\"panel-title\">" << escapeHtml(stats.name) << "</div>\n";
-            html << "      <div class=\"stats-row\">\n";
-            html << "        <div class=\"stat-pill\"><span class=\"dot dot-total\"></span>" << stats.nodeCount << " nodes</div>\n";
-            html << "        <div class=\"stat-pill\"><span class=\"dot dot-covered\"></span>" << stats.covered << " covered</div>\n";
-            html << "        <div class=\"stat-pill\"><span class=\"dot dot-uncovered\"></span>" << stats.uncovered << " uncovered</div>\n";
-            html << "      </div>\n";
-            html << "    </div>\n";
-            html << "    <div class=\"toolbar\">\n";
-            html << "      <input type=\"text\" placeholder=\"Search functions...\" oninput=\"filterTree(this.value, " << index << ")\">\n";
-            html << "      <button type=\"button\" class=\"toolbar-btn\" onclick=\"expandAll(" << index << ")\">Expand All</button>\n";
-            html << "      <button type=\"button\" class=\"toolbar-btn\" onclick=\"collapseAll(" << index << ")\">Collapse All</button>\n";
-            html << "      <div class=\"filter-group\">\n";
-            html << "        <button type=\"button\" class=\"filter-btn active-all\" data-filter=\"all\" data-tab=\"" << index << "\" onclick=\"setFilter('all', " << index << ")\">All</button>\n";
-            html << "        <button type=\"button\" class=\"filter-btn\" data-filter=\"covered\" data-tab=\"" << index << "\" onclick=\"setFilter('covered', " << index << ")\">Covered</button>\n";
-            html << "        <button type=\"button\" class=\"filter-btn\" data-filter=\"uncovered\" data-tab=\"" << index << "\" onclick=\"setFilter('uncovered', " << index << ")\">Uncovered</button>\n";
-            html << "      </div>\n";
-            html << "    </div>\n";
-            html << "    <div class=\"tree-wrap\">\n";
-            html << "      <table>\n";
-            html << "        <thead>\n";
-            html << "          <tr>\n";
-            html << "            <th>Function</th>\n";
-            html << "            <th style=\"width:160px\">Status</th>\n";
-            html << "          </tr>\n";
-            html << "        </thead>\n";
-            html << "        <tbody id=\"tbody-" << index << "\">\n";
-            html << buildTreeRowsHtml(stats.treeNodes, index);
-            html << "        </tbody>\n";
-            html << "      </table>\n";
-            html << "    </div>\n";
-            html << "  </div>\n";
-        }
-        html << "</div>\n";
-        return html.str();
+        output << "  <div id=\"panel-" << tabIndex << "\" class=\"panel\" style=\"display:" << (tabIndex == 0U ? "flex" : "none") << "\">\n";
+        output << "    <div class=\"panel-header\">\n";
+        output << "      <div class=\"panel-title\">" << escapeHtml(summary.name) << "</div>\n";
+        output << "      <div class=\"stats-row\">\n";
+        output << "        <div class=\"stat-pill\"><span class=\"dot dot-total\"></span>" << summary.nodeCount << " nodes</div>\n";
+        output << "        <div class=\"stat-pill\"><span class=\"dot dot-covered\"></span>" << summary.covered << " covered</div>\n";
+        output << "        <div class=\"stat-pill\"><span class=\"dot dot-uncovered\"></span>" << summary.uncovered << " uncovered</div>\n";
+        output << "      </div>\n";
+        output << "    </div>\n";
+        output << "    <div class=\"toolbar\">\n";
+        output << "      <input type=\"text\" placeholder=\"Search functions...\" oninput=\"filterTree(this.value, " << tabIndex << ")\">\n";
+        output << "      <button type=\"button\" class=\"toolbar-btn\" onclick=\"expandAll(" << tabIndex << ")\">Expand All</button>\n";
+        output << "      <button type=\"button\" class=\"toolbar-btn\" onclick=\"collapseAll(" << tabIndex << ")\">Collapse All</button>\n";
+        output << "      <div class=\"filter-group\">\n";
+        output << "        <button type=\"button\" class=\"filter-btn active-all\" data-filter=\"all\" data-tab=\"" << tabIndex << "\" onclick=\"setFilter('all', " << tabIndex << ")\">All</button>\n";
+        output << "        <button type=\"button\" class=\"filter-btn\" data-filter=\"covered\" data-tab=\"" << tabIndex << "\" onclick=\"setFilter('covered', " << tabIndex << ")\">Covered</button>\n";
+        output << "        <button type=\"button\" class=\"filter-btn\" data-filter=\"uncovered\" data-tab=\"" << tabIndex << "\" onclick=\"setFilter('uncovered', " << tabIndex << ")\">Uncovered</button>\n";
+        output << "      </div>\n";
+        output << "    </div>\n";
+        output << "    <div class=\"tree-wrap\">\n";
+        output << "      <table>\n";
+        output << "        <thead>\n";
+        output << "          <tr>\n";
+        output << "            <th>Function</th>\n";
+        output << "            <th style=\"width:160px\">Status</th>\n";
+        output << "          </tr>\n";
+        output << "        </thead>\n";
+        output << "        <tbody id=\"tbody-" << tabIndex << "\">\n";
+        writeTreeRowsHtml(output, treeNodes, tabIndex);
+        output << "        </tbody>\n";
+        output << "      </table>\n";
+        output << "    </div>\n";
+        output << "  </div>\n";
     }
 
-    bool writeHtmlFile(const std::string &path, const std::vector<RootStats> &rootStats, const std::set<Edge> &staticEdges, const std::set<Edge> &runtimeEdges, std::string &error)
+    bool streamFileIntoOutput(std::string_view sourcePath, std::ofstream &output, std::string &error)
+    {
+        std::ifstream input(std::string(sourcePath), std::ios::binary);
+        if (!input)
+        {
+            error = "failed to open intermediate HTML fragment: " + std::string(sourcePath);
+            return false;
+        }
+
+        std::vector<char> buffer(64U * 1024U);
+        while (input)
+        {
+            input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+            const std::streamsize readCount = input.gcount();
+            if (readCount > 0)
+            {
+                output.write(buffer.data(), readCount);
+                if (!output)
+                {
+                    error = "failed to write HTML output";
+                    return false;
+                }
+            }
+        }
+
+        if (!input.eof())
+        {
+            error = "failed while reading intermediate HTML fragment: " + std::string(sourcePath);
+            return false;
+        }
+
+        return true;
+    }
+
+    bool writeHtmlFile(
+        const std::string &path,
+        const std::vector<RootSummary> &rootSummaries,
+        std::string_view panelsPath,
+        const std::set<Edge> &staticEdges,
+        const std::set<Edge> &runtimeEdges,
+        std::string &error)
     {
         if (path.empty())
         {
@@ -1026,16 +1055,6 @@ namespace
         if (!loadTemplateBundle(htmlTemplate, cssTemplate, jsTemplate, error))
         {
             return false;
-        }
-
-        std::vector<std::string> rootNames;
-        std::vector<double> coveragePercents;
-        rootNames.reserve(rootStats.size());
-        coveragePercents.reserve(rootStats.size());
-        for (const RootStats &stats : rootStats)
-        {
-            rootNames.push_back(stats.name);
-            coveragePercents.push_back(stats.pct);
         }
 
         std::size_t globallyCoveredStaticEdges = 0U;
@@ -1069,25 +1088,46 @@ namespace
         globalBarHtml += "%\"></div>\n";
         globalBarHtml += "</div>\n";
 
-        const std::string sidebarHtml = buildSidebarHtml(rootNames, coveragePercents);
-        const std::string mainHtml = buildMainHtml(rootStats);
-
-        std::string body;
-        body.reserve(headerHtml.size() + globalBarHtml.size() + sidebarHtml.size() + mainHtml.size() + 64U);
-        body += headerHtml;
-        body += globalBarHtml;
-        body += "<div class=\"layout\">\n";
-        body += sidebarHtml;
-        body += mainHtml;
-        body += "</div>\n";
-
         std::string html = htmlTemplate;
         html = replaceAll(html, "{{TITLE}}", "Callgraph Coverage Analysis");
         html = replaceAll(html, "{{STYLE}}", cssTemplate);
-        html = replaceAll(html, "{{BODY}}", body);
         html = replaceAll(html, "{{SCRIPT}}", jsTemplate);
+        constexpr std::string_view kBodyMarker = "{{BODY}}";
+        const std::size_t bodyPos = html.find(kBodyMarker);
+        if (bodyPos == std::string::npos)
+        {
+            error = "HTML template missing {{BODY}} placeholder";
+            return false;
+        }
 
-        return writeTextFile(path, html, error);
+        std::ofstream output(path, std::ios::binary);
+        if (!output)
+        {
+            error = "failed to open output file: " + path;
+            return false;
+        }
+
+        output.write(html.data(), static_cast<std::streamsize>(bodyPos));
+        output << headerHtml;
+        output << globalBarHtml;
+        output << "<div class=\"layout\">\n";
+        output << buildSidebarHtml(rootSummaries);
+        output << "<div class=\"main\">\n";
+        if (!streamFileIntoOutput(panelsPath, output, error))
+        {
+            return false;
+        }
+        output << "</div>\n";
+        output << "</div>\n";
+
+        const std::size_t suffixPos = bodyPos + kBodyMarker.size();
+        output.write(html.data() + static_cast<std::ptrdiff_t>(suffixPos), static_cast<std::streamsize>(html.size() - suffixPos));
+        if (!output)
+        {
+            error = "failed to write output file: " + path;
+            return false;
+        }
+        return true;
     }
 
     bool writeJsonFile(const std::string &path, const std::set<Edge> &staticEdges, const std::set<Edge> &runtimeEdges, const std::set<Edge> &uncoveredEdges, std::size_t totalStaticNodes, std::size_t totalRuntimeNodes, std::string &error)
@@ -1252,8 +1292,22 @@ int main(int argc, const char **argv)
         group.push_back(runtimeContext);
     }
 
-    std::vector<RootStats> rootStats;
-    rootStats.reserve(orderedEntrypoints.size());
+    const std::string htmlOutputPath = kHtmlOutput;
+    if (htmlOutputPath.empty())
+    {
+        return 0;
+    }
+
+    const std::string panelsPath = htmlOutputPath + ".panels.tmp";
+    std::ofstream panelsOutput(panelsPath, std::ios::binary);
+    if (!panelsOutput)
+    {
+        llvm::errs() << "[callgraph-diff] failed to open intermediate HTML fragment: " << panelsPath << "\n";
+        return 1;
+    }
+
+    std::vector<RootSummary> rootSummaries;
+    rootSummaries.reserve(orderedEntrypoints.size());
     for (const std::string &entrypoint : orderedEntrypoints)
     {
         const auto groupIt = contextsByEntrypoint.find(entrypoint);
@@ -1263,30 +1317,54 @@ int main(int argc, const char **argv)
         }
 
         const std::vector<const RuntimeContextData *> &contextGroup = groupIt->second;
-        RootStats stats;
-        stats.name = entrypoint;
+        RootSummary summary;
+        summary.name = entrypoint;
         if (contextGroup.size() > 1U)
         {
-            stats.name += " (" + std::to_string(contextGroup.size()) + " runs)";
+            summary.name += " (" + std::to_string(contextGroup.size()) + " runs)";
         }
         CallGraph subgraph;
+        TreeNodes treeNodes;
         buildSubgraphFromRoot(entrypoint, acyclicGraph, subgraph);
-        buildTreeNodesForContexts(entrypoint, contextGroup, subgraph, stats.treeNodes);
-        for (const TreeNode &node : stats.treeNodes)
+        buildTreeNodesForContexts(entrypoint, contextGroup, subgraph, treeNodes);
+        for (const TreeNode &node : treeNodes)
         {
-            stats.covered += node.coveredChildren;
-            stats.uncovered += node.uncoveredChildren;
+            summary.covered += node.coveredChildren;
+            summary.uncovered += node.uncoveredChildren;
         }
-        stats.nodeCount = stats.treeNodes.size();
-        stats.pct = (stats.covered + stats.uncovered) > 0U ? (100.0 * static_cast<double>(stats.covered)) / static_cast<double>(stats.covered + stats.uncovered) : 0.0;
-        rootStats.push_back(std::move(stats));
+        summary.nodeCount = treeNodes.size();
+        summary.pct = (summary.covered + summary.uncovered) > 0U ? (100.0 * static_cast<double>(summary.covered)) / static_cast<double>(summary.covered + summary.uncovered) : 0.0;
+        writePanelHtml(panelsOutput, summary, treeNodes, rootSummaries.size());
+        panelsOutput.flush();
+        if (!panelsOutput)
+        {
+            llvm::errs() << "[callgraph-diff] failed to write intermediate HTML fragment: " << panelsPath << "\n";
+            std::error_code removeError;
+            std::filesystem::remove(panelsPath, removeError);
+            return 1;
+        }
+        rootSummaries.push_back(std::move(summary));
     }
 
-    if (!writeHtmlFile(kHtmlOutput, rootStats, staticEdges, runtimeEdges, error))
+    panelsOutput.close();
+    if (!panelsOutput)
     {
-        llvm::errs() << "[callgraph-diff] " << error << "\n";
+        llvm::errs() << "[callgraph-diff] failed to finalize intermediate HTML fragment: " << panelsPath << "\n";
+        std::error_code removeError;
+        std::filesystem::remove(panelsPath, removeError);
         return 1;
     }
+
+    if (!writeHtmlFile(htmlOutputPath, rootSummaries, panelsPath, staticEdges, runtimeEdges, error))
+    {
+        llvm::errs() << "[callgraph-diff] " << error << "\n";
+        std::error_code removeError;
+        std::filesystem::remove(panelsPath, removeError);
+        return 1;
+    }
+
+    std::error_code removeError;
+    std::filesystem::remove(panelsPath, removeError);
 
     return 0;
 }
