@@ -25,6 +25,8 @@ RUNTIME_TIMELINE_HTML="out/runtime-timeline.html"
 RUNTIME_CONTEXT_TREE_HTML="out/runtime-context-tree.html"
 RUNTIME_TOP_K=8
 RUNTIME_LOOKAHEAD_PLAIN_EVENTS=8
+CALLGRAPH_DIFF_OUTPUT="out/callgraph-diff.json"
+CALLGRAPH_DIFF_HTML="out/callgraph-diff.html"
 DO_BUILD_IMAGE=0
 DO_FORMAT=0
 DO_DOT=0
@@ -35,6 +37,7 @@ DO_CALLGRAPH_DEBUG=0
 DO_RUNTIME_CALLGRAPH=0
 DO_RUNTIME_DOT=1
 DO_RUNTIME_HTML=1
+DO_CALLGRAPH_DIFF=0
 DO_DOCKER_BUILD=0
 ACTIVE_CONTAINER_NAMES=()
 
@@ -107,6 +110,10 @@ Options:
                              Future plain events used by runtime Viterbi-style lookahead (default: 8)
   --no-runtime-dot           Disable runtime DOT output
   --no-runtime-html          Disable runtime HTML outputs
+  --callgraph-diff           Generate callgraph diff JSON and HTML from static/runtime callgraphs
+  --callgraph-diff-output FILE
+                             Callgraph diff JSON output file (default: out/callgraph-diff.json)
+  --callgraph-diff-html FILE Callgraph diff HTML output file (default: out/callgraph-diff.html)
   -h, --help                 Show help
 EOF
 }
@@ -282,6 +289,16 @@ generate_runtime_callgraph() {
   fi
 }
 
+generate_callgraph_diff() {
+  local cmd="./$BUILD_DIR/callgraph_diff --static $(printf '%q' "$CALLGRAPH_OUTPUT") --runtime $(printf '%q' "$RUNTIME_OUTPUT") --entrypoints $(printf '%q' "$RUNTIME_ENTRYPOINTS") -o $(printf '%q' "$CALLGRAPH_DIFF_OUTPUT") --html $(printf '%q' "$CALLGRAPH_DIFF_HTML")"
+
+  if [[ "$DO_DOCKER_BUILD" -eq 1 ]]; then
+    run_in_docker "$cmd"
+  else
+    eval "$cmd"
+  fi
+}
+
 generate_svgs() {
   if [[ "$DO_DOT" -ne 1 ]]; then
     echo "--svg requires --dot"
@@ -410,6 +427,18 @@ while [[ $# -gt 0 ]]; do
       RUNTIME_LOOKAHEAD_PLAIN_EVENTS="$2"
       shift 2
       ;;
+    --callgraph-diff)
+      DO_CALLGRAPH_DIFF=1
+      shift
+      ;;
+    --callgraph-diff-output)
+      CALLGRAPH_DIFF_OUTPUT="$2"
+      shift 2
+      ;;
+    --callgraph-diff-html)
+      CALLGRAPH_DIFF_HTML="$2"
+      shift 2
+      ;;
     --no-runtime-dot)
       DO_RUNTIME_DOT=0
       shift
@@ -429,6 +458,11 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$DO_CALLGRAPH_DIFF" -eq 1 ]]; then
+  DO_CALLGRAPH=1
+  DO_RUNTIME_CALLGRAPH=1
+fi
 
 if [[ "$DO_BUILD_IMAGE" -eq 1 ]]; then
   run_docker_build_image
@@ -476,6 +510,22 @@ if [[ -f "$ROOT_DIR/$BUILD_DIR/cfg_generator" ]]; then
       exit 1
     fi
     generate_runtime_callgraph
+  fi
+
+  if [[ "$DO_CALLGRAPH_DIFF" -eq 1 ]]; then
+    if [[ ! -f "$ROOT_DIR/$BUILD_DIR/callgraph_diff" ]]; then
+      echo "callgraph_diff not found in $BUILD_DIR"
+      exit 1
+    fi
+    if [[ ! -f "$ROOT_DIR/$CALLGRAPH_OUTPUT" ]]; then
+      echo "error: static callgraph JSON not found: $CALLGRAPH_OUTPUT"
+      exit 1
+    fi
+    if [[ ! -f "$ROOT_DIR/$RUNTIME_OUTPUT" ]]; then
+      echo "error: runtime callgraph JSON not found: $RUNTIME_OUTPUT"
+      exit 1
+    fi
+    generate_callgraph_diff
   fi
 
   if [[ "$DO_SVG" -eq 1 ]]; then
