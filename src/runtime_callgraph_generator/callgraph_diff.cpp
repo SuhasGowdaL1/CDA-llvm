@@ -58,6 +58,14 @@ namespace
 
     using TreeNodes = std::vector<TreeNode>;
 
+    struct RuntimeCallData
+    {
+        std::size_t eventIndex = 0U;
+        std::string caller;
+        std::optional<std::size_t> callerDepth;
+        std::string callee;
+    };
+
     struct RuntimeContextData
     {
         std::string contextId;
@@ -66,6 +74,14 @@ namespace
         std::size_t startEventIndex = 0U;
         std::size_t endEventIndex = 0U;
         std::unordered_map<std::string, std::size_t> edgeCounts;
+        std::vector<RuntimeCallData> calls;
+    };
+
+    struct RuntimeOccurrenceNode
+    {
+        std::string name;
+        std::size_t hitCount = 0U;
+        std::vector<std::size_t> children;
     };
 
     struct RootStats
@@ -79,16 +95,6 @@ namespace
         CallGraph subgraph;
         std::set<std::string> nodes;
         TreeNodes treeNodes;
-    };
-
-    struct AggregatedContextData
-    {
-        std::string entrypoint;
-        std::vector<std::string> contextIds;
-        std::size_t ordinal = 0U;
-        std::size_t startEventIndex = 0U;
-        std::size_t endEventIndex = 0U;
-        std::unordered_map<std::string, std::size_t> edgeCounts;
     };
 
     llvm::cl::OptionCategory kCategory("callgraph-diff options");
@@ -429,6 +435,7 @@ namespace
             }
 
             runtimeContext.edgeCounts.reserve(calls->size());
+            runtimeContext.calls.reserve(calls->size());
 
             for (const llvm::json::Value &callValue : *calls)
             {
@@ -445,10 +452,16 @@ namespace
                     continue;
                 }
 
-                std::size_t callerDepth = 0U;
+                std::optional<std::size_t> callerDepth;
                 if (const std::optional<std::int64_t> callerDepthValue = callObject->getInteger("callerDepth"))
                 {
                     callerDepth = static_cast<std::size_t>(*callerDepthValue);
+                }
+
+                std::size_t eventIndex = 0U;
+                if (const std::optional<std::int64_t> eventIndexValue = callObject->getInteger("eventIndex"))
+                {
+                    eventIndex = static_cast<std::size_t>(*eventIndexValue);
                 }
 
                 const std::string caller = callerOpt->str();
@@ -464,6 +477,7 @@ namespace
                 }
                 const std::string key = caller + "|" + callee;
                 ++runtimeContext.edgeCounts[key];
+                runtimeContext.calls.push_back(RuntimeCallData{eventIndex, caller, callerDepth, callee});
             }
 
             runtimeContexts.push_back(std::move(runtimeContext));
@@ -594,90 +608,303 @@ namespace
         }
     }
 
-    void buildTreeNodesForRoot(const std::string &root, const CallGraph &subgraph, const std::unordered_map<std::string, std::size_t> &runtimeEdgeCounts, TreeNodes &treeNodes)
+    std::vector<RuntimeOccurrenceNode> buildOccurrenceNodesForContext(const RuntimeContextData &runtimeContext)
     {
-        struct StackEntry
+        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
+        occurrenceNodes.push_back({runtimeContext.entrypoint, 0U, {}});
+
+        std::vector<const RuntimeCallData *> orderedCalls;
+        orderedCalls.reserve(runtimeContext.calls.size());
+        for (const RuntimeCallData &call : runtimeContext.calls)
         {
-            std::string name;
-            std::string parentUid;
-            int level = 0;
-            bool edgeTaken = false;
-            std::size_t hitCount = 0U;
+            orderedCalls.push_back(&call);
+        }
+        std::stable_sort(orderedCalls.begin(), orderedCalls.end(), [](const RuntimeCallData *lhs, const RuntimeCallData *rhs)
+                         {
+            if (lhs->eventIndex != rhs->eventIndex)
+            {
+                return lhs->eventIndex < rhs->eventIndex;
+            }
+            if (lhs->caller != rhs->caller)
+            {
+                return lhs->caller < rhs->caller;
+            }
+            return lhs->callee < rhs->callee; });
+
+        std::vector<std::size_t> frameStack;
+        frameStack.push_back(0U);
+
+        const auto findCallerFrameIndex = [&](std::string_view callerName, const std::optional<std::size_t> &callerDepth) -> std::ptrdiff_t
+        {
+            if (callerDepth.has_value())
+            {
+                const std::size_t depth = *callerDepth;
+                if (depth < frameStack.size())
+                {
+                    const std::size_t indexFromBottom = (frameStack.size() - 1U) - depth;
+                    const std::size_t occurrenceIndex = frameStack[indexFromBottom];
+                    if (occurrenceNodes[occurrenceIndex].name == callerName)
+                    {
+                        return static_cast<std::ptrdiff_t>(indexFromBottom);
+                    }
+                }
+            }
+
+            for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(frameStack.size()) - 1; i >= 0; --i)
+            {
+                if (occurrenceNodes[frameStack[static_cast<std::size_t>(i)]].name == callerName)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
         };
 
-        std::unordered_set<std::string> visited;
-        std::stack<StackEntry> work;
-        work.push({root, std::string{}, 0, true, 0U});
+        for (const RuntimeCallData *call : orderedCalls)
+        {
+            const std::string &caller = call->caller.empty() ? runtimeContext.entrypoint : call->caller;
+            std::ptrdiff_t callerFrameIndex = findCallerFrameIndex(caller, call->callerDepth);
+            if (callerFrameIndex < 0)
+            {
+                callerFrameIndex = 0;
+                frameStack.resize(1U);
+            }
+            else
+            {
+                frameStack.resize(static_cast<std::size_t>(callerFrameIndex) + 1U);
+            }
+
+            const std::size_t parentIndex = frameStack.back();
+            const std::string calleeName = call->callee.empty() ? std::string("<unknown>") : call->callee;
+            const std::size_t childIndex = occurrenceNodes.size();
+            occurrenceNodes.push_back({calleeName, 1U, {}});
+            occurrenceNodes[parentIndex].children.push_back(childIndex);
+            frameStack.push_back(childIndex);
+        }
+
+        std::vector<RuntimeOccurrenceNode> compressedNodes;
+        if (occurrenceNodes.empty())
+        {
+            return compressedNodes;
+        }
+
+        const std::function<std::size_t(const std::vector<std::size_t> &)> compressGroup =
+            [&](const std::vector<std::size_t> &sourceIndices) -> std::size_t
+        {
+            if (sourceIndices.empty())
+            {
+                return 0U;
+            }
+
+            const RuntimeOccurrenceNode &representative = occurrenceNodes[sourceIndices.front()];
+            const std::size_t compressedIndex = compressedNodes.size();
+            compressedNodes.push_back({representative.name, 0U, {}});
+
+            std::vector<std::string> childOrder;
+            std::unordered_map<std::string, std::vector<std::size_t>> childGroups;
+            for (const std::size_t sourceIndex : sourceIndices)
+            {
+                if (sourceIndex >= occurrenceNodes.size())
+                {
+                    continue;
+                }
+
+                const RuntimeOccurrenceNode &sourceNode = occurrenceNodes[sourceIndex];
+                compressedNodes[compressedIndex].hitCount += sourceNode.hitCount;
+                for (const std::size_t sourceChildIndex : sourceNode.children)
+                {
+                    if (sourceChildIndex >= occurrenceNodes.size())
+                    {
+                        continue;
+                    }
+
+                    const std::string &childName = occurrenceNodes[sourceChildIndex].name;
+                    std::vector<std::size_t> &group = childGroups[childName];
+                    if (group.empty())
+                    {
+                        childOrder.push_back(childName);
+                    }
+                    group.push_back(sourceChildIndex);
+                }
+            }
+
+            for (const std::string &childName : childOrder)
+            {
+                const std::size_t compressedChildIndex = compressGroup(childGroups[childName]);
+                compressedNodes[compressedIndex].children.push_back(compressedChildIndex);
+            }
+            return compressedIndex;
+        };
+
+        compressGroup({0U});
+        return compressedNodes;
+    }
+
+    void mergeOccurrenceSubtree(
+        std::vector<RuntimeOccurrenceNode> &mergedNodes,
+        std::size_t mergedIndex,
+        const std::vector<RuntimeOccurrenceNode> &sourceNodes,
+        std::size_t sourceIndex)
+    {
+        if (mergedIndex >= mergedNodes.size() || sourceIndex >= sourceNodes.size())
+        {
+            return;
+        }
+
+        mergedNodes[mergedIndex].hitCount += sourceNodes[sourceIndex].hitCount;
+
+        std::unordered_map<std::string, std::vector<std::size_t>> mergedChildrenByName;
+        mergedChildrenByName.reserve(mergedNodes[mergedIndex].children.size());
+        for (const std::size_t childIndex : mergedNodes[mergedIndex].children)
+        {
+            if (childIndex >= mergedNodes.size())
+            {
+                continue;
+            }
+
+            mergedChildrenByName[mergedNodes[childIndex].name].push_back(childIndex);
+        }
+
+        std::unordered_map<std::string, std::size_t> seenSourceChildrenByName;
+        for (const std::size_t sourceChildIndex : sourceNodes[sourceIndex].children)
+        {
+            if (sourceChildIndex >= sourceNodes.size())
+            {
+                continue;
+            }
+
+            const std::string &sourceChildName = sourceNodes[sourceChildIndex].name;
+            std::size_t &seenCount = seenSourceChildrenByName[sourceChildName];
+            std::vector<std::size_t> &mergedCandidates = mergedChildrenByName[sourceChildName];
+
+            std::size_t targetMergedChildIndex = 0U;
+            if (seenCount < mergedCandidates.size())
+            {
+                targetMergedChildIndex = mergedCandidates[seenCount];
+            }
+            else
+            {
+                targetMergedChildIndex = mergedNodes.size();
+                mergedNodes.push_back({sourceChildName, 0U, {}});
+                mergedNodes[mergedIndex].children.push_back(targetMergedChildIndex);
+                mergedCandidates.push_back(targetMergedChildIndex);
+            }
+
+            ++seenCount;
+            mergeOccurrenceSubtree(mergedNodes, targetMergedChildIndex, sourceNodes, sourceChildIndex);
+        }
+    }
+
+    void buildTreeNodesForContexts(const std::string &entrypoint, const std::vector<const RuntimeContextData *> &runtimeContexts, const CallGraph &subgraph, TreeNodes &treeNodes)
+    {
+        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
+        occurrenceNodes.push_back({entrypoint, 0U, {}});
+
+        for (const RuntimeContextData *runtimeContext : runtimeContexts)
+        {
+            if (runtimeContext == nullptr)
+            {
+                continue;
+            }
+
+            std::vector<RuntimeOccurrenceNode> sourceNodes = buildOccurrenceNodesForContext(*runtimeContext);
+            if (sourceNodes.empty())
+            {
+                continue;
+            }
+
+            occurrenceNodes[0].hitCount += 1U;
+            mergeOccurrenceSubtree(occurrenceNodes, 0U, sourceNodes, 0U);
+        }
 
         std::size_t nextUid = 0U;
-
-        while (!work.empty())
+        std::function<void(std::size_t, const std::string &, int, bool)> emitTree =
+            [&](std::size_t occurrenceIndex, const std::string &parentUid, int level, bool edgeTaken)
         {
-            const StackEntry current = work.top();
-            work.pop();
-
-            if (!visited.insert(current.name).second)
+            if (occurrenceIndex >= occurrenceNodes.size())
             {
-                continue;
+                return;
             }
 
+            const std::string occurrenceName = occurrenceNodes[occurrenceIndex].name;
+            const std::size_t occurrenceHitCount = occurrenceNodes[occurrenceIndex].hitCount;
+            const std::vector<std::size_t> occurrenceChildren = occurrenceNodes[occurrenceIndex].children;
             TreeNode node;
-            node.name = current.name;
-            node.level = current.level;
-            node.parentUid = current.parentUid;
-            node.edgeTaken = current.edgeTaken;
-            node.hitCount = current.hitCount;
+            node.name = occurrenceName;
+            node.level = level;
+            node.parentUid = parentUid;
+            node.edgeTaken = edgeTaken;
+            node.hitCount = level > 0 ? occurrenceHitCount : 0U;
             node.uid = std::to_string(nextUid++);
 
-            const auto it = subgraph.find(current.name);
-            if (it != subgraph.end())
+            std::vector<std::string> staticChildren;
+            const auto staticIt = subgraph.find(occurrenceName);
+            if (staticIt != subgraph.end())
             {
-                std::vector<std::string> children;
-                children.reserve(it->second.size());
-                children.insert(children.end(), it->second.begin(), it->second.end());
-                std::sort(children.begin(), children.end());
-
-                node.hasChildren = !children.empty();
-                for (const std::string &child : children)
-                {
-                    const std::string key = current.name + "|" + child;
-                    const auto itc = runtimeEdgeCounts.find(key);
-                    const std::size_t hits = (itc != runtimeEdgeCounts.end()) ? itc->second : 0U;
-                    if (hits != 0U)
-                    {
-                        ++node.coveredChildren;
-                    }
-                    else
-                    {
-                        ++node.uncoveredChildren;
-                    }
-                }
-
-                treeNodes.push_back(std::move(node));
-
-                const std::string parentUid = treeNodes.back().uid;
-                for (auto childIt = children.rbegin(); childIt != children.rend(); ++childIt)
-                {
-                    const std::string &child = *childIt;
-                    const std::string key = current.name + "|" + child;
-                    const auto itc = runtimeEdgeCounts.find(key);
-                    const std::size_t hits = (itc != runtimeEdgeCounts.end()) ? itc->second : 0U;
-                    work.push({child, parentUid, current.level + 1, hits != 0U, hits});
-                }
-                continue;
+                staticChildren.reserve(staticIt->second.size());
+                staticChildren.insert(staticChildren.end(), staticIt->second.begin(), staticIt->second.end());
+                std::sort(staticChildren.begin(), staticChildren.end());
             }
 
+            std::unordered_set<std::string> coveredStaticChildren;
+            coveredStaticChildren.reserve(occurrenceChildren.size());
+            for (const std::size_t childIndex : occurrenceChildren)
+            {
+                if (childIndex >= occurrenceNodes.size())
+                {
+                    continue;
+                }
+
+                coveredStaticChildren.insert(occurrenceNodes[childIndex].name);
+            }
+
+            node.coveredChildren = 0U;
+            node.uncoveredChildren = 0U;
+            for (const std::string &childName : staticChildren)
+            {
+                if (coveredStaticChildren.find(childName) != coveredStaticChildren.end())
+                {
+                    ++node.coveredChildren;
+                }
+                else
+                {
+                    ++node.uncoveredChildren;
+                }
+            }
+            node.hasChildren = !staticChildren.empty() || !occurrenceChildren.empty();
+
             treeNodes.push_back(std::move(node));
-        }
+            const std::string currentUid = treeNodes.back().uid;
+
+            for (const std::size_t childIndex : occurrenceChildren)
+            {
+                emitTree(childIndex, currentUid, level + 1, true);
+            }
+
+            for (const std::string &childName : staticChildren)
+            {
+                if (coveredStaticChildren.find(childName) != coveredStaticChildren.end())
+                {
+                    continue;
+                }
+
+                const std::size_t missingChildIndex = occurrenceNodes.size();
+                occurrenceNodes.push_back({childName, 0U, {}});
+                emitTree(missingChildIndex, currentUid, level + 1, false);
+            }
+        };
+
+        emitTree(0U, std::string{}, 0, true);
     }
 
     std::string buildSidebarHtml(const std::vector<std::string> &rootNames, const std::vector<double> &coveragePercents)
     {
         std::ostringstream html;
         html << "<div class=\"sidebar\">\n";
-        html << "  <div class=\"sidebar-title\">Entry Points (" << rootNames.size() << ")</div>\n";
+        html << "  <div class=\"sidebar-title\">Contexts (" << rootNames.size() << ")</div>\n";
         html << "  <div class=\"sidebar-search\">\n";
-        html << "    <input type=\"text\" id=\"sidebar-search\" placeholder=\"Filter entry points...\" oninput=\"filterSidebar(this.value)\">\n";
+        html << "    <input type=\"text\" id=\"sidebar-search\" placeholder=\"Filter contexts...\" oninput=\"filterSidebar(this.value)\">\n";
         html << "  </div>\n";
         html << "  <div class=\"entry-list\" id=\"entry-list\">\n";
 
@@ -841,14 +1068,15 @@ namespace
             coveragePercents.push_back(stats.pct);
         }
 
-        std::size_t globalCovered = 0U;
-        std::size_t globalUncovered = 0U;
-        for (const RootStats &stats : rootStats)
+        std::size_t globallyCoveredStaticEdges = 0U;
+        for (const Edge &edge : staticEdges)
         {
-            globalCovered += stats.covered;
-            globalUncovered += stats.uncovered;
+            if (runtimeEdges.find(edge) != runtimeEdges.end())
+            {
+                ++globallyCoveredStaticEdges;
+            }
         }
-        const double globalPct = (globalCovered + globalUncovered) > 0U ? (100.0 * static_cast<double>(globalCovered)) / static_cast<double>(globalCovered + globalUncovered) : 0.0;
+        const double globalPct = staticEdges.empty() ? 0.0 : (100.0 * static_cast<double>(globallyCoveredStaticEdges)) / static_cast<double>(staticEdges.size());
 
         std::string headerHtml;
         headerHtml.reserve(160U);
@@ -1008,61 +1236,74 @@ int main(int argc, const char **argv)
     std::set<Edge> acyclicEdges;
     removeBackEdges(staticEdges, acyclicGraph, acyclicEdges);
 
-    std::unordered_map<std::string, AggregatedContextData> aggregatedContexts;
-    aggregatedContexts.reserve(runtimeContexts.size());
+    std::vector<const RuntimeContextData *> orderedContexts;
+    orderedContexts.reserve(runtimeContexts.size());
     for (const RuntimeContextData &runtimeContext : runtimeContexts)
     {
-        if (runtimeContext.entrypoint.empty())
-        {
-            continue;
-        }
-
-        AggregatedContextData &aggregated = aggregatedContexts[runtimeContext.entrypoint];
-        if (aggregated.entrypoint.empty())
-        {
-            aggregated.entrypoint = runtimeContext.entrypoint;
-            aggregated.startEventIndex = runtimeContext.startEventIndex;
-            aggregated.endEventIndex = runtimeContext.endEventIndex;
-        }
-        else
-        {
-            aggregated.startEventIndex = std::min(aggregated.startEventIndex, runtimeContext.startEventIndex);
-            aggregated.endEventIndex = std::max(aggregated.endEventIndex, runtimeContext.endEventIndex);
-        }
-
-        if (!runtimeContext.contextId.empty())
-        {
-            aggregated.contextIds.push_back(runtimeContext.contextId);
-        }
-        ++aggregated.ordinal;
-
-        for (const auto &edgeCount : runtimeContext.edgeCounts)
-        {
-            aggregated.edgeCounts[edgeCount.first] += edgeCount.second;
-        }
-    }
-
-    std::vector<RootStats> rootStats;
-    rootStats.reserve(aggregatedContexts.size());
-    for (auto &entry : aggregatedContexts)
-    {
-        AggregatedContextData &runtimeContext = entry.second;
-
         if (!runtimeContext.entrypoint.empty() && roots.find(runtimeContext.entrypoint) == roots.end())
         {
             continue;
         }
 
-        RootStats stats;
-        stats.name = runtimeContext.entrypoint;
-        if (runtimeContext.ordinal > 1U)
-        {
-            stats.name += " (" + std::to_string(runtimeContext.ordinal) + " runs)";
-        }
-        stats.runCount = runtimeContext.ordinal;
+        orderedContexts.push_back(&runtimeContext);
+    }
 
-        buildSubgraphFromRoot(runtimeContext.entrypoint, acyclicGraph, stats.subgraph, stats.nodes);
-        buildTreeNodesForRoot(runtimeContext.entrypoint, stats.subgraph, runtimeContext.edgeCounts, stats.treeNodes);
+    std::sort(orderedContexts.begin(), orderedContexts.end(), [](const RuntimeContextData *lhs, const RuntimeContextData *rhs)
+              {
+        if (lhs->entrypoint != rhs->entrypoint)
+        {
+            return lhs->entrypoint < rhs->entrypoint;
+        }
+        if (lhs->ordinal != rhs->ordinal)
+        {
+            return lhs->ordinal < rhs->ordinal;
+        }
+        if (lhs->startEventIndex != rhs->startEventIndex)
+        {
+            return lhs->startEventIndex < rhs->startEventIndex;
+        }
+        return lhs->contextId < rhs->contextId; });
+
+    std::unordered_map<std::string, std::vector<const RuntimeContextData *>> contextsByEntrypoint;
+    contextsByEntrypoint.reserve(orderedContexts.size());
+    std::vector<std::string> orderedEntrypoints;
+    orderedEntrypoints.reserve(orderedContexts.size());
+    for (const RuntimeContextData *runtimeContext : orderedContexts)
+    {
+        if (runtimeContext == nullptr || runtimeContext->entrypoint.empty())
+        {
+            continue;
+        }
+
+        std::vector<const RuntimeContextData *> &group = contextsByEntrypoint[runtimeContext->entrypoint];
+        if (group.empty())
+        {
+            orderedEntrypoints.push_back(runtimeContext->entrypoint);
+        }
+        group.push_back(runtimeContext);
+    }
+
+    std::vector<RootStats> rootStats;
+    rootStats.reserve(orderedEntrypoints.size());
+    for (const std::string &entrypoint : orderedEntrypoints)
+    {
+        const auto groupIt = contextsByEntrypoint.find(entrypoint);
+        if (groupIt == contextsByEntrypoint.end() || groupIt->second.empty())
+        {
+            continue;
+        }
+
+        const std::vector<const RuntimeContextData *> &contextGroup = groupIt->second;
+        RootStats stats;
+        stats.name = entrypoint;
+        if (contextGroup.size() > 1U)
+        {
+            stats.name += " (" + std::to_string(contextGroup.size()) + " runs)";
+        }
+        stats.runCount = contextGroup.size();
+
+        buildSubgraphFromRoot(entrypoint, acyclicGraph, stats.subgraph, stats.nodes);
+        buildTreeNodesForContexts(entrypoint, contextGroup, stats.subgraph, stats.treeNodes);
         for (const TreeNode &node : stats.treeNodes)
         {
             stats.covered += node.coveredChildren;
