@@ -2,6 +2,7 @@ let currentTab = 0;
 const currentFilter = {};
 const currentSearch = {};
 const renderedPanels = {};
+const panelStates = {};
 
 function loadReportData() {
   const dataEl = document.getElementById('callgraph-data');
@@ -25,11 +26,6 @@ function setActiveSidebarItem(idx) {
   });
 }
 
-function setToggleState(toggleEl, expanded) {
-  toggleEl.dataset.expanded = expanded ? 'true' : 'false';
-  toggleEl.innerHTML = expanded ? '&#9660;' : '&#9654;';
-}
-
 function createStatPill(dotClass, text) {
   const pill = document.createElement('div');
   pill.className = 'stat-pill';
@@ -41,79 +37,184 @@ function createStatPill(dotClass, text) {
   return pill;
 }
 
-function createTreeRow(node, nodeIndex) {
+function escapeHtml(text) {
+  return String(text)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#39;');
+}
+
+function createPanelState(root) {
+  const children = new Array(root.nodes.length);
+  const expanded = new Uint8Array(root.nodes.length);
+
+  for (let nodeIndex = 0; nodeIndex < root.nodes.length; nodeIndex += 1) {
+    children[nodeIndex] = [];
+  }
+
+  root.nodes.forEach(function (node, nodeIndex) {
+    const parentIndex = node[2];
+    if (parentIndex >= 0) {
+      children[parentIndex].push(nodeIndex);
+    }
+  });
+
+  return {
+    root: root,
+    children: children,
+    expanded: expanded,
+    panel: null,
+    tbody: null,
+  };
+}
+
+function getPanelState(idx) {
+  if (!panelStates[idx]) {
+    panelStates[idx] = createPanelState(reportData[idx]);
+  }
+  return panelStates[idx];
+}
+
+function buildTreeRowHtml(state, nodeIndex) {
+  const node = state.root.nodes[nodeIndex];
   const level = node[1];
-  const parentIndex = node[2];
   const edgeTaken = node[3] === 1;
   const hitCount = node[4];
   const coveredChildren = node[5];
   const uncoveredChildren = node[6];
-  const hasChildren = coveredChildren + uncoveredChildren > 0;
+  const hasChildren = state.children[nodeIndex].length > 0;
 
-  const row = document.createElement('tr');
-  row.className = 'tree-node' + (level !== 0 ? ' tree-hidden' : '');
-  row.dataset.nodeIndex = String(nodeIndex);
-  row.dataset.parentIndex = parentIndex < 0 ? '' : String(parentIndex);
-  row.dataset.edgeStatus = level === 0 || edgeTaken ? 'covered' : 'uncovered';
-  row.dataset.name = node[0];
-
-  const functionCell = document.createElement('td');
-  const nodeCell = document.createElement('div');
-  nodeCell.className = 'node-cell';
-
-  for (let indentLevel = 0; indentLevel < level; indentLevel += 1) {
-    const indent = document.createElement('span');
-    indent.className = 'ident-block';
-    nodeCell.appendChild(indent);
-  }
-
-  const toggle = document.createElement('span');
-  toggle.className = 'tree-toggle' + (hasChildren ? '' : ' no-children');
-  if (hasChildren) {
-    toggle.dataset.toggleIndex = String(nodeIndex);
-    setToggleState(toggle, true);
-  } else {
-    toggle.innerHTML = '&#9675;';
-  }
-  nodeCell.appendChild(toggle);
-
-  const name = document.createElement('span');
-  name.className = 'node-name' + (level === 0 ? ' is-root' : '');
-  name.textContent = node[0];
-  nodeCell.appendChild(name);
-
-  if (hitCount > 0) {
-    const hits = document.createElement('span');
-    hits.className = 'edge-hits';
-    hits.textContent = '(' + hitCount + ')';
-    nodeCell.appendChild(hits);
-  }
-
-  functionCell.appendChild(nodeCell);
-  row.appendChild(functionCell);
-
-  const statusCell = document.createElement('td');
-  statusCell.className = 'status-cell';
-
-  const badge = document.createElement('span');
+  let badgeClass = '';
+  let badgeText = '';
   if (level === 0) {
-    badge.className = 'badge badge-root';
-    badge.innerHTML = '&diams; entry';
+    badgeClass = 'badge badge-root';
+    badgeText = '&diams; entry';
   } else if (coveredChildren + uncoveredChildren === 0) {
-    badge.className = 'badge ' + (edgeTaken ? 'badge-covered' : 'badge-uncovered');
-    badge.innerHTML = edgeTaken ? '&check; leaf' : '&times; leaf';
+    badgeClass = 'badge ' + (edgeTaken ? 'badge-covered' : 'badge-uncovered');
+    badgeText = edgeTaken ? '&check; leaf' : '&times; leaf';
   } else {
-    badge.className = 'badge ' + (edgeTaken ? 'badge-covered' : 'badge-uncovered');
-    badge.innerHTML = edgeTaken ? '&check; taken' : '&times; not taken';
+    badgeClass = 'badge ' + (edgeTaken ? 'badge-covered' : 'badge-uncovered');
+    badgeText = edgeTaken ? '&check; taken' : '&times; not taken';
   }
 
-  statusCell.appendChild(badge);
-  row.appendChild(statusCell);
+  const toggleClass = 'tree-toggle' + (hasChildren ? '' : ' no-children');
+  const toggleAttrs = hasChildren
+    ? ' data-toggle-index="' + nodeIndex + '" data-expanded="' + (state.expanded[nodeIndex] === 1 ? 'true' : 'false') + '"'
+    : '';
+  const toggleText = hasChildren
+    ? (state.expanded[nodeIndex] === 1 ? '&#9660;' : '&#9654;')
+    : '&#9675;';
+  const hitsHtml = hitCount > 0 ? '<span class="edge-hits">(' + hitCount + ')</span>' : '';
 
-  return row;
+  return (
+    '<tr class="tree-node"' +
+    ' data-node-index="' + nodeIndex + '"' +
+    ' data-parent-index="' + (node[2] < 0 ? '' : node[2]) + '"' +
+    ' data-edge-status="' + (level === 0 || edgeTaken ? 'covered' : 'uncovered') + '"' +
+    ' data-name="' + escapeHtml(node[0]) + '">' +
+      '<td>' +
+        '<div class="node-cell" style="--level:' + level + '">' +
+          '<span class="' + toggleClass + '"' + toggleAttrs + '>' + toggleText + '</span>' +
+          '<span class="node-name' + (level === 0 ? ' is-root' : '') + '">' + escapeHtml(node[0]) + '</span>' +
+          hitsHtml +
+        '</div>' +
+      '</td>' +
+      '<td class="status-cell">' +
+        '<span class="' + badgeClass + '">' + badgeText + '</span>' +
+      '</td>' +
+    '</tr>'
+  );
+}
+
+function collectVisibleNodeIndexes(state, tabIdx) {
+  const root = state.root;
+  const filter = currentFilter[tabIdx] || 'all';
+  const search = currentSearch[tabIdx] || '';
+  const hasQuery = filter !== 'all' || search !== '';
+
+  if (!hasQuery) {
+    const visible = [];
+    const stack = [0];
+
+    while (stack.length > 0) {
+      const nodeIndex = stack.pop();
+      visible.push(nodeIndex);
+
+      if (state.expanded[nodeIndex] !== 1) {
+        continue;
+      }
+
+      const children = state.children[nodeIndex];
+      for (let childIdx = children.length - 1; childIdx >= 0; childIdx -= 1) {
+        stack.push(children[childIdx]);
+      }
+    }
+
+    return visible;
+  }
+
+  const included = new Uint8Array(root.nodes.length);
+  const visible = [];
+
+  root.nodes.forEach(function (node, nodeIndex) {
+    const edgeStatus = node[1] === 0 || node[3] === 1 ? 'covered' : 'uncovered';
+    const statusOk = filter === 'all' || edgeStatus === filter;
+    const nameOk = search === '' || node[0].toLowerCase().includes(search);
+
+    if (!statusOk || !nameOk) {
+      return;
+    }
+
+    let currentIndex = nodeIndex;
+    while (currentIndex >= 0 && included[currentIndex] === 0) {
+      included[currentIndex] = 1;
+      currentIndex = root.nodes[currentIndex][2];
+    }
+  });
+
+  if (included[0] === 0) {
+    included[0] = 1;
+  }
+
+  const stack = [0];
+  while (stack.length > 0) {
+    const nodeIndex = stack.pop();
+    if (included[nodeIndex] === 0) {
+      continue;
+    }
+
+    visible.push(nodeIndex);
+
+    const children = state.children[nodeIndex];
+    for (let childIdx = children.length - 1; childIdx >= 0; childIdx -= 1) {
+      const childIndex = children[childIdx];
+      if (included[childIndex] === 1) {
+        stack.push(childIndex);
+      }
+    }
+  }
+
+  return visible;
+}
+
+function renderTree(state, tabIdx) {
+  if (!state.tbody) {
+    return;
+  }
+
+  const rows = [];
+  collectVisibleNodeIndexes(state, tabIdx).forEach(function (nodeIndex) {
+    rows.push(buildTreeRowHtml(state, nodeIndex));
+  });
+
+  state.tbody.innerHTML = rows.join('');
 }
 
 function buildPanel(root, idx) {
+  const state = getPanelState(idx);
+
   const panel = document.createElement('div');
   panel.id = 'panel-' + idx;
   panel.className = 'panel';
@@ -208,17 +309,14 @@ function buildPanel(root, idx) {
 
   const tbody = document.createElement('tbody');
   tbody.id = 'tbody-' + idx;
-
-  const rows = document.createDocumentFragment();
-  root.nodes.forEach(function (node, nodeIndex) {
-    rows.appendChild(createTreeRow(node, nodeIndex));
-  });
-  tbody.appendChild(rows);
   table.appendChild(tbody);
 
   treeWrap.appendChild(table);
   panel.appendChild(treeWrap);
 
+  state.panel = panel;
+  state.tbody = tbody;
+  renderTree(state, idx);
   return panel;
 }
 
@@ -250,81 +348,14 @@ function setActivePanel(idx) {
   }
 }
 
-function hideDescendants(tbody, nodeIndex) {
-  tbody.querySelectorAll('[data-parent-index="' + nodeIndex + '"]').forEach(function (row) {
-    row.classList.add('tree-hidden');
-    hideDescendants(tbody, row.dataset.nodeIndex);
-  });
-}
-
-function showDescendants(tbody, nodeIndex) {
-  tbody.querySelectorAll('[data-parent-index="' + nodeIndex + '"]').forEach(function (row) {
-    row.classList.remove('tree-hidden');
-    const toggle = row.querySelector('[data-toggle-index]');
-    if (toggle && toggle.dataset.expanded === 'true') {
-      showDescendants(tbody, row.dataset.nodeIndex);
-    } else {
-      hideDescendants(tbody, row.dataset.nodeIndex);
-    }
-  });
-}
-
-function restoreCollapseState(tbody, nodeIndex) {
-  const row = tbody.querySelector('[data-node-index="' + nodeIndex + '"]');
-  if (!row) {
-    return;
-  }
-
-  row.classList.remove('tree-hidden');
-  const toggle = row.querySelector('[data-toggle-index]');
-  if (toggle && toggle.dataset.expanded === 'true') {
-    showDescendants(tbody, nodeIndex);
-  } else {
-    hideDescendants(tbody, nodeIndex);
-  }
-}
-
 function applyVisibility(tabIdx) {
   ensurePanelRendered(tabIdx);
-  const tbody = document.getElementById('tbody-' + tabIdx);
-  if (!tbody) {
+  const state = panelStates[tabIdx];
+  if (!state) {
     return;
   }
 
-  const filter = currentFilter[tabIdx] || 'all';
-  const search = currentSearch[tabIdx] || '';
-  const isFiltering = filter !== 'all' || search !== '';
-
-  tbody.querySelectorAll('.tree-node').forEach(function (row) {
-    const statusOk = filter === 'all' || row.dataset.edgeStatus === filter;
-    const nameOk = search === '' || (row.dataset.name || '').toLowerCase().includes(search);
-    row.classList.toggle('filter-hidden', !(statusOk && nameOk));
-  });
-
-  if (isFiltering) {
-    tbody.querySelectorAll('.tree-node:not(.filter-hidden)').forEach(function (row) {
-      row.classList.remove('tree-hidden');
-
-      let parentIndex = row.dataset.parentIndex;
-      while (parentIndex !== '') {
-        const parent = tbody.querySelector('[data-node-index="' + parentIndex + '"]');
-        if (!parent) {
-          break;
-        }
-        parent.classList.remove('tree-hidden');
-        parentIndex = parent.dataset.parentIndex || '';
-      }
-    });
-    return;
-  }
-
-  tbody.querySelectorAll('.tree-node').forEach(function (row) {
-    row.classList.remove('filter-hidden');
-  });
-
-  tbody.querySelectorAll('.tree-node[data-parent-index=""]').forEach(function (root) {
-    restoreCollapseState(tbody, root.dataset.nodeIndex);
-  });
+  renderTree(state, tabIdx);
 }
 
 function selectRoot(idx) {
@@ -335,60 +366,46 @@ function selectRoot(idx) {
 }
 
 function toggleNode(toggleEl) {
-  const nodeIndex = toggleEl.dataset.toggleIndex;
-  if (!nodeIndex) {
+  const nodeIndex = parseInt(toggleEl.dataset.toggleIndex, 10);
+  if (Number.isNaN(nodeIndex)) {
     return;
   }
 
-  const tbody = toggleEl.closest('tbody');
-  if (!tbody) {
+  const panel = toggleEl.closest('.panel');
+  if (!panel) {
     return;
   }
 
-  const expanded = toggleEl.dataset.expanded === 'true';
-  if (expanded) {
-    hideDescendants(tbody, nodeIndex);
-    setToggleState(toggleEl, false);
-  } else {
-    showDescendants(tbody, nodeIndex);
-    setToggleState(toggleEl, true);
+  const idx = parseInt(panel.id.replace('panel-', ''), 10);
+  if (Number.isNaN(idx)) {
+    return;
   }
+
+  const state = getPanelState(idx);
+  state.expanded[nodeIndex] = state.expanded[nodeIndex] === 1 ? 0 : 1;
+  renderTree(state, idx);
 }
 
 function expandAll(tabIdx) {
   ensurePanelRendered(tabIdx);
-  const tbody = document.getElementById('tbody-' + tabIdx);
-  if (!tbody) {
+  const state = panelStates[tabIdx];
+  if (!state) {
     return;
   }
 
-  tbody.querySelectorAll('.tree-node').forEach(function (row) {
-    row.classList.remove('tree-hidden');
-    row.classList.remove('filter-hidden');
-  });
-
-  tbody.querySelectorAll('[data-toggle-index]').forEach(function (toggleEl) {
-    setToggleState(toggleEl, true);
-  });
+  state.expanded.fill(1);
+  renderTree(state, tabIdx);
 }
 
 function collapseAll(tabIdx) {
   ensurePanelRendered(tabIdx);
-  const tbody = document.getElementById('tbody-' + tabIdx);
-  if (!tbody) {
+  const state = panelStates[tabIdx];
+  if (!state) {
     return;
   }
 
-  tbody.querySelectorAll('.tree-node').forEach(function (row) {
-    row.classList.remove('filter-hidden');
-    if (row.dataset.parentIndex !== '') {
-      row.classList.add('tree-hidden');
-    }
-  });
-
-  tbody.querySelectorAll('[data-toggle-index]').forEach(function (toggleEl) {
-    setToggleState(toggleEl, false);
-  });
+  state.expanded.fill(0);
+  renderTree(state, tabIdx);
 }
 
 function setFilter(filter, tabIdx) {

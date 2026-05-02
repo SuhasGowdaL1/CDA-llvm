@@ -387,25 +387,7 @@ thead th {
   display: flex;
   align-items: center;
   min-height: 36px;
-  padding: 7px 16px;
-}
-
-.ident-block {
-  display: inline-flex;
-  width: var(--indent-w);
-  flex-shrink: 0;
-  align-self: stretch;
-  position: relative;
-}
-
-.ident-block::before {
-  content: "";
-  position: absolute;
-  left: 50%;
-  top: 0;
-  bottom: 0;
-  width: 1px;
-  background: var(--border);
+  padding: 7px 16px 7px calc(16px + (var(--level, 0) * var(--indent-w)));
 }
 
 .tree-toggle {
