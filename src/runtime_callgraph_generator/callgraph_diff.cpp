@@ -4,11 +4,11 @@
 #include <fstream>
 #include <functional>
 #include <filesystem>
+#include <limits>
 #include <optional>
 #include <queue>
 #include <set>
 #include <sstream>
-#include <stack>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -44,16 +44,13 @@ namespace
     {
         std::string name;
         int level = 0;
-        // `parentUid` stores the parent's node-unique id (not the function name).
-        std::string parentUid;
+        std::size_t parentIndex = std::numeric_limits<std::size_t>::max();
         bool edgeTaken = false;
         // number of times the incoming edge (parent->this) was observed in runtime traces
         std::size_t hitCount = 0;
         std::size_t coveredChildren = 0;
         std::size_t uncoveredChildren = 0;
         bool hasChildren = false;
-        // node-unique id used for HTML `data-uid` attributes
-        std::string uid;
     };
 
     using TreeNodes = std::vector<TreeNode>;
@@ -66,21 +63,17 @@ namespace
         std::string callee;
     };
 
-    struct RuntimeContextData
-    {
-        std::string contextId;
-        std::string entrypoint;
-        std::size_t ordinal = 0U;
-        std::size_t startEventIndex = 0U;
-        std::size_t endEventIndex = 0U;
-        std::vector<RuntimeCallData> calls;
-    };
-
     struct RuntimeOccurrenceNode
     {
         std::string name;
         std::size_t hitCount = 0U;
         std::vector<std::size_t> children;
+    };
+
+    struct RootAggregation
+    {
+        std::size_t runCount = 0U;
+        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
     };
 
     struct NamedNodeKey
@@ -110,6 +103,12 @@ namespace
         std::size_t uncovered = 0;
         double pct = 0.0;
     };
+
+    void mergeOccurrenceSubtree(
+        std::vector<RuntimeOccurrenceNode> &mergedNodes,
+        std::size_t mergedIndex,
+        const std::vector<RuntimeOccurrenceNode> &sourceNodes,
+        std::size_t sourceIndex);
 
     llvm::cl::OptionCategory kCategory("callgraph-diff options");
 
@@ -200,24 +199,6 @@ namespace
         return false;
     }
 
-    bool writeTextFile(std::string_view path, const std::string &content, std::string &error)
-    {
-        const std::string filePath(path);
-        std::ofstream output(filePath, std::ios::binary);
-        if (!output)
-        {
-            error = "failed to open output file: " + filePath;
-            return false;
-        }
-        output << content;
-        if (!output)
-        {
-            error = "failed to write output file: " + filePath;
-            return false;
-        }
-        return true;
-    }
-
     std::string replaceAll(std::string text, std::string_view needle, std::string_view replacement)
     {
         if (needle.empty())
@@ -263,6 +244,60 @@ namespace
             }
         }
         return escaped;
+    }
+
+    void writeJsonString(std::ostream &output, std::string_view text)
+    {
+        static constexpr char kHexDigits[] = "0123456789abcdef";
+
+        output.put('"');
+        for (const unsigned char ch : text)
+        {
+            switch (ch)
+            {
+            case '"':
+                output << "\\\"";
+                break;
+            case '\\':
+                output << "\\\\";
+                break;
+            case '\b':
+                output << "\\b";
+                break;
+            case '\f':
+                output << "\\f";
+                break;
+            case '\n':
+                output << "\\n";
+                break;
+            case '\r':
+                output << "\\r";
+                break;
+            case '\t':
+                output << "\\t";
+                break;
+            case '<':
+                output << "\\u003c";
+                break;
+            case '>':
+                output << "\\u003e";
+                break;
+            case '&':
+                output << "\\u0026";
+                break;
+            default:
+                if (ch < 0x20U)
+                {
+                    output << "\\u00" << kHexDigits[ch >> 4U] << kHexDigits[ch & 0x0FU];
+                }
+                else
+                {
+                    output.put(static_cast<char>(ch));
+                }
+                break;
+            }
+        }
+        output.put('"');
     }
 
     bool loadTemplateBundle(std::string &htmlTemplate, std::string &cssTemplate, std::string &jsTemplate, std::string &error)
@@ -351,7 +386,108 @@ namespace
         return true;
     }
 
-    bool extractRuntimeEdges(const std::string &jsonPath, std::set<Edge> &edges, std::unordered_set<std::string> &nodes, std::vector<RuntimeContextData> &runtimeContexts, std::string &error)
+    std::vector<RuntimeOccurrenceNode> buildOccurrenceNodesForContext(std::string_view entrypoint, const std::vector<RuntimeCallData> &calls)
+    {
+        std::vector<const RuntimeCallData *> orderedCalls;
+        orderedCalls.reserve(calls.size());
+        for (const RuntimeCallData &call : calls)
+        {
+            orderedCalls.push_back(&call);
+        }
+        std::stable_sort(orderedCalls.begin(), orderedCalls.end(), [](const RuntimeCallData *lhs, const RuntimeCallData *rhs)
+                         {
+            if (lhs->eventIndex != rhs->eventIndex)
+            {
+                return lhs->eventIndex < rhs->eventIndex;
+            }
+            if (lhs->caller != rhs->caller)
+            {
+                return lhs->caller < rhs->caller;
+            }
+            return lhs->callee < rhs->callee; });
+
+        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
+        occurrenceNodes.reserve(calls.size() + 1U);
+        occurrenceNodes.push_back({std::string(entrypoint), 0U, {}});
+
+        std::unordered_map<NamedNodeKey, std::size_t, NamedNodeKeyHash> childIndexByParentAndName;
+        childIndexByParentAndName.reserve(calls.size() * 2U + 1U);
+
+        std::vector<std::size_t> frameStack;
+        frameStack.push_back(0U);
+
+        const auto findCallerFrameIndex = [&](std::string_view callerName, const std::optional<std::size_t> &callerDepth) -> std::ptrdiff_t
+        {
+            if (callerDepth.has_value())
+            {
+                const std::size_t depth = *callerDepth;
+                if (depth < frameStack.size())
+                {
+                    const std::size_t indexFromBottom = (frameStack.size() - 1U) - depth;
+                    const std::size_t occurrenceIndex = frameStack[indexFromBottom];
+                    if (occurrenceNodes[occurrenceIndex].name == callerName)
+                    {
+                        return static_cast<std::ptrdiff_t>(indexFromBottom);
+                    }
+                }
+            }
+
+            for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(frameStack.size()) - 1; i >= 0; --i)
+            {
+                if (occurrenceNodes[frameStack[static_cast<std::size_t>(i)]].name == callerName)
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        };
+
+        for (const RuntimeCallData *call : orderedCalls)
+        {
+            const std::string &caller = call->caller.empty() ? occurrenceNodes[0].name : call->caller;
+            std::ptrdiff_t callerFrameIndex = findCallerFrameIndex(caller, call->callerDepth);
+            if (callerFrameIndex < 0)
+            {
+                callerFrameIndex = 0;
+                frameStack.resize(1U);
+            }
+            else
+            {
+                frameStack.resize(static_cast<std::size_t>(callerFrameIndex) + 1U);
+            }
+
+            const std::size_t parentIndex = frameStack.back();
+            const std::string calleeName = call->callee.empty() ? std::string("<unknown>") : call->callee;
+            const NamedNodeKey key{parentIndex, calleeName};
+            std::size_t childIndex = 0U;
+            const auto childIt = childIndexByParentAndName.find(key);
+            if (childIt != childIndexByParentAndName.end())
+            {
+                childIndex = childIt->second;
+                ++occurrenceNodes[childIndex].hitCount;
+            }
+            else
+            {
+                childIndex = occurrenceNodes.size();
+                occurrenceNodes.push_back({calleeName, 1U, {}});
+                occurrenceNodes[parentIndex].children.push_back(childIndex);
+                childIndexByParentAndName.emplace(NamedNodeKey{parentIndex, calleeName}, childIndex);
+            }
+            frameStack.push_back(childIndex);
+        }
+
+        return occurrenceNodes;
+    }
+
+    bool extractRuntimeEdges(
+        const std::string &jsonPath,
+        const std::set<std::string> *roots,
+        std::set<Edge> &edges,
+        std::unordered_set<std::string> &nodes,
+        std::vector<std::string> &orderedEntrypoints,
+        std::unordered_map<std::string, RootAggregation> &aggregatedRoots,
+        std::string &error)
     {
         std::string content;
         if (!readTextFile(jsonPath, content, error))
@@ -403,7 +539,11 @@ namespace
         }
 
         nodes.reserve(nodes.size() + totalCalls * 2U);
-        runtimeContexts.reserve(contexts->size());
+        if (roots != nullptr)
+        {
+            orderedEntrypoints.reserve(contexts->size());
+            aggregatedRoots.reserve(contexts->size());
+        }
 
         for (const llvm::json::Value &contextValue : *contexts)
         {
@@ -419,36 +559,22 @@ namespace
                 continue;
             }
 
-            RuntimeContextData runtimeContext;
-
-            const std::optional<llvm::StringRef> contextIdOpt = contextObject->getString("contextId");
-            if (contextIdOpt)
+            std::string entrypoint;
+            if (const std::optional<llvm::StringRef> entrypointOpt = contextObject->getString("entrypoint"))
             {
-                runtimeContext.contextId = contextIdOpt->str();
+                entrypoint = entrypointOpt->str();
             }
 
-            const std::optional<llvm::StringRef> entrypointOpt = contextObject->getString("entrypoint");
-            if (entrypointOpt)
+            std::vector<RuntimeCallData> contextCalls;
+            bool shouldCollectContextCalls = roots != nullptr;
+            if (shouldCollectContextCalls && !entrypoint.empty() && roots->find(entrypoint) == roots->end())
             {
-                runtimeContext.entrypoint = entrypointOpt->str();
+                shouldCollectContextCalls = false;
             }
-
-            if (const std::optional<std::int64_t> ordinalValue = contextObject->getInteger("ordinal"))
+            if (shouldCollectContextCalls)
             {
-                runtimeContext.ordinal = static_cast<std::size_t>(*ordinalValue);
+                contextCalls.reserve(calls->size());
             }
-
-            if (const std::optional<std::int64_t> startValue = contextObject->getInteger("startEventIndex"))
-            {
-                runtimeContext.startEventIndex = static_cast<std::size_t>(*startValue);
-            }
-
-            if (const std::optional<std::int64_t> endValue = contextObject->getInteger("endEventIndex"))
-            {
-                runtimeContext.endEventIndex = static_cast<std::size_t>(*endValue);
-            }
-
-            runtimeContext.calls.reserve(calls->size());
 
             for (const llvm::json::Value &callValue : *calls)
             {
@@ -484,14 +610,38 @@ namespace
                 nodes.insert(edge.caller);
                 nodes.insert(edge.callee);
 
-                if (runtimeContext.entrypoint.empty())
+                if (entrypoint.empty())
                 {
-                    runtimeContext.entrypoint = caller;
+                    entrypoint = caller;
                 }
-                runtimeContext.calls.push_back(RuntimeCallData{eventIndex, caller, callerDepth, callee});
+                if (shouldCollectContextCalls && roots->find(entrypoint) == roots->end())
+                {
+                    shouldCollectContextCalls = false;
+                    contextCalls.clear();
+                }
+                if (shouldCollectContextCalls)
+                {
+                    contextCalls.push_back(RuntimeCallData{eventIndex, caller, callerDepth, callee});
+                }
             }
 
-            runtimeContexts.push_back(std::move(runtimeContext));
+            if (roots == nullptr || entrypoint.empty() || roots->find(entrypoint) == roots->end())
+            {
+                continue;
+            }
+
+            auto [rootIt, inserted] = aggregatedRoots.try_emplace(entrypoint);
+            if (inserted)
+            {
+                rootIt->second.occurrenceNodes.push_back({entrypoint, 0U, {}});
+                orderedEntrypoints.push_back(entrypoint);
+            }
+
+            ++rootIt->second.runCount;
+            ++rootIt->second.occurrenceNodes[0].hitCount;
+
+            const std::vector<RuntimeOccurrenceNode> sourceNodes = buildOccurrenceNodesForContext(entrypoint, contextCalls);
+            mergeOccurrenceSubtree(rootIt->second.occurrenceNodes, 0U, sourceNodes, 0U);
         }
 
         return true;
@@ -616,100 +766,6 @@ namespace
         }
     }
 
-    std::vector<RuntimeOccurrenceNode> buildOccurrenceNodesForContext(const RuntimeContextData &runtimeContext)
-    {
-        std::vector<const RuntimeCallData *> orderedCalls;
-        orderedCalls.reserve(runtimeContext.calls.size());
-        for (const RuntimeCallData &call : runtimeContext.calls)
-        {
-            orderedCalls.push_back(&call);
-        }
-        std::stable_sort(orderedCalls.begin(), orderedCalls.end(), [](const RuntimeCallData *lhs, const RuntimeCallData *rhs)
-                         {
-            if (lhs->eventIndex != rhs->eventIndex)
-            {
-                return lhs->eventIndex < rhs->eventIndex;
-            }
-            if (lhs->caller != rhs->caller)
-            {
-                return lhs->caller < rhs->caller;
-            }
-            return lhs->callee < rhs->callee; });
-
-        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
-        occurrenceNodes.reserve(runtimeContext.calls.size() + 1U);
-        occurrenceNodes.push_back({runtimeContext.entrypoint, 0U, {}});
-
-        std::unordered_map<NamedNodeKey, std::size_t, NamedNodeKeyHash> childIndexByParentAndName;
-        childIndexByParentAndName.reserve(runtimeContext.calls.size() * 2U + 1U);
-
-        std::vector<std::size_t> frameStack;
-        frameStack.push_back(0U);
-
-        const auto findCallerFrameIndex = [&](std::string_view callerName, const std::optional<std::size_t> &callerDepth) -> std::ptrdiff_t
-        {
-            if (callerDepth.has_value())
-            {
-                const std::size_t depth = *callerDepth;
-                if (depth < frameStack.size())
-                {
-                    const std::size_t indexFromBottom = (frameStack.size() - 1U) - depth;
-                    const std::size_t occurrenceIndex = frameStack[indexFromBottom];
-                    if (occurrenceNodes[occurrenceIndex].name == callerName)
-                    {
-                        return static_cast<std::ptrdiff_t>(indexFromBottom);
-                    }
-                }
-            }
-
-            for (std::ptrdiff_t i = static_cast<std::ptrdiff_t>(frameStack.size()) - 1; i >= 0; --i)
-            {
-                if (occurrenceNodes[frameStack[static_cast<std::size_t>(i)]].name == callerName)
-                {
-                    return i;
-                }
-            }
-
-            return -1;
-        };
-
-        for (const RuntimeCallData *call : orderedCalls)
-        {
-            const std::string &caller = call->caller.empty() ? runtimeContext.entrypoint : call->caller;
-            std::ptrdiff_t callerFrameIndex = findCallerFrameIndex(caller, call->callerDepth);
-            if (callerFrameIndex < 0)
-            {
-                callerFrameIndex = 0;
-                frameStack.resize(1U);
-            }
-            else
-            {
-                frameStack.resize(static_cast<std::size_t>(callerFrameIndex) + 1U);
-            }
-
-            const std::size_t parentIndex = frameStack.back();
-            const std::string calleeName = call->callee.empty() ? std::string("<unknown>") : call->callee;
-            const NamedNodeKey key{parentIndex, calleeName};
-            std::size_t childIndex = 0U;
-            const auto childIt = childIndexByParentAndName.find(key);
-            if (childIt != childIndexByParentAndName.end())
-            {
-                childIndex = childIt->second;
-                ++occurrenceNodes[childIndex].hitCount;
-            }
-            else
-            {
-                childIndex = occurrenceNodes.size();
-                occurrenceNodes.push_back({calleeName, 1U, {}});
-                occurrenceNodes[parentIndex].children.push_back(childIndex);
-                childIndexByParentAndName.emplace(NamedNodeKey{parentIndex, calleeName}, childIndex);
-            }
-            frameStack.push_back(childIndex);
-        }
-
-        return occurrenceNodes;
-    }
-
     void mergeOccurrenceSubtree(
         std::vector<RuntimeOccurrenceNode> &mergedNodes,
         std::size_t mergedIndex,
@@ -765,31 +821,16 @@ namespace
         }
     }
 
-    void buildTreeNodesForContexts(const std::string &entrypoint, const std::vector<const RuntimeContextData *> &runtimeContexts, const CallGraph &subgraph, TreeNodes &treeNodes)
+    void buildTreeNodesForRoot(const std::vector<RuntimeOccurrenceNode> &rootOccurrenceNodes, const CallGraph &subgraph, TreeNodes &treeNodes)
     {
-        std::vector<RuntimeOccurrenceNode> occurrenceNodes;
-        occurrenceNodes.push_back({entrypoint, 0U, {}});
-
-        for (const RuntimeContextData *runtimeContext : runtimeContexts)
+        if (rootOccurrenceNodes.empty())
         {
-            if (runtimeContext == nullptr)
-            {
-                continue;
-            }
-
-            std::vector<RuntimeOccurrenceNode> sourceNodes = buildOccurrenceNodesForContext(*runtimeContext);
-            if (sourceNodes.empty())
-            {
-                continue;
-            }
-
-            occurrenceNodes[0].hitCount += 1U;
-            mergeOccurrenceSubtree(occurrenceNodes, 0U, sourceNodes, 0U);
+            return;
         }
 
-        std::size_t nextUid = 0U;
-        std::function<void(std::size_t, const std::string &, int, bool)> emitTree =
-            [&](std::size_t occurrenceIndex, const std::string &parentUid, int level, bool edgeTaken)
+        std::vector<RuntimeOccurrenceNode> occurrenceNodes = rootOccurrenceNodes;
+        std::function<void(std::size_t, std::size_t, int, bool)> emitTree =
+            [&](std::size_t occurrenceIndex, std::size_t parentIndex, int level, bool edgeTaken)
         {
             if (occurrenceIndex >= occurrenceNodes.size())
             {
@@ -802,10 +843,9 @@ namespace
             TreeNode node;
             node.name = occurrenceName;
             node.level = level;
-            node.parentUid = parentUid;
+            node.parentIndex = parentIndex;
             node.edgeTaken = edgeTaken;
             node.hitCount = level > 0 ? occurrenceHitCount : 0U;
-            node.uid = std::to_string(nextUid++);
 
             std::vector<std::string> staticChildren;
             const auto staticIt = subgraph.find(occurrenceName);
@@ -843,12 +883,12 @@ namespace
             }
             node.hasChildren = !staticChildren.empty() || !occurrenceChildren.empty();
 
+            const std::size_t currentIndex = treeNodes.size();
             treeNodes.push_back(std::move(node));
-            const std::string currentUid = treeNodes.back().uid;
 
             for (const std::size_t childIndex : occurrenceChildren)
             {
-                emitTree(childIndex, currentUid, level + 1, true);
+                emitTree(childIndex, currentIndex, level + 1, true);
             }
 
             for (const std::string &childName : staticChildren)
@@ -860,11 +900,11 @@ namespace
 
                 const std::size_t missingChildIndex = occurrenceNodes.size();
                 occurrenceNodes.push_back({childName, 0U, {}});
-                emitTree(missingChildIndex, currentUid, level + 1, false);
+                emitTree(missingChildIndex, currentIndex, level + 1, false);
             }
         };
 
-        emitTree(0U, std::string{}, 0, true);
+        emitTree(0U, std::numeric_limits<std::size_t>::max(), 0, true);
     }
 
     std::string buildSidebarHtml(const std::vector<RootSummary> &rootSummaries)
@@ -901,105 +941,35 @@ namespace
         return html.str();
     }
 
-    void writeTreeRowsHtml(std::ostream &output, const TreeNodes &treeNodes, std::size_t tabIndex)
+    void writePanelDataJson(std::ostream &output, const RootSummary &summary, const TreeNodes &treeNodes)
     {
+        output << "{\"name\":";
+        writeJsonString(output, summary.name);
+        output << ",\"nodeCount\":" << summary.nodeCount;
+        output << ",\"covered\":" << summary.covered;
+        output << ",\"uncovered\":" << summary.uncovered;
+        output << ",\"pct\":" << summary.pct;
+        output << ",\"nodes\":[";
+
         for (std::size_t index = 0; index < treeNodes.size(); ++index)
         {
             const TreeNode &node = treeNodes[index];
-            const std::string uid = "t" + std::to_string(tabIndex) + "n" + node.uid;
-            const std::string parentUid = node.parentUid.empty() ? std::string{} : std::string("t") + std::to_string(tabIndex) + "n" + node.parentUid;
-            const bool hasChildren = node.hasChildren;
-            const std::string edgeStatus = (node.level == 0 || node.edgeTaken) ? "covered" : "uncovered";
-
-            std::string badgeClass;
-            std::string badgeText;
-            if (node.level == 0)
+            if (index != 0U)
             {
-                badgeClass = "badge-root";
-                badgeText = "&diams; entry";
-            }
-            else if (node.coveredChildren + node.uncoveredChildren == 0U)
-            {
-                badgeClass = node.edgeTaken ? "badge-covered" : "badge-uncovered";
-                badgeText = node.edgeTaken ? "&check; leaf" : "&times; leaf";
-            }
-            else
-            {
-                badgeClass = node.edgeTaken ? "badge-covered" : "badge-uncovered";
-                badgeText = node.edgeTaken ? "&check; taken" : "&times; not taken";
+                output << ",";
             }
 
-            output << "        <tr class=\"tree-node" << (node.level != 0 ? " tree-hidden" : "") << "\"";
-            output << " data-uid=\"" << uid << "\"";
-            output << " data-parent-uid=\"" << parentUid << "\"";
-            output << " data-edge-status=\"" << edgeStatus << "\"";
-            output << " data-name=\"" << escapeHtml(node.name) << "\">\n";
-            output << "          <td>\n";
-            output << "            <div class=\"node-cell\">\n";
-            for (int level = 0; level < node.level; ++level)
-            {
-                output << "              <span class=\"ident-block\"></span>\n";
-            }
-
-            if (hasChildren)
-            {
-                output << "              <span class=\"tree-toggle\" data-toggle-uid=\"" << uid << "\" data-expanded=\"true\">&#9660;</span>\n";
-            }
-            else
-            {
-                output << "              <span class=\"tree-toggle no-children\">&#9675;</span>\n";
-            }
-
-            // show node name and, if present, the hit count for the incoming edge
-            output << "              <span class=\"node-name" << (node.level == 0 ? " is-root" : "") << "\">" << escapeHtml(node.name) << "</span>\n";
-            if (node.hitCount > 0U)
-            {
-                output << "              <span class=\"edge-hits\">(" << node.hitCount << ")</span>\n";
-            }
-            output << "            </div>\n";
-            output << "          </td>\n";
-            output << "          <td class=\"status-cell\">\n";
-            output << "            <span class=\"badge " << badgeClass << "\">" << badgeText << "</span>\n";
-            output << "          </td>\n";
-            output << "        </tr>\n";
+            output << "[";
+            writeJsonString(output, node.name);
+            output << "," << node.level;
+            output << "," << (node.parentIndex == std::numeric_limits<std::size_t>::max() ? -1 : static_cast<std::int64_t>(node.parentIndex));
+            output << "," << (node.edgeTaken ? 1 : 0);
+            output << "," << node.hitCount;
+            output << "," << node.coveredChildren;
+            output << "," << node.uncoveredChildren;
+            output << "]";
         }
-    }
-
-    void writePanelHtml(std::ostream &output, const RootSummary &summary, const TreeNodes &treeNodes, std::size_t tabIndex)
-    {
-        output << "  <div id=\"panel-" << tabIndex << "\" class=\"panel\" style=\"display:" << (tabIndex == 0U ? "flex" : "none") << "\">\n";
-        output << "    <div class=\"panel-header\">\n";
-        output << "      <div class=\"panel-title\">" << escapeHtml(summary.name) << "</div>\n";
-        output << "      <div class=\"stats-row\">\n";
-        output << "        <div class=\"stat-pill\"><span class=\"dot dot-total\"></span>" << summary.nodeCount << " nodes</div>\n";
-        output << "        <div class=\"stat-pill\"><span class=\"dot dot-covered\"></span>" << summary.covered << " covered</div>\n";
-        output << "        <div class=\"stat-pill\"><span class=\"dot dot-uncovered\"></span>" << summary.uncovered << " uncovered</div>\n";
-        output << "      </div>\n";
-        output << "    </div>\n";
-        output << "    <div class=\"toolbar\">\n";
-        output << "      <input type=\"text\" placeholder=\"Search functions...\" oninput=\"filterTree(this.value, " << tabIndex << ")\">\n";
-        output << "      <button type=\"button\" class=\"toolbar-btn\" onclick=\"expandAll(" << tabIndex << ")\">Expand All</button>\n";
-        output << "      <button type=\"button\" class=\"toolbar-btn\" onclick=\"collapseAll(" << tabIndex << ")\">Collapse All</button>\n";
-        output << "      <div class=\"filter-group\">\n";
-        output << "        <button type=\"button\" class=\"filter-btn active-all\" data-filter=\"all\" data-tab=\"" << tabIndex << "\" onclick=\"setFilter('all', " << tabIndex << ")\">All</button>\n";
-        output << "        <button type=\"button\" class=\"filter-btn\" data-filter=\"covered\" data-tab=\"" << tabIndex << "\" onclick=\"setFilter('covered', " << tabIndex << ")\">Covered</button>\n";
-        output << "        <button type=\"button\" class=\"filter-btn\" data-filter=\"uncovered\" data-tab=\"" << tabIndex << "\" onclick=\"setFilter('uncovered', " << tabIndex << ")\">Uncovered</button>\n";
-        output << "      </div>\n";
-        output << "    </div>\n";
-        output << "    <div class=\"tree-wrap\">\n";
-        output << "      <table>\n";
-        output << "        <thead>\n";
-        output << "          <tr>\n";
-        output << "            <th>Function</th>\n";
-        output << "            <th style=\"width:160px\">Status</th>\n";
-        output << "          </tr>\n";
-        output << "        </thead>\n";
-        output << "        <tbody id=\"tbody-" << tabIndex << "\">\n";
-        writeTreeRowsHtml(output, treeNodes, tabIndex);
-        output << "        </tbody>\n";
-        output << "      </table>\n";
-        output << "    </div>\n";
-        output << "  </div>\n";
+        output << "]}";
     }
 
     bool streamFileIntoOutput(std::string_view sourcePath, std::ofstream &output, std::string &error)
@@ -1039,7 +1009,7 @@ namespace
     bool writeHtmlFile(
         const std::string &path,
         const std::vector<RootSummary> &rootSummaries,
-        std::string_view panelsPath,
+        std::string_view dataPath,
         const std::set<Edge> &staticEdges,
         const std::set<Edge> &runtimeEdges,
         std::string &error)
@@ -1112,13 +1082,14 @@ namespace
         output << globalBarHtml;
         output << "<div class=\"layout\">\n";
         output << buildSidebarHtml(rootSummaries);
-        output << "<div class=\"main\">\n";
-        if (!streamFileIntoOutput(panelsPath, output, error))
+        output << "<div class=\"main\" id=\"main\"></div>\n";
+        output << "</div>\n";
+        output << "<script id=\"callgraph-data\" type=\"application/json\">";
+        if (!streamFileIntoOutput(dataPath, output, error))
         {
             return false;
         }
-        output << "</div>\n";
-        output << "</div>\n";
+        output << "</script>\n";
 
         const std::size_t suffixPos = bodyPos + kBodyMarker.size();
         output.write(html.data() + static_cast<std::ptrdiff_t>(suffixPos), static_cast<std::streamsize>(html.size() - suffixPos));
@@ -1204,11 +1175,26 @@ int main(int argc, const char **argv)
         return 1;
     }
 
+    std::set<std::string> roots;
+    if (!kNoHtml && !loadEntryPoints(kEntryPoints, roots, error))
+    {
+        llvm::errs() << "[callgraph-diff] " << error << "\n";
+        return 1;
+    }
+
     std::set<Edge> runtimeEdges;
     std::unordered_set<std::string> runtimeNodes;
-    std::vector<RuntimeContextData> runtimeContexts;
+    std::vector<std::string> orderedEntrypoints;
+    std::unordered_map<std::string, RootAggregation> aggregatedRoots;
     llvm::errs() << "[callgraph-diff] Loading runtime callgraph: " << kRuntimeCallgraph << "\n";
-    if (!extractRuntimeEdges(kRuntimeCallgraph, runtimeEdges, runtimeNodes, runtimeContexts, error))
+    if (!extractRuntimeEdges(
+            kRuntimeCallgraph,
+            kNoHtml ? nullptr : &roots,
+            runtimeEdges,
+            runtimeNodes,
+            orderedEntrypoints,
+            aggregatedRoots,
+            error))
     {
         llvm::errs() << "[callgraph-diff] " << error << "\n";
         return 1;
@@ -1235,62 +1221,8 @@ int main(int argc, const char **argv)
         return 0;
     }
 
-    std::set<std::string> roots;
-    if (!loadEntryPoints(kEntryPoints, roots, error))
-    {
-        llvm::errs() << "[callgraph-diff] " << error << "\n";
-        return 1;
-    }
-
     CallGraph acyclicGraph;
     removeBackEdges(staticEdges, acyclicGraph);
-
-    std::vector<const RuntimeContextData *> orderedContexts;
-    orderedContexts.reserve(runtimeContexts.size());
-    for (const RuntimeContextData &runtimeContext : runtimeContexts)
-    {
-        if (!runtimeContext.entrypoint.empty() && roots.find(runtimeContext.entrypoint) == roots.end())
-        {
-            continue;
-        }
-
-        orderedContexts.push_back(&runtimeContext);
-    }
-
-    std::sort(orderedContexts.begin(), orderedContexts.end(), [](const RuntimeContextData *lhs, const RuntimeContextData *rhs)
-              {
-        if (lhs->entrypoint != rhs->entrypoint)
-        {
-            return lhs->entrypoint < rhs->entrypoint;
-        }
-        if (lhs->ordinal != rhs->ordinal)
-        {
-            return lhs->ordinal < rhs->ordinal;
-        }
-        if (lhs->startEventIndex != rhs->startEventIndex)
-        {
-            return lhs->startEventIndex < rhs->startEventIndex;
-        }
-        return lhs->contextId < rhs->contextId; });
-
-    std::unordered_map<std::string, std::vector<const RuntimeContextData *>> contextsByEntrypoint;
-    contextsByEntrypoint.reserve(orderedContexts.size());
-    std::vector<std::string> orderedEntrypoints;
-    orderedEntrypoints.reserve(orderedContexts.size());
-    for (const RuntimeContextData *runtimeContext : orderedContexts)
-    {
-        if (runtimeContext == nullptr || runtimeContext->entrypoint.empty())
-        {
-            continue;
-        }
-
-        std::vector<const RuntimeContextData *> &group = contextsByEntrypoint[runtimeContext->entrypoint];
-        if (group.empty())
-        {
-            orderedEntrypoints.push_back(runtimeContext->entrypoint);
-        }
-        group.push_back(runtimeContext);
-    }
 
     const std::string htmlOutputPath = kHtmlOutput;
     if (htmlOutputPath.empty())
@@ -1298,35 +1230,36 @@ int main(int argc, const char **argv)
         return 0;
     }
 
-    const std::string panelsPath = htmlOutputPath + ".panels.tmp";
-    std::ofstream panelsOutput(panelsPath, std::ios::binary);
-    if (!panelsOutput)
+    const std::string dataPath = htmlOutputPath + ".data.tmp";
+    std::ofstream dataOutput(dataPath, std::ios::binary);
+    if (!dataOutput)
     {
-        llvm::errs() << "[callgraph-diff] failed to open intermediate HTML fragment: " << panelsPath << "\n";
+        llvm::errs() << "[callgraph-diff] failed to open intermediate data fragment: " << dataPath << "\n";
         return 1;
     }
+    dataOutput << "[";
 
     std::vector<RootSummary> rootSummaries;
     rootSummaries.reserve(orderedEntrypoints.size());
     for (const std::string &entrypoint : orderedEntrypoints)
     {
-        const auto groupIt = contextsByEntrypoint.find(entrypoint);
-        if (groupIt == contextsByEntrypoint.end() || groupIt->second.empty())
+        const auto groupIt = aggregatedRoots.find(entrypoint);
+        if (groupIt == aggregatedRoots.end() || groupIt->second.occurrenceNodes.empty())
         {
             continue;
         }
 
-        const std::vector<const RuntimeContextData *> &contextGroup = groupIt->second;
+        const RootAggregation &rootAggregation = groupIt->second;
         RootSummary summary;
         summary.name = entrypoint;
-        if (contextGroup.size() > 1U)
+        if (rootAggregation.runCount > 1U)
         {
-            summary.name += " (" + std::to_string(contextGroup.size()) + " runs)";
+            summary.name += " (" + std::to_string(rootAggregation.runCount) + " runs)";
         }
         CallGraph subgraph;
         TreeNodes treeNodes;
         buildSubgraphFromRoot(entrypoint, acyclicGraph, subgraph);
-        buildTreeNodesForContexts(entrypoint, contextGroup, subgraph, treeNodes);
+        buildTreeNodesForRoot(rootAggregation.occurrenceNodes, subgraph, treeNodes);
         for (const TreeNode &node : treeNodes)
         {
             summary.covered += node.coveredChildren;
@@ -1334,37 +1267,42 @@ int main(int argc, const char **argv)
         }
         summary.nodeCount = treeNodes.size();
         summary.pct = (summary.covered + summary.uncovered) > 0U ? (100.0 * static_cast<double>(summary.covered)) / static_cast<double>(summary.covered + summary.uncovered) : 0.0;
-        writePanelHtml(panelsOutput, summary, treeNodes, rootSummaries.size());
-        panelsOutput.flush();
-        if (!panelsOutput)
+        if (!rootSummaries.empty())
         {
-            llvm::errs() << "[callgraph-diff] failed to write intermediate HTML fragment: " << panelsPath << "\n";
+            dataOutput << ",";
+        }
+        writePanelDataJson(dataOutput, summary, treeNodes);
+        dataOutput.flush();
+        if (!dataOutput)
+        {
+            llvm::errs() << "[callgraph-diff] failed to write intermediate data fragment: " << dataPath << "\n";
             std::error_code removeError;
-            std::filesystem::remove(panelsPath, removeError);
+            std::filesystem::remove(dataPath, removeError);
             return 1;
         }
         rootSummaries.push_back(std::move(summary));
     }
 
-    panelsOutput.close();
-    if (!panelsOutput)
+    dataOutput << "]";
+    dataOutput.close();
+    if (!dataOutput)
     {
-        llvm::errs() << "[callgraph-diff] failed to finalize intermediate HTML fragment: " << panelsPath << "\n";
+        llvm::errs() << "[callgraph-diff] failed to finalize intermediate data fragment: " << dataPath << "\n";
         std::error_code removeError;
-        std::filesystem::remove(panelsPath, removeError);
+        std::filesystem::remove(dataPath, removeError);
         return 1;
     }
 
-    if (!writeHtmlFile(htmlOutputPath, rootSummaries, panelsPath, staticEdges, runtimeEdges, error))
+    if (!writeHtmlFile(htmlOutputPath, rootSummaries, dataPath, staticEdges, runtimeEdges, error))
     {
         llvm::errs() << "[callgraph-diff] " << error << "\n";
         std::error_code removeError;
-        std::filesystem::remove(panelsPath, removeError);
+        std::filesystem::remove(dataPath, removeError);
         return 1;
     }
 
     std::error_code removeError;
-    std::filesystem::remove(panelsPath, removeError);
+    std::filesystem::remove(dataPath, removeError);
 
     return 0;
 }
